@@ -84,7 +84,7 @@ Ranbooru Forge（Reforge）是 Ranbooru 的增强分支，围绕以下目标优�
 
 ```bash
 git clone -b kemomimi --single-branch https://github.com/Rivulet138/sd-webui-ranbooru-reforge.git extensions/sd-webui-ranbooru-reforge
-
+```
 快速开始（3 分钟上手）
 打开 Ranbooru 面板并勾选 Enabled
 选择 Booru
