@@ -26,6 +26,8 @@ try:
 except Exception:
     InputAccordion = gr.Accordion
 
+
+
 extension_root = scripts.basedir()
 user_data_dir = os.path.join(extension_root, 'user')
 user_search_dir = os.path.join(user_data_dir, 'search')
@@ -70,85 +72,14 @@ DEFAULT_BAD_TAGS = [
 ]
 
 # ─── Tag cache manager ───────────────────────────────────────────────────────
-class TagCacheManager:
-    """管理批量爬取的 tag 缓存与顺序索引"""
-
-    def __init__(self, cache_dir):
-        self.cache_dir = cache_dir
-        self.cache_file = os.path.join(cache_dir, 'tag_cache.json')
-        self.index_file = os.path.join(cache_dir, 'cache_index.json')
-
-    # ── 缓存读写 ──────────────────────────────────────────────────────────
-    def load_cache(self):
-        if os.path.exists(self.cache_file):
-            try:
-                with open(self.cache_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return data if isinstance(data, list) else []
-            except (json.JSONDecodeError, IOError):
-                return []
-        return []
-
-    def save_cache(self, tags_list):
-        with open(self.cache_file, 'w', encoding='utf-8') as f:
-            json.dump(tags_list, f, ensure_ascii=False, indent=2)
-
-    def append_cache(self, tags_list):
-        existing = self.load_cache()
-        existing.extend(tags_list)
-        self.save_cache(existing)
-        return len(existing)
-
-    # ── 索引读写 ──────────────────────────────────────────────────────────
-    def get_index(self):
-        if os.path.exists(self.index_file):
-            try:
-                with open(self.index_file, 'r') as f:
-                    data = json.load(f)
-                    return int(data.get('index', 0))
-            except (json.JSONDecodeError, IOError, ValueError):
-                return 0
-        return 0
-
-    def save_index(self, index):
-        with open(self.index_file, 'w') as f:
-            json.dump({'index': index}, f)
-
-    def reset_index(self):
-        self.save_index(0)
-
-    # ── 顺序取出 ──────────────────────────────────────────────────────────
-    def get_next_tags(self, loop=False):
-        """返回 (tags_str | None, new_index, total)"""
-        cache = self.load_cache()
-        total = len(cache)
-        if total == 0:
-            return None, 0, 0
-        index = self.get_index()
-        if index >= total:
-            if loop:
-                index = 0
-            else:
-                return None, index, total
-        tags = cache[index]
-        self.save_index(index + 1)
-        return tags, index + 1, total
-
-    # ── 删除 ──────────────────────────────────────────────────────────────
-    def delete_cache(self):
-        for fp in (self.cache_file, self.index_file):
-            if os.path.exists(fp):
-                os.remove(fp)
-
-    # ── 状态 ──────────────────────────────────────────────────────────────
-    def get_status(self):
-        cache = self.load_cache()
-        total = len(cache)
-        index = self.get_index()
-        if total == 0:
-            return "缓存为空"
-        remaining = max(total - index, 0)
-        return f"缓存总数: {total} | 当前索引: {index} | 剩余: {remaining}"
+try:
+    from .cache_db import TagCacheManager
+except ImportError:
+    import sys
+    _ranbooru_scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    if _ranbooru_scripts_dir not in sys.path:
+        sys.path.insert(0, _ranbooru_scripts_dir)
+    from cache_db import TagCacheManager
 
 
 tag_cache_manager = TagCacheManager(user_cache_dir)
@@ -287,80 +218,181 @@ class Booru():
         self.booru_url = booru_url
         self.headers = {'user-agent': 'my-app/0.0.1'}
 
+    def fetch_with_retry(self, url, max_retries=3, timeout=10, **kwargs):
+        """Fetch URL with retry logic for rate limiting and network errors."""
+        import time
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(url, timeout=timeout, **kwargs)
+                if response.status_code == 429:
+                    wait = 2 ** attempt
+                    print(f"[{self.booru}] Rate limited (429), waiting {wait}s...")
+                    time.sleep(wait)
+                    continue
+                response.raise_for_status()
+                return response
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    print(f"[{self.booru}] Timeout, retry {attempt + 1}/{max_retries}")
+                    time.sleep(2 ** attempt)
+            except requests.exceptions.RequestException as e:
+                if attempt < max_retries - 1:
+                    print(f"[{self.booru}] Request error: {e}, retry {attempt + 1}/{max_retries}")
+                    time.sleep(2 ** attempt)
+        raise Exception(f"[{self.booru}] All {max_retries} attempts failed for {url}")
+
     def get_data(self, add_tags, max_pages=10, id=''):
         pass
 
     def get_post(self, add_tags, max_pages=10, id=''):
-        pass
+        return self.get_data(add_tags, max_pages, "&id=" + id)
 
 
 class Gelbooru(Booru):
 
-    def __init__(self, fringe_benefits, api_key=None, user_id=None):
+    def __init__(self, fringe_benefits=True, api_key=None, user_id=None):
         super().__init__('gelbooru', f'https://gelbooru.com/index.php?page=dapi&s=post&q=index&json=1&limit={POST_AMOUNT}')
-        self.fringeBenefits = fringe_benefits
+        self.fringe_benefits = fringe_benefits
         self.api_key = api_key
         self.user_id = user_id
 
     def get_data(self, add_tags, max_pages=10, id=''):
         global COUNT
-        loop_msg = True # avoid showing same msg twice
-        for loop in range(2): # run loop at most twice
-            if id:
-                add_tags = ''
-            
-            # Build the API URL with credentials if available
-            api_params = f"&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
+        loop_msg = True
+        for _ in range(2):
+            local_add_tags = '' if id else add_tags
+            url = f"{self.base_url}&pid={random.randint(0, max_pages-1)}{id}{local_add_tags}"
             if self.api_key and self.user_id:
-                api_params += f"&api_key={self.api_key}&user_id={self.user_id}"
-            url = f"{self.base_url}{api_params}"
+                url += f"&api_key={self.api_key}&user_id={self.user_id}"
+            if self.fringe_benefits:
+                url += "&fringeBenefits=1"
             self.booru_url = url
-            # The randint function is an alias to randrange(a, b+1), so 'max_pages' should be passed as 'max_pages-1'
-            if self.fringeBenefits:
-                res = requests.get(url, cookies={'fringeBenefits': 'yup'}, timeout=10)
-            else:
-                res = requests.get(url, timeout=10)
+            res = self.fetch_with_retry(url, timeout=10)
             try:
                 data = res.json()
-            except Exception:
-                data = {'@attributes': {'count': 0}, 'post': []}
-            COUNT = data.get('@attributes', {}).get('count', 0)
-            if COUNT <= max_pages*POST_AMOUNT:
-                max_pages = COUNT // POST_AMOUNT+1
-                # If max_pages is bigger than available pages, loop the function with updated max_pages based on the value of COUNT
+            except Exception as e:
+                print(f"[Gelbooru] JSON parse error: {e}")
+                data = []
+            if not isinstance(data, list):
+                data = []
+            COUNT = len(data)
+            if COUNT == 0:
+                max_pages = 2
                 while loop_msg:
                     print(f" Processing {COUNT} results.")
                     loop_msg = False
-                    # avoid showing same msg twice
                 continue
-            else:
-                print(f" Processing {max_pages*POST_AMOUNT} out of {COUNT} results.")
             break
-        return data
+        for post in data:
+            if isinstance(post, dict) and 'directory' in post and 'image' in post:
+                post['file_url'] = f"https://img3.gelbooru.com/images/{post['directory']}/{post['image']}"
+        return {'post': data}
 
     def get_data_page(self, add_tags, page=0, id=''):
-        """Fetch a specific page (used by batch cache)."""
         global COUNT
-        if id:
-            add_tags = ''
-        api_params = f"&pid={page}{id}{add_tags}"
+        local_add_tags = '' if id else add_tags
+        url = f"{self.base_url}&pid={page}{id}{local_add_tags}"
         if self.api_key and self.user_id:
-            api_params += f"&api_key={self.api_key}&user_id={self.user_id}"
-        url = f"{self.base_url}{api_params}"
+            url += f"&api_key={self.api_key}&user_id={self.user_id}"
+        if self.fringe_benefits:
+            url += "&fringeBenefits=1"
         self.booru_url = url
-        if self.fringeBenefits:
-            res = requests.get(url, cookies={'fringeBenefits': 'yup'}, timeout=10)
-        else:
-            res = requests.get(url, timeout=10)
+        res = self.fetch_with_retry(url, timeout=10)
         try:
             data = res.json()
-        except Exception:
-            data = {'@attributes': {'count': 0}, 'post': []}
-        COUNT = data.get('@attributes', {}).get('count', 0)
-        return data
+        except Exception as e:
+            print(f"[Gelbooru] JSON parse error (page): {e}")
+            data = []
+        if not isinstance(data, list):
+            data = []
+        COUNT = len(data)
+        for post in data:
+            if isinstance(post, dict) and 'directory' in post and 'image' in post:
+                post['file_url'] = f"https://img3.gelbooru.com/images/{post['directory']}/{post['image']}"
+        return {'post': data}
 
     def get_post(self, add_tags, max_pages=10, id=''):
         return self.get_data(add_tags, max_pages, "&id=" + id)
+
+
+class e621(Booru):
+
+    def __init__(self):
+        super().__init__('e621', f'https://e621.net/posts.json?limit={POST_AMOUNT}')
+
+    def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
+        global COUNT
+        loop_msg = True
+        for loop in range(2):
+            if id:
+                add_tags = ''
+            random_page = random.randint(1, max(1, int(max_pages)))
+            url = f"{self.base_url}&page={random_page}{add_tags}"
+            self.booru_url = url
+            res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
+            data = res.json()
+            posts = data.get('posts', []) if isinstance(data, dict) else []
+            for post in posts:
+                if isinstance(post, dict):
+                    post['tags'] = self._filter_tags_by_category(post, tag_categories)
+            COUNT = len(posts)
+            if COUNT == 0:
+                max_pages = 2
+                while loop_msg:
+                    print(f" Processing {COUNT} results.")
+                    loop_msg = False
+                continue
+            else:
+                print(f"Found enough results")
+            break
+        return {'post': posts}
+
+    def get_data_page(self, add_tags, page=0, id='', tag_categories=None):
+        global COUNT
+        if id:
+            add_tags = ''
+        safe_page = max(1, int(page) + 1)
+        url = f"{self.base_url}&page={safe_page}{add_tags}"
+        self.booru_url = url
+        res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
+        data = res.json()
+        posts = data.get('posts', []) if isinstance(data, dict) else []
+        for post in posts:
+            if isinstance(post, dict):
+                post['tags'] = self._filter_tags_by_category(post, tag_categories)
+        COUNT = len(posts)
+        return {'post': posts}
+
+    def _filter_tags_by_category(self, post, categories):
+        """Filter tags by selected categories (e621 uses nested tags dict)."""
+        if not categories or not isinstance(categories, list):
+            tags_dict = post.get('tags', {})
+            if isinstance(tags_dict, dict):
+                all_tags = []
+                for cat in ['general', 'artist', 'copyright', 'character', 'species', 'meta']:
+                    all_tags.extend(tags_dict.get(cat, []))
+                return ' '.join(all_tags)
+            return ''
+        tags_dict = post.get('tags', {})
+        if not isinstance(tags_dict, dict):
+            return ''
+        parts = []
+        for cat in categories:
+            if cat in tags_dict:
+                parts.extend(tags_dict[cat])
+        return ' '.join(parts) if parts else ''
+
+    def get_post(self, add_tags, max_pages=10, id=''):
+        if not id:
+            return self.get_data(add_tags, max_pages, '', tag_categories=None)
+        self.booru_url = f"https://danbooru.donmai.us/posts/{id}.json"
+        res = self.fetch_with_retry(self.booru_url, headers=self.headers, timeout=10)
+        data = res.json()
+        if isinstance(data, dict):
+            data['tags'] = data.get('tag_string', '')
+            return {'post': [data]}
+        return {'post': []}
+
 
 
 class XBooru(Booru):
@@ -377,7 +409,7 @@ class XBooru(Booru):
             url = f"{self.base_url}&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
             self.booru_url = url
             print(url)
-            res = requests.get(url, timeout=10)
+            res = self.fetch_with_retry(url, timeout=10)
             data = res.json()
             COUNT = 0
             for post in data:
@@ -402,7 +434,7 @@ class XBooru(Booru):
             add_tags = ''
         url = f"{self.base_url}&pid={page}{id}{add_tags}"
         self.booru_url = url
-        res = requests.get(url, timeout=10)
+        res = self.fetch_with_retry(url, timeout=10)
         data = res.json()
         COUNT = 0
         for post in data:
@@ -431,10 +463,11 @@ class Rule34(Booru):
             if self.api_key and self.user_id:
                 url += f"&api_key={self.api_key}&user_id={self.user_id}"
             self.booru_url = url
-            res = requests.get(url, timeout=10)
+            res = self.fetch_with_retry(url, timeout=10)
             try:
                 data = res.json()
-            except Exception:
+            except Exception as e:
+                print(f"[Rule34] JSON parse error: {e}")
                 data = []
             if not isinstance(data, list):
                 data = []
@@ -460,10 +493,11 @@ class Rule34(Booru):
         if self.api_key and self.user_id:
             url += f"&api_key={self.api_key}&user_id={self.user_id}"
         self.booru_url = url
-        res = requests.get(url, timeout=10)
+        res = self.fetch_with_retry(url, timeout=10)
         try:
             data = res.json()
-        except Exception:
+        except Exception as e:
+            print(f"[Rule34] JSON parse error (page): {e}")
             data = []
         if not isinstance(data, list):
             data = []
@@ -477,51 +511,88 @@ class Rule34(Booru):
 class Safebooru(Booru):
 
     def __init__(self):
-        super().__init__('safebooru', f'https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1&limit={POST_AMOUNT}')
+        super().__init__('safebooru', f'https://safebooru.donmai.us/posts.json?limit={POST_AMOUNT}')
 
-    def get_data(self, add_tags, max_pages=10, id=''):
+    def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         global COUNT
-        loop_msg = True # avoid showing same msg twice
-        for loop in range(2): # run loop at most twice
+        loop_msg = True
+        for loop in range(2):
             if id:
                 add_tags = ''
-            url = f"{self.base_url}&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
+            random_page = random.randint(1, max(1, int(max_pages)))
+            url = f"{self.base_url}&page={random_page}{add_tags}"
             self.booru_url = url
-            res = requests.get(url, timeout=10)
+            res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
             data = res.json()
+            if not isinstance(data, list):
+                try:
+                    data = data.get('posts', [])
+                except AttributeError:
+                    data = []
             COUNT = 0
             for post in data:
-                post['file_url'] = f"https://safebooru.org/images/{post['directory']}/{post['image']}"
-                COUNT += 1
-            if COUNT <= max_pages*POST_AMOUNT:
-                max_pages = COUNT // POST_AMOUNT+1
-                # If max_pages is bigger than available pages, loop the function with updated max_pages based on the value of COUNT
+                if isinstance(post, dict):
+                    post['tags'] = self._filter_tags_by_category(post, tag_categories)
+                    if not post.get('file_url') and post.get('large_file_url'):
+                        post['file_url'] = post.get('large_file_url')
+                    COUNT += 1
+            if COUNT == 0:
+                max_pages = 2
                 while loop_msg:
                     print(f" Processing {COUNT} results.")
                     loop_msg = False
-                    # avoid showing same msg twice
                 continue
             else:
-                print(f" Processing {max_pages*POST_AMOUNT} out of {COUNT} results.")
+                print(f"Found enough results")
             break
         return {'post': data}
 
-    def get_data_page(self, add_tags, page=0, id=''):
+    def get_data_page(self, add_tags, page=0, id='', tag_categories=None):
         global COUNT
         if id:
             add_tags = ''
-        url = f"{self.base_url}&pid={page}{id}{add_tags}"
+        safe_page = max(1, int(page) + 1)
+        url = f"{self.base_url}&page={safe_page}{add_tags}"
         self.booru_url = url
-        res = requests.get(url, timeout=10)
+        res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
         data = res.json()
+        if not isinstance(data, list):
+            try:
+                data = data.get('posts', [])
+            except AttributeError:
+                data = []
         COUNT = 0
         for post in data:
-            post['file_url'] = f"https://safebooru.org/images/{post['directory']}/{post['image']}"
-            COUNT += 1
+            if isinstance(post, dict):
+                post['tags'] = self._filter_tags_by_category(post, tag_categories)
+                if not post.get('file_url') and post.get('large_file_url'):
+                    post['file_url'] = post.get('large_file_url')
+                COUNT += 1
         return {'post': data}
 
+    def _filter_tags_by_category(self, post, categories):
+        """Filter tags by selected categories."""
+        if not categories or not isinstance(categories, list):
+            return post.get('tag_string', '')
+        parts = []
+        for cat in categories:
+            field = f'tag_string_{cat}'
+            if field in post:
+                parts.append(post[field])
+        return ' '.join(parts) if parts else post.get('tag_string', '')
+
     def get_post(self, add_tags, max_pages=10, id=''):
-        return self.get_data(add_tags, max_pages, "&id=" + id)
+        if not id:
+            return self.get_data(add_tags, max_pages, '', tag_categories=None)
+        self.booru_url = f"https://safebooru.donmai.us/posts/{id}.json"
+        res = self.fetch_with_retry(self.booru_url, headers=self.headers, timeout=10)
+        data = res.json()
+        if isinstance(data, dict):
+            data['tags'] = data.get('tag_string', '')
+            if not data.get('file_url') and data.get('large_file_url'):
+                data['file_url'] = data.get('large_file_url')
+            return {'post': [data]}
+        return {'post': []}
 
 
 class Konachan(Booru):
@@ -537,13 +608,14 @@ class Konachan(Booru):
                 add_tags = ''
             url = f"{self.base_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
             self.booru_url = url
-            res = requests.get(url, timeout=10)
+            res = self.fetch_with_retry(url, timeout=10)
             if res.status_code != 200:
                 data = []
             else:
                 try:
                     data = res.json()
-                except Exception:
+                except Exception as e:
+                    print(f"[Konachan] JSON parse error: {e}")
                     data = []
             COUNT = len(data)
             if COUNT == 0:
@@ -565,13 +637,14 @@ class Konachan(Booru):
             add_tags = ''
         url = f"{self.base_url}&page={page}{id}{add_tags}"
         self.booru_url = url
-        res = requests.get(url, timeout=10)
+        res = self.fetch_with_retry(url, timeout=10)
         if res.status_code != 200:
             data = []
         else:
             try:
                 data = res.json()
-            except Exception:
+            except Exception as e:
+                print(f"[Konachan] JSON parse error (page): {e}")
                 data = []
         COUNT = len(data)
         return {'post': data}
@@ -595,7 +668,7 @@ class Yandere(Booru):
             extras = '&filter=1&include_tags=1&include_votes=1&include_pools=1'
             url = f"{self.base_url}&limit={POST_AMOUNT}&page={page}{id}{add_tags}{extras}"
             self.booru_url = url
-            res = requests.get(url, timeout=10)
+            res = self.fetch_with_retry(url, timeout=10)
             posts = []
             if res.status_code == 200:
                 try:
@@ -604,7 +677,8 @@ class Yandere(Booru):
                         posts = data.get('posts', [])
                     elif isinstance(data, list):
                         posts = data
-                except Exception:
+                except Exception as e:
+                    print(f"[Yandere] JSON parse error: {e}")
                     posts = []
             COUNT = len(posts)
             if COUNT == 0:
@@ -627,7 +701,7 @@ class Yandere(Booru):
         extras = '&filter=1&include_tags=1&include_votes=1&include_pools=1'
         url = f"{self.base_url}&limit={POST_AMOUNT}&page={page}{id}{add_tags}{extras}"
         self.booru_url = url
-        res = requests.get(url, timeout=10)
+        res = self.fetch_with_retry(url, timeout=10)
         posts = []
         if res.status_code == 200:
             try:
@@ -650,44 +724,53 @@ class AIBooru(Booru):
     def __init__(self):
         super().__init__('AIBooru', f'https://aibooru.online/posts.json?limit={POST_AMOUNT}')
 
-    def get_data(self, add_tags, max_pages=10, id=''):
+    def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         global COUNT
-        loop_msg = True # avoid showing same msg twice
-        for loop in range(2): # run loop at most twice
+        loop_msg = True
+        for loop in range(2):
             if id:
                 add_tags = ''
             url = f"{self.base_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
             self.booru_url = url
-            res = requests.get(url)
+            res = self.fetch_with_retry(url)
             data = res.json()
             for post in data:
-                post['tags'] = post['tag_string']
+                post['tags'] = self._filter_tags_by_category(post, tag_categories)
             COUNT = len(data)
             if COUNT == 0:
                 max_pages = 2
-                # AIBooru does not have a way to know the amount of results available in the search, so we need to run the function again with a fixed amount of pages
                 while loop_msg:
                     print(f" Processing {COUNT} results.")
                     loop_msg = False
-                    # avoid showing same msg twice
                 continue
             else:
                 print(f"Found enough results")
             break
         return {'post': data}
 
-    def get_data_page(self, add_tags, page=0, id=''):
+    def get_data_page(self, add_tags, page=0, id='', tag_categories=None):
         global COUNT
         if id:
             add_tags = ''
         url = f"{self.base_url}&page={page}{id}{add_tags}"
         self.booru_url = url
-        res = requests.get(url)
+        res = self.fetch_with_retry(url)
         data = res.json()
         for post in data:
-            post['tags'] = post['tag_string']
+            post['tags'] = self._filter_tags_by_category(post, tag_categories)
         COUNT = len(data)
         return {'post': data}
+
+    def _filter_tags_by_category(self, post, categories):
+        """Filter tags by selected categories."""
+        if not categories or not isinstance(categories, list):
+            return post.get('tag_string', '')
+        parts = []
+        for cat in categories:
+            field = f'tag_string_{cat}'
+            if field in post:
+                parts.append(post[field])
+        return ' '.join(parts) if parts else post.get('tag_string', '')
 
     def get_post(self, add_tags, max_pages=10, id=''):
         raise Exception("AIBooru does not support post IDs")
@@ -698,15 +781,16 @@ class Danbooru(Booru):
     def __init__(self):
         super().__init__('danbooru', f'https://danbooru.donmai.us/posts.json?limit={POST_AMOUNT}')
 
-    def get_data(self, add_tags, max_pages=10, id=''):
+    def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         global COUNT
-        loop_msg = True # avoid showing same msg twice
-        for loop in range(2): # run loop at most twice
+        loop_msg = True
+        for loop in range(2):
             if id:
                 add_tags = ''
-            url = f"{self.base_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
+            random_page = random.randint(1, max(1, int(max_pages)))
+            url = f"{self.base_url}&page={random_page}{add_tags}"
             self.booru_url = url
-            res = requests.get(url, headers=self.headers, timeout=10)
+            res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
             data = res.json()
             if not isinstance(data, list):
                 try:
@@ -715,28 +799,27 @@ class Danbooru(Booru):
                     data = []
             for post in data:
                 if isinstance(post, dict):
-                    post['tags'] = post.get('tag_string', '')
+                    post['tags'] = self._filter_tags_by_category(post, tag_categories)
             COUNT = len(data)
             if COUNT == 0:
                 max_pages = 2
-                # Danbooru does not have a way to know the amount of results available in the search, so we need to run the function again with a fixed amount of pages
                 while loop_msg:
                     print(f" Processing {COUNT} results.")
                     loop_msg = False
-                    # avoid showing same msg twice
                 continue
             else:
                 print(f"Found enough results")
             break
         return {'post': data}
 
-    def get_data_page(self, add_tags, page=0, id=''):
+    def get_data_page(self, add_tags, page=0, id='', tag_categories=None):
         global COUNT
         if id:
             add_tags = ''
-        url = f"{self.base_url}&page={page}{id}{add_tags}"
+        safe_page = max(1, int(page) + 1)
+        url = f"{self.base_url}&page={safe_page}{add_tags}"
         self.booru_url = url
-        res = requests.get(url, headers=self.headers, timeout=10)
+        res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
         data = res.json()
         if not isinstance(data, list):
             try:
@@ -745,73 +828,31 @@ class Danbooru(Booru):
                 data = []
         for post in data:
             if isinstance(post, dict):
-                post['tags'] = post.get('tag_string', '')
+                post['tags'] = self._filter_tags_by_category(post, tag_categories)
         COUNT = len(data)
         return {'post': data}
 
+    def _filter_tags_by_category(self, post, categories):
+        """Filter tags by selected categories."""
+        if not categories or not isinstance(categories, list):
+            return post.get('tag_string', '')
+        parts = []
+        for cat in categories:
+            field = f'tag_string_{cat}'
+            if field in post:
+                parts.append(post[field])
+        return ' '.join(parts) if parts else post.get('tag_string', '')
+
     def get_post(self, add_tags, max_pages=10, id=''):
+        if not id:
+            return self.get_data(add_tags, max_pages, '', tag_categories=None)
         self.booru_url = f"https://danbooru.donmai.us/posts/{id}.json"
-        res = requests.get(self.booru_url, headers=self.headers, timeout=10)
+        res = self.fetch_with_retry(self.booru_url, headers=self.headers, timeout=10)
         data = res.json()
-        data['tags'] = data['tag_string']
-        data = {'post': [data]}
-        return data
-
-
-class e621(Booru):
-
-    def __init__(self):
-        super().__init__('danbooru', f'https://e621.net/posts.json?limit={POST_AMOUNT}')
-
-    def _normalize_posts(self, data):
-        """Normalize e621 post format."""
-        for post in data:
-            temp_tags = []
-            sublevels = ['general', 'artist', 'copyright', 'character', 'species']
-            for sublevel in sublevels:
-                temp_tags.extend(post['tags'][sublevel])
-            post['tags'] = ' '.join(temp_tags)
-            post['score'] = post['score']['total']
-
-    def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
-        loop_msg = True # avoid showing same msg twice
-        for loop in range(2): # run loop at most twice
-            if id:
-                add_tags = ''
-            url = f"{self.base_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
-            self.booru_url = url
-            res = requests.get(url, headers=self.headers, timeout=10)
-            data = res.json()['posts']
-            COUNT = len(data)
-            self._normalize_posts(data)
-            if COUNT <= max_pages*POST_AMOUNT:
-                max_pages = COUNT // POST_AMOUNT+1
-                # If max_pages is bigger than available pages, loop the function with updated max_pages based on the value of COUNT
-                while loop_msg:
-                    print(f" Processing {COUNT} results.")
-                    loop_msg = False
-                    # avoid showing same msg twice
-                continue
-            else:
-                print(f" Processing {max_pages*POST_AMOUNT} out of {COUNT} results.")
-            break
-        return {'post': data}
-
-    def get_data_page(self, add_tags, page=0, id=''):
-        global COUNT
-        if id:
-            add_tags = ''
-        url = f"{self.base_url}&page={page}{id}{add_tags}"
-        self.booru_url = url
-        res = requests.get(url, headers=self.headers, timeout=10)
-        data = res.json()['posts']
-        COUNT = len(data)
-        self._normalize_posts(data)
-        return {'post': data}
-
-    def get_post(self, add_tags, max_pages=10, id=''):
-        return self.get_data(add_tags, max_pages, "&id=" + id)
+        if isinstance(data, dict):
+            data['tags'] = data.get('tag_string', '')
+            return {'post': [data]}
+        return {'post': []}
 
 
 def generate_chaos(pos_tags, neg_tags, chaos_amount):
@@ -947,7 +988,7 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                      remove_bad_tags, remove_tags_str, shuffle_tags, change_dash,
                      limit_tags, max_tags, mature_rating,
                      api_key='', user_id_str='', save_credentials=False,
-                     use_remove_txt=False, choose_remove_txt=''):
+                     use_remove_txt=False, choose_remove_txt='', tag_categories=None):
     """从 booru 批量抓取多页帖子的 tags，返回 cleaned tag 字符串列表"""
     max_pages = int(max_pages)
 
@@ -1017,7 +1058,10 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
     for page in range(max_pages):
         try:
             if hasattr(api, 'get_data_page'):
-                data = api.get_data_page(add_tags, page=page)
+                if booru_name in ['danbooru', 'safebooru', 'aibooru', 'e621'] and tag_categories:
+                    data = api.get_data_page(add_tags, page, '', tag_categories)
+                else:
+                    data = api.get_data_page(add_tags, page)
             else:
                 data = api.get_data(add_tags, max_pages=1)
             posts = data.get('post', [])
@@ -1032,15 +1076,15 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                 raw_tags = post.get('tags', '')
                 if not raw_tags:
                     continue
-                clean = raw_tags.replace('(', r'\(').replace(')', r'\)')
-                tag_list = clean.split(' ')
+                # Split and filter bad tags first
+                tag_list = raw_tags.split(' ')
                 if shuffle_tags:
                     random.shuffle(tag_list)
-                # Remove bad tags
                 tag_list = [t for t in tag_list if t.strip() not in bad_tags]
                 for bt in bad_tags:
                     if '*' in bt:
                         tag_list = [t for t in tag_list if bt.replace('*', '') not in t]
+                # Join with commas
                 prompt_str = ','.join(tag_list)
                 if change_dash:
                     prompt_str = prompt_str.replace('_', ' ')
@@ -1197,7 +1241,7 @@ class Script(scripts.Script):
                            remove_bad_tags, remove_tags_str, shuffle_tags,
                            change_dash, limit_tags, max_tags, mature_rating,
                            api_key, user_id_str, save_credentials,
-                           use_remove_txt, choose_remove_txt, append_mode):
+                           use_remove_txt, choose_remove_txt, append_mode, tag_categories):
         """批量爬取并保存到缓存"""
         try:
             tags_list = batch_fetch_tags(
@@ -1205,7 +1249,7 @@ class Script(scripts.Script):
                 remove_bad_tags, remove_tags_str, shuffle_tags, change_dash,
                 limit_tags, max_tags, mature_rating,
                 api_key, user_id_str, save_credentials,
-                use_remove_txt, choose_remove_txt
+                use_remove_txt, choose_remove_txt, tag_categories
             )
             if not tags_list:
                 return "未抓取到任何 tag 数据", tag_cache_manager.get_status()
@@ -1223,7 +1267,7 @@ class Script(scripts.Script):
     @staticmethod
     def _cache_get_next(loop_mode):
         """从缓存顺序取出下一条"""
-        tags, idx, total = tag_cache_manager.get_next_tags(loop=loop_mode)
+        tags, idx, total = tag_cache_manager.get_next_tags_from_pool(loop=loop_mode)
         if tags is None:
             if total == 0:
                 return "缓存为空，请先批量爬取", tag_cache_manager.get_status()
@@ -1242,13 +1286,40 @@ class Script(scripts.Script):
         return "✅ 缓存文件已删除", tag_cache_manager.get_status()
 
     @staticmethod
+    def _cache_search(keyword):
+        """搜索缓存"""
+        results = tag_cache_manager.search_cache(keyword)
+        return results if results else []
+
+    @staticmethod
+    def _cache_fill_by_id(tag_id):
+        """根据ID填充标签"""
+        tags = tag_cache_manager.get_by_id(int(tag_id))
+        if tags:
+            return tags, f"✅ 已填充 ID {int(tag_id)}"
+        return "", f"❌ 未找到 ID {int(tag_id)}"
+
+    @staticmethod
+    def _cache_delete_by_id(tag_id):
+        """根据ID删除标签"""
+        success = tag_cache_manager.delete_by_id(int(tag_id))
+        if success:
+            return f"✅ 已删除 ID {int(tag_id)}", tag_cache_manager.get_status()
+        return f"❌ 删除失败", tag_cache_manager.get_status()
+
+    @staticmethod
     def _cache_refresh_status():
-        return tag_cache_manager.get_status()
+        pool_status = tag_cache_manager.get_filtered_pool_status()
+        using_pool = tag_cache_manager.is_using_filtered_pool()
+        status_msg = f"{tag_cache_manager.get_status()} | {pool_status}"
+        if using_pool:
+            status_msg += " [当前使用筛选池]"
+        return status_msg
 
     @staticmethod
     def _cache_get_next_and_set(loop_mode, tag_prompt_text, current_prompt):
         """从缓存顺序取出下一条并设置到提示词"""
-        tags, idx, total = tag_cache_manager.get_next_tags(loop=loop_mode)
+        tags, idx, total = tag_cache_manager.get_next_tags_from_pool(loop=loop_mode)
         if tags is None:
             if total == 0:
                 return "缓存为空，请先批量爬取", tag_cache_manager.get_status(), current_prompt
@@ -1260,7 +1331,48 @@ class Script(scripts.Script):
             combined = tags
         return tags, tag_cache_manager.get_status(), combined
 
+    @staticmethod
+    def _filter_tags(must_include, must_exclude):
+        """筛选标签"""
+        try:
+            results = tag_cache_manager.filter_tags_by_keywords(must_include, must_exclude)
+            if not results:
+                return [], "未找到匹配的标签"
+            return results, f"找到 {len(results)} 条匹配标签"
+        except Exception as e:
+            print(f"[Filter] Error: {e}")
+            return [], f"筛选出错: {e}"
+
+    @staticmethod
+    def _create_filtered_pool(selected_ids_str):
+        """创建筛选池"""
+        try:
+            if not selected_ids_str or not selected_ids_str.strip():
+                return "请输入要添加的 ID（逗号分隔）", tag_cache_manager.get_filtered_pool_status()
+            
+            id_list = [int(x.strip()) for x in selected_ids_str.split(',') if x.strip().isdigit()]
+            if not id_list:
+                return "未找到有效的 ID", tag_cache_manager.get_filtered_pool_status()
+            
+            count = tag_cache_manager.create_filtered_pool(id_list)
+            return f"✅ 筛选池已创建，包含 {count} 条标签", tag_cache_manager.get_filtered_pool_status()
+        except Exception as e:
+            print(f"[FilterPool] Error: {e}")
+            return f"创建失败: {e}", tag_cache_manager.get_filtered_pool_status()
+
+    @staticmethod
+    def _switch_to_filtered_pool(use_pool):
+        """切换到筛选池"""
+        msg = tag_cache_manager.use_filtered_pool(use_pool)
+        return msg, tag_cache_manager.get_filtered_pool_status()
+
+    @staticmethod
+    def _get_filtered_pool_status():
+        """获取筛选池状态"""
+        return tag_cache_manager.get_filtered_pool_status()
+
     def ui(self, is_img2img):
+        default_booru = "safebooru"
         # Determine initial Gelbooru credential visibility based on saved credentials
         has_saved = credentials_manager.has_credentials('gelbooru')
         saved_creds = credentials_manager.get_booru_credentials('gelbooru') if has_saved else {}
@@ -1287,7 +1399,13 @@ class Script(scripts.Script):
                         enabled = gr.Checkbox(label="Enabled", value=False)
                         with gr.Row():
                             with gr.Column(scale=1):
-                                booru = gr.Dropdown(["safebooru", "rule34", "danbooru", "gelbooru", 'aibooru', 'xbooru', 'e621'], label="Booru", value="safebooru")
+                                booru = gr.Dropdown(["safebooru", "rule34", "danbooru", "gelbooru", 'konachan', 'yande.re', 'aibooru', 'xbooru', 'e621'], label="Booru", value=default_booru)
+                                tag_categories = gr.CheckboxGroup(
+                                    ["general", "character", "copyright", "artist", "meta"],
+                                    value=["general", "character", "copyright"],
+                                    label="Tag Categories (Danbooru/Safebooru/AIBooru/e621)",
+                                    visible=default_booru in ['danbooru', 'safebooru', 'aibooru', 'e621']
+                                )
                                 max_pages = gr.Number(label="Max Pages", minimum=1, maximum=9999, value=100, step=1, precision=0)
                                 gr.Markdown("""## Post""")
                                 post_id = gr.Textbox(lines=1, label="Post ID")
@@ -1297,12 +1415,12 @@ class Script(scripts.Script):
                                     with gr.Group():
                                         prompt_output = gr.Textbox(lines=3, label="提示词输出")
                             with gr.Column(scale=1):
-                                mature_rating = gr.Radio(list(RATINGS['safebooru']), label="Mature Rating", value="All")
+                                mature_rating = gr.Radio(list(RATINGS[default_booru]), label="Mature Rating", value="All")
                                 remove_bad_tags = gr.Checkbox(label="Remove bad tags", value=True)
                                 shuffle_tags = gr.Checkbox(label="Shuffle tags", value=True)
                                 change_dash = gr.Checkbox(label='Convert "_" to spaces', value=False)
                                 same_prompt = gr.Checkbox(label="Use same prompt for all images", value=False)
-                                fringe_benefits = gr.Checkbox(label="Fringe Benefits", value=True)
+                                fringe_benefits = gr.Checkbox(label="Fringe Benefits", value=(default_booru == 'gelbooru'), visible=(default_booru == 'gelbooru'))
                                 with gr.Group(visible=False) as gelbooru_credentials_group:
                                     gr.Markdown("### API Credentials")
                                     api_key = gr.Textbox(
@@ -1329,6 +1447,11 @@ class Script(scripts.Script):
                         booru.change(get_available_ratings, booru, mature_rating)
                         booru.change(show_fringe_benefits, booru, fringe_benefits)
                         booru.change(self.show_gelbooru_api_fields, booru, gelbooru_credentials_group)
+                        booru.change(
+                            fn=lambda b: gr.update(visible=b in ['danbooru', 'safebooru', 'aibooru', 'e621']),
+                            inputs=[booru],
+                            outputs=[tag_categories]
+                        )
 
                         with gr.Accordion("Img2Img", open=False):
                             use_img2img = gr.Checkbox(label="Use img2img", value=False)
@@ -1379,18 +1502,80 @@ class Script(scripts.Script):
                                 cache_next_set_btn = gr.Button("▶ 取出并设置到提示词", variant="primary")
                             cache_next_output = gr.Textbox(label="当前取出的 Tag", interactive=False, lines=3)
                             
-                            # --- 新增部分开始 ---
                             gr.Markdown("#### ⚙️ 生成设置")
                             with gr.Row():
                                 use_local_cache_gen = gr.Checkbox(label="生成时使用此缓存", value=False)
                                 use_local_cache_loop = gr.Checkbox(label="生成时循环读取 (到末尾自动重头)", value=True)
-                            # --- 新增部分结束 ---
 
-                            gr.Markdown("#### 管理操作")
+                        # ─── 管理操作面板 ────────────────────────
+                        with gr.Accordion("缓存管理操作", open=False):
+                            gr.Markdown("### 🔧 搜索、删除、重置缓存")
+                            with gr.Row():
+                                cache_search_keyword = gr.Textbox(label="搜索关键词", placeholder="输入关键词搜索缓存", lines=1)
+                                cache_search_btn = gr.Button("🔍 搜索")
+                            cache_search_results = gr.Dataframe(
+                                headers=["ID", "Tags"],
+                                label="搜索结果",
+                                interactive=False,
+                                wrap=True
+                            )
+                            with gr.Row():
+                                cache_select_id = gr.Number(label="选择ID", minimum=1, step=1, precision=0)
+                                cache_fill_btn = gr.Button("📝 填充到输出")
+                                cache_delete_id_btn = gr.Button("🗑️ 删除此条", variant="stop")
                             with gr.Row():
                                 cache_reset_btn = gr.Button("🔁 重置索引")
-                                cache_delete_btn = gr.Button("🗑️ 删除缓存文件", variant="stop")
+                                cache_delete_btn = gr.Button("🗑️ 删除全部缓存", variant="stop")
                             cache_manage_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
+
+                        # ─── 标签筛选池面板 ────────────────────────────────
+                        with gr.Accordion("标签筛选池", open=False):
+                            gr.Markdown("### 🎯 从缓存中筛选特定标签，创建自定义标签池")
+                            
+                            with gr.Row():
+                                filter_must_include = gr.Textbox(
+                                    label="必须包含（逗号分隔）", 
+                                    placeholder="例如: 1girl,blue_eyes",
+                                    lines=1
+                                )
+                                filter_must_exclude = gr.Textbox(
+                                    label="必须排除（逗号分隔）", 
+                                    placeholder="例如: 2girls,multiple_girls",
+                                    lines=1
+                                )
+                            
+                            filter_search_btn = gr.Button("🔍 筛选标签", variant="primary")
+                            filter_result_msg = gr.Textbox(label="筛选结果", interactive=False, lines=1)
+                            
+                            filter_results = gr.Dataframe(
+                                headers=["ID", "Tags"],
+                                label="筛选结果（可复制 ID）",
+                                interactive=False,
+                                wrap=True
+                            )
+                            
+                            with gr.Row():
+                                filter_selected_ids = gr.Textbox(
+                                    label="选中的 ID（逗号分隔）",
+                                    placeholder="例如: 1,5,10,23",
+                                    lines=1
+                                )
+                                filter_create_pool_btn = gr.Button("✅ 创建筛选池", variant="primary")
+                            
+                            with gr.Row():
+                                filter_pool_status = gr.Textbox(
+                                    label="筛选池状态",
+                                    value=tag_cache_manager.get_filtered_pool_status(),
+                                    interactive=False,
+                                    lines=1
+                                )
+                                filter_refresh_status_btn = gr.Button("🔄 刷新")
+                            
+                            with gr.Row():
+                                filter_use_pool = gr.Checkbox(label="使用筛选池（而非主缓存）", value=False)
+                                filter_switch_btn = gr.Button("🔄 切换")
+                            
+                            filter_pool_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
 
         with InputAccordion(False, label="LoRAnado", elem_id=self.elem_id("lo_enable")) as lora_enabled:
             with gr.Group():
@@ -1441,7 +1626,7 @@ class Script(scripts.Script):
                     remove_bad_tags, remove_tags, shuffle_tags,
                     change_dash, limit_tags, max_tags, mature_rating,
                     api_key, user_id, save_credentials,
-                    use_remove_txt, choose_remove_txt, cache_append_mode],
+                    use_remove_txt, choose_remove_txt, cache_append_mode, tag_categories],
             outputs=[cache_fetch_result, cache_status_display]
         )
 
@@ -1463,6 +1648,49 @@ class Script(scripts.Script):
             outputs=[cache_manage_result, cache_status_display]
         )
 
+        cache_search_btn.click(
+            fn=self._cache_search,
+            inputs=[cache_search_keyword],
+            outputs=[cache_search_results]
+        )
+
+        cache_fill_btn.click(
+            fn=self._cache_fill_by_id,
+            inputs=[cache_select_id],
+            outputs=[cache_next_output, cache_manage_result]
+        )
+
+        cache_delete_id_btn.click(
+            fn=self._cache_delete_by_id,
+            inputs=[cache_select_id],
+            outputs=[cache_manage_result, cache_status_display]
+        )
+
+        # ─── 筛选池事件绑定 ───────────────────────────────────────────
+        filter_search_btn.click(
+            fn=self._filter_tags,
+            inputs=[filter_must_include, filter_must_exclude],
+            outputs=[filter_results, filter_result_msg]
+        )
+
+        filter_create_pool_btn.click(
+            fn=self._create_filtered_pool,
+            inputs=[filter_selected_ids],
+            outputs=[filter_pool_result, filter_pool_status]
+        )
+
+        filter_switch_btn.click(
+            fn=self._switch_to_filtered_pool,
+            inputs=[filter_use_pool],
+            outputs=[filter_pool_result, filter_pool_status]
+        )
+
+        filter_refresh_status_btn.click(
+            fn=self._get_filtered_pool_status,
+            inputs=[],
+            outputs=[filter_pool_status]
+        )
+
         target_prompt_box = self.prompt_area[1 if is_img2img else 0]
         if target_prompt_box is None:
             try:
@@ -1477,7 +1705,7 @@ class Script(scripts.Script):
         if target_prompt_box is not None:
             generate_prompt_btn.click(
                 fn=self.generate_and_set_prompt,
-                inputs=[booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_prompt_input, target_prompt_box],
+                inputs=[booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_prompt_input, target_prompt_box, tag_categories],
                 outputs=[prompt_output, target_prompt_box]
             )
 
@@ -1490,7 +1718,7 @@ class Script(scripts.Script):
         else:
             generate_prompt_btn.click(
                 fn=self.generate_prompts_only,
-                inputs=[booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags],
+                inputs=[booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_categories],
                 outputs=[prompt_output]
             )
 
@@ -1501,7 +1729,7 @@ class Script(scripts.Script):
                 outputs=[cache_next_output, cache_status_display]
             )
 
-        return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop]
+        return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories]
 
     def check_orientation(self, img):
         """Check if image is portrait, landscape or square"""
@@ -1539,7 +1767,7 @@ class Script(scripts.Script):
                 p.prompt = f'{lora_prompt} {p.prompt}'
         return p
 
-    def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, *args):
+    def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
         max_pages = int(max_pages)
         if use_cache:
             if HAS_REQUESTS_CACHE and not requests_cache.patcher.is_installed():
@@ -1577,8 +1805,8 @@ class Script(scripts.Script):
                 cache_prompts = []
                 # 为每一张图按顺序取出一个 Tag 串
                 for i in range(total_images):
-                    # 从缓存管理器获取下一条，并自动保存索引到硬盘
-                    tags_str, idx, total = tag_cache_manager.get_next_tags(loop=use_local_cache_loop)
+                    # 从缓存管理器获取下一条（自动判断使用主缓存还是筛选池）
+                    tags_str, idx, total = tag_cache_manager.get_next_tags_from_pool(loop=use_local_cache_loop)
                     
                     if tags_str is None:
                         print(f"[Ranbooru] ⚠️ 缓存已耗尽 (Index: {idx}/{total})，停止注入。")
@@ -1735,7 +1963,10 @@ class Script(scripts.Script):
             if post_id:
                 data = api_url.get_post(add_tags, max_pages, post_id)
             else:
-                data = api_url.get_data(add_tags, max_pages)
+                if booru in ['danbooru', 'safebooru', 'aibooru', 'e621'] and tag_categories:
+                    data = api_url.get_data(add_tags, max_pages, '', tag_categories)
+                else:
+                    data = api_url.get_data(add_tags, max_pages)
 
             print(api_url.booru_url)
             posts = data.get('post', [])
@@ -1780,8 +2011,7 @@ class Script(scripts.Script):
                         temp_tags = []
                         mix_max_tags = 0
                         for _ in range(0, mix_amount):
-                            if not post_id:
-                                random_mix_number = self.random_number(sorting_order, 1, len(data['post']))[0]
+                            random_mix_number = 0 if post_id else self.random_number(sorting_order, 1, len(data['post']))[0]
                             temp_tags.extend(data['post'][random_mix_number]['tags'].split(' '))
                             mix_max_tags = max(mix_max_tags, len(data['post'][random_mix_number]['tags'].split(' ')))
                         # distinct temp_tags
@@ -1795,9 +2025,9 @@ class Script(scripts.Script):
                         except IndexError:
                             raise Exception(
                                 "No posts found with those tags. Try lowering the pages or changing the tags.")
-                clean_tags = random_post['tags'].replace('(', r'\(').replace(')', r'\)')
-                temp_tags = random.sample(clean_tags.split(' '), len(clean_tags.split(' '))) if shuffle_tags else clean_tags.split(' ')
-                prompts.append(','.join(temp_tags))
+                raw_tags = random_post['tags']
+                temp_tags = random.sample(raw_tags.split(' '), len(raw_tags.split(' '))) if shuffle_tags else raw_tags.split(' ')
+                prompts.append(' '.join(temp_tags))
                 preview_urls.append(random_post.get('file_url', 'https://pic.re/image'))
                 # Debug picture
                 if DEBUG:
@@ -1807,18 +2037,18 @@ class Script(scripts.Script):
                 image_urls = [random_post['file_url']] if use_last_img else preview_urls
 
                 for img in image_urls:
-                    response = requests.get(img, headers=api_url.headers, timeout=10)
+                    response = self.fetch_with_retry(img, headers=api_url.headers, timeout=10)
                     last_img.append(Image.open(BytesIO(response.content)))
             new_prompts = []
             # Cleaning Tags
             for prompt in prompts:
-                prompt_tags = [tag for tag in html.unescape(prompt).split(',') if tag.strip() not in bad_tags]
+                prompt_tags = [tag for tag in html.unescape(prompt).split(' ') if tag.strip() not in bad_tags]
                 for bad_tag in bad_tags:
                     if '*' in bad_tag:
                         prompt_tags = [tag for tag in prompt_tags if bad_tag.replace('*', '') not in tag]
                 new_prompt = ','.join(prompt_tags)
                 if change_dash:
-                    new_prompt = new_prompt.replace("_", " ")
+                    new_prompt = new_prompt.replace('_', ' ')
                 new_prompts.append(new_prompt)
             prompts = new_prompts
             if len(prompts) == 1:
@@ -1874,6 +2104,8 @@ class Script(scripts.Script):
                     p.prompt = self.original_prompt
             if negative_mode == 'Negative' or chaos_mode in ['Chaos', 'Less Chaos']:
                 # NEGATIVE PROMPT FIX
+                if isinstance(p.negative_prompt, str):
+                    p.negative_prompt = [p.negative_prompt for _ in range(0, p.batch_size * p.n_iter)]
                 neg_prompt_tokens = []
                 for pr in p.negative_prompt:
                     neg_prompt_tokens.append(model_hijack.get_prompt_lengths(pr)[1])
@@ -1913,7 +2145,7 @@ class Script(scripts.Script):
                     p.prompt = [remove_repeated_tags(pr) for pr in p.prompt]
                 else:
                     p.prompt = modify_prompt(p.prompt, tagged_prompts, type_deepbooru)
-                    p.prompt = remove_repeated_tags(p.prompt[0])
+                    p.prompt = remove_repeated_tags(p.prompt)
 
             if use_img2img:
                 if not use_ip:
@@ -1934,7 +2166,7 @@ class Script(scripts.Script):
         elif lora_enabled:
             p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev)
 
-    def postprocess(self, p, processed, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, *args):
+    def postprocess(self, p, processed, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
         if use_img2img and not use_ip and enabled:
             print('Using pictures')
             if crop_center:
@@ -1979,7 +2211,7 @@ class Script(scripts.Script):
                 for img in self.last_img:
                     processed.images.append(img)
 
-    def generate_prompts_only(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags):
+    def generate_prompts_only(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_categories):
         max_pages = int(max_pages)
         if use_cache:
             if HAS_REQUESTS_CACHE and not requests_cache.patcher.is_installed():
@@ -2013,7 +2245,7 @@ class Script(scripts.Script):
                 rule34_api_key = saved_credentials.get('api_key', '')
                 rule34_user_id = saved_credentials.get('user_id', '')
 
-            booru_apis = {
+        booru_apis = {
             'gelbooru': Gelbooru(fringe_benefits, gelbooru_api_key, gelbooru_user_id),
             'rule34': Rule34(rule34_api_key, rule34_user_id),
             'safebooru': Safebooru(),
@@ -2069,7 +2301,7 @@ class Script(scripts.Script):
                 selected_tags = random.choice(filtered_tags)
                 tags = f'{tags},{selected_tags}' if tags else selected_tags
 
-                add_tags = '&tags=-animated'
+        add_tags = '&tags=-animated'
         if tags:
             add_tags += '+' + tags.replace(',', '+')
             if mature_rating != 'All':
@@ -2079,7 +2311,10 @@ class Script(scripts.Script):
         if post_id:
             data = api_url.get_post(add_tags, max_pages, post_id)
         else:
-            data = api_url.get_data(add_tags, max_pages)
+            if booru in ['danbooru', 'safebooru', 'aibooru', 'e621'] and tag_categories:
+                data = api_url.get_data(add_tags, max_pages, '', tag_categories)
+            else:
+                data = api_url.get_data(add_tags, max_pages)
         posts = data.get('post', [])
         if not isinstance(posts, list):
             posts = []
@@ -2121,12 +2356,13 @@ class Script(scripts.Script):
         else:
             rp = posts[rn]
 
-        clean_tags = rp['tags'].replace('(', r'\(').replace(')', r'\)')
-        temp_tags = random.sample(clean_tags.split(' '), len(clean_tags.split(' '))) if shuffle_tags else clean_tags.split(' ')
-        prompt = ','.join([t for t in temp_tags if t.strip() not in bad_tags])
+        raw_tags = rp['tags']
+        temp_tags = random.sample(raw_tags.split(' '), len(raw_tags.split(' '))) if shuffle_tags else raw_tags.split(' ')
+        tag_list = [t for t in temp_tags if t.strip() not in bad_tags]
         for bt in bad_tags:
             if '*' in bt:
-                prompt = ','.join([t for t in prompt.split(',') if bt.replace('*', '') not in t])
+                tag_list = [t for t in tag_list if bt.replace('*', '') not in t]
+        prompt = ','.join(tag_list)
         if change_dash:
             prompt = prompt.replace('_', ' ')
         if limit_tags < 1:
@@ -2136,8 +2372,8 @@ class Script(scripts.Script):
         final_prompt = f'{prompt_addition},{prompt}' if prompt_addition else prompt
         return final_prompt
 
-    def generate_and_set_prompt(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_prompt_text, current_prompt):
-        final_prompt = self.generate_prompts_only(booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags)
+    def generate_and_set_prompt(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_prompt_text, current_prompt, tag_categories):
+        final_prompt = self.generate_prompts_only(booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_categories)
         if not final_prompt or final_prompt.strip() == '' or final_prompt == '未找到符合条件的帖子':
             return final_prompt, current_prompt
         if tag_prompt_text and tag_prompt_text.strip():
@@ -2189,7 +2425,6 @@ class Script(scripts.Script):
             else:
                 orig_prompt = self.original_prompt
             deepbooru.model.start()
-            for img, prompt in zip(self.last_img, orig_prompt):
-                final_prompts = [prompt + ',' + deepbooru.model.tag_multi(img) for img in self.last_img]
+            final_prompts = [prompt + ',' + deepbooru.model.tag_multi(img) for img, prompt in zip(self.last_img, orig_prompt)]
             deepbooru.model.stop()
             return final_prompts

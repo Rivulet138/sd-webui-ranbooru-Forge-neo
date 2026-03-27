@@ -51,7 +51,7 @@
 - Gelbooru 与 Rule34 的 API 调用可能需要凭证：`API Key` 与 `User ID`。
 - 在选择站点后，面板会显示对应的输入框，并提供 `Save credentials` 选项。
 - 勾选保存后，凭证会持久化到：
-  - `extensions/sd-webui-ranbooru-forge/user/credentials/credentials.json`
+  - `extensions/sd-webui-ranbooru-reforge/user/credentials/credentials.json`
 - 当保存成功时，UI 会隐藏输入框并显示状态信息；你可以随时点击 `Clear saved credentials` 清除。
 
 ## 使用示例
