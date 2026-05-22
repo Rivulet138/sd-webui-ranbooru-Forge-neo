@@ -1,7 +1,8 @@
 # Ranbooru Forge / Ranbooru Reforge
 
-> 适配 **AUTOMATIC1111 Stable Diffusion WebUI / Forge** 的增强扩展。  
-> 从多个 Booru 站点随机抓取标签，自动生成可用提示词（Prompt），支持 Img2Img、Deepbooru 自动打标、LoRAnado、标签缓存与筛选池等能力，帮助你快速构造多样化生成工作流。
+适配 **AUTOMATIC1111 Stable Diffusion WebUI / Forge / Forge Classic Neo** 的增强扩展。
+
+Ranbooru Reforge 可以从多个 Booru 站点抓取图片标签，清理后生成可直接写入 Prompt 的 tag。它同时提供本地 SQLite 标签缓存、可复用规则池、增强搜索语法、批量抓取过滤、LoRAnado、Img2Img / ControlNet 辅助流程等能力，适合批量生成和离线 tag 库工作流。
 
 ![Ranbooru 面板](pics/ranbooru.png)
 
@@ -9,54 +10,37 @@
 
 ## 目录
 
-- [项目简介](#项目简介)
 - [核心特性](#核心特性)
 - [支持站点](#支持站点)
 - [安装方式](#安装方式)
-- [快速开始（3 分钟上手）](#快速开始3-分钟上手)
-- [参数总览](#参数总览)
-- [高级功能](#高级功能)
-  - [Img2Img / ControlNet / Deepbooru](#img2img--controlnet--deepbooru)
-  - [LoRAnado（LoRA 随机器）](#loranadoloRA-随机器)
-  - [Tag 缓存系统（SQLite）](#tag-缓存系统sqlite)
-  - [标签筛选池（Filtered Pool）](#标签筛选池filtered-pool)
+- [快速开始](#快速开始)
+- [Tag 缓存系统](#tag-缓存系统)
+- [搜索语法](#搜索语法)
+- [规则池](#规则池)
+- [提示词写入模式](#提示词写入模式)
+- [抓取过滤与质量控制](#抓取过滤与质量控制)
+- [其他功能](#其他功能)
 - [凭证与隐私](#凭证与隐私)
-- [典型使用场景](#典型使用场景)
+- [常见问题](#常见问题)
 - [目录结构](#目录结构)
-- [已知问题](#已知问题)
-- [常见问题 FAQ](#常见问题-faq)
 - [更新记录与反馈](#更新记录与反馈)
-
----
-
-## 项目简介
-
-Ranbooru Forge（Reforge）是 Ranbooru 的增强分支，围绕以下目标优化：
-
-- 更稳定的标签生成流程
-- 更丰富的随机化和控制能力
-- 更实用的缓存与离线工作流
-- 更适合批量生成与实验型工作流
-
-适合人群：
-
-- 需要快速构建提示词的人
-- 需要批量生成且希望每张图提示词不同的人
-- 需要在“随机”与“可控”之间平衡的人
 
 ---
 
 ## 核心特性
 
-- ✅ 多 Booru 数据源随机抓取标签
-- ✅ 标签去重、打乱、数量限制、坏标签清理
-- ✅ `Tags to Search` + `Tags to Remove` 双向控制
-- ✅ Img2Img 模式，支持使用上一张图、中心裁剪、ControlNet 发送
-- ✅ Deepbooru 自动打标（前置 / 后置 / 替换）
-- ✅ LoRAnado：随机挑选 LoRA + 权重控制 + 锁定上轮
-- ✅ 文件驱动标签（`tags_search.txt` / `tags_remove.txt`）
-- ✅ SQLite 标签缓存（本地离线顺序读取）
-- ✅ 标签筛选池（从缓存中按关键词筛选并建立可切换池）
+- 多 Booru 数据源随机抓取标签。
+- `Tags to Search` + `Tags to Remove` 双向控制。
+- 内置坏标签黑名单，抓取和生成时可永久过滤水印、文字、打码等低价值 tag。
+- 支持标签打乱、数量限制、下划线转空格、背景/色彩 tag 策略。
+- SQLite 本地缓存，支持离线顺序读取、循环读取、按 ID 取 tag。
+- 缓存记录升级为元数据结构：保存 `booru / post_id / score / rating / source_url / preview_url / raw tags / prompt tags`。
+- 写入 Prompt 时只会写入清理后的 tag，不会把元数据写入 Prompt。
+- 增强搜索语法：支持 `+include -exclude`。
+- 可复用规则池：保存筛选规则、排序方式和读取上限，适合大型缓存库。
+- 批量抓取支持入库去重、可选最低分过滤，并显示新增/重复/跳过统计。
+- 提示词写入模式：追加到后面、追加到前面、替换、只输出。
+- Img2Img、ControlNet、LoRAnado、DeepBooru 兼容路径。
 
 ---
 
@@ -72,143 +56,259 @@ Ranbooru Forge（Reforge）是 Ranbooru 的增强分支，围绕以下目标优�
 - `xbooru`
 - `e621`
 
-> 注：不同站点对内容分级、Post ID、API 等支持不完全一致。
+不同站点对 `Post ID`、分级、API 凭证、score 字段和 tag 分类的支持并不完全一致。
 
 ---
 
 ## 安装方式
 
-### 方式一（推荐）
-
-将仓库克隆到 WebUI 的 `extensions` 目录：
+在 WebUI 的 `extensions` 目录执行：
 
 ```bash
 git clone -b kemomimi --single-branch https://github.com/Rivulet138/sd-webui-ranbooru-reforge.git extensions/sd-webui-ranbooru-reforge
 ```
-## 快速开始（3 分钟上手）
 
-1. 打开 Ranbooru 面板并勾选 **Enabled**
-2. 选择 Booru
-3. 在 **Tags to Search (Pre)** 填写搜索标签（逗号分隔，如 `1girl,blue_eyes,long_hair`）
-4. 点击 **生成提示词**
-5. 生成结果会显示在输出框，并可写入 WebUI prompt
-6. 点击 WebUI **Generate** 开始出图
+然后重启 WebUI / Forge。
 
 ---
 
-## 参数总览
+## 快速开始
 
-### 基础参数
-- **Booru**：数据源站点
-- **Max Pages**：随机搜索页上限（影响样本范围）
-- **Post ID**：指定图片 ID（留空则随机）
-- **Tags to Search (Pre)**：预搜索标签（逗号分隔）
-- **Tags to Remove (Post)**：后处理移除标签（支持 `*` 通配）
-- **Mature Rating**：按站点支持筛选分级内容
+1. 打开 Ranbooru 面板并勾选 **Enabled**。
+2. 选择 Booru。
+3. 在 **Tags to Search (Pre)** 输入搜索 tag，例如 `1girl,blue_eyes,long_hair`。
+4. 点击 **生成提示词**。
+5. 选择写入模式后，把结果写入 WebUI Prompt。
+6. 点击 WebUI **Generate** 出图。
 
-### 标签处理参数
-- **Remove bad tags**：清理水印/文字/打码等低价值标签
-- **Shuffle tags**：打乱标签顺序
-- **Convert "_" to spaces**：下划线转空格（`blue_eyes` -> `blue eyes`）
-- **Limit tags**：保留比例
-- **Max tags**：保留标签最大数量
+离线批量工作流：
 
-### 视觉风格参数
-- **Change Background**：背景相关标签策略（添加/移除/清空）
-- **Change Color**：色彩倾向策略（彩色/有限调色板/单色）
-- **Sorting Order**：随机/高分优先/低分优先
-
-### 批处理相关
-- **Use same prompt for all images**：同批次共用提示词
-- **Use same seed**：同批次共用随机种子
+1. 在 **Tag 缓存管理** 中批量爬取 tag。
+2. 根据需要启用入库去重和最低 score 过滤。
+3. 在 **标签筛选池** 中用规则筛选缓存。
+4. 勾选 **生成时使用此缓存**。
+5. 生成时会按主缓存或当前规则池顺序取 tag。
 
 ---
 
-## 高级功能
+## Tag 缓存系统
 
-### Img2Img / ControlNet / Deepbooru
-- **Use img2img**：启用图生图模式
-- **Send to Controlnet**：发送图像到 ControlNet（需已安装）
-- **Denoising**：重绘强度（建议从 0.5~0.75 测试）
-- **Use last image as img2img**：使用上一轮图像
-- **Crop Center**：中心裁剪
-- **Use Deepbooru**：自动识别图像标签
-- **Deepbooru Tags Position**：
-  - Add Before（前置）
-  - Add After（后置）
-  - Replace（替换原提示词）
+缓存文件：
 
-### LoRAnado（LoRA 随机器）
-- 从指定 LoRA 文件夹随机选取 N 个 LoRA
-- 支持最小/最大权重范围
-- 支持自定义权重列表（逗号分隔）
-- 支持锁定上轮 LoRA 组合（Lock previous LoRAs）
+```text
+user/cache/tag_cache.db
+```
 
-**常见搭配：**
-- LoRAs Amount = 2~3
-- Min/Max Weight = 0.3~0.8
-- 与 Mix prompts 一起可增加随机性
+缓存现在不再只保存一串 tag，而是保存完整记录：
 
-### Tag 缓存系统（SQLite）
-**缓存文件**：`user/cache/tag_cache.db`
+```text
+booru
+post_id
+tags_raw
+tags_prompt
+score
+rating
+source_url
+preview_url
+search_query
+created_at
+```
 
-**支持能力：**
-- 批量爬取标签到本地数据库
-- 追加模式 / 覆盖模式
-- 顺序读取下一条标签（可循环）
-- 按关键词搜索缓存
-- 按 ID 查看、填充、删除
-- 重置索引并持久化保存（重启后可续）
+说明：
 
-**适合场景：**
-- 大批量生成时避免每次联网
-- 想要“每张图不同提示词但可追踪”的流程
+- `tags_raw` 是站点返回的原始 tag。
+- `tags_prompt` 是经过坏标签过滤、移除规则、数量限制等处理后的 tag。
+- 写入 Prompt、顺序读取、按 ID 取出时只返回 `tags_prompt`。
+- 旧版只有 `tags` 字段的缓存库会自动迁移，不需要手动重建。
 
-### 标签筛选池（Filtered Pool）
-这是本分支的重要增强能力：
-- 从主缓存按关键词筛选（必须包含 / 必须排除）
-- 将选中的 ID 生成独立 `filtered_pool`
-- 可在“主缓存 / 筛选池”之间切换
-- 切换状态持久化保存到数据库 metadata
-- 生成时可按当前数据源顺序输出标签
+常用操作：
 
-**典型示例：**
-- **只保留单人**： 包含：`1girl` 排除：`2girls,multiple_girls`
-- **指定发色**： 包含：`1girl,blue_hair` 排除：`blonde_hair,red_hair`
+- **开始批量爬取**：从当前 Booru 和搜索条件抓取 tag 并入库。
+- **追加模式**：保留旧缓存，只追加新记录。
+- **覆盖模式**：清空旧缓存并重新保存。
+- **入库去重**：按 `booru + post_id` 去重；没有 post id 时按 tag 字符串去重。
+- **按缓存 ID 取 Tag**：例如输入 `544`，可直接取出缓存 ID 为 544 的清理后 tag。
+- **取出下一条**：按主缓存或规则池顺序读取下一条。
+- **重置索引**：把顺序读取位置重置到 0。
+
+---
+
+## 搜索语法
+
+缓存搜索和规则池都支持增强语法：
+
+```text
++1girl +blue_eyes -2girls -text
+```
+
+含义：
+
+- `+tag`：必须包含。
+- `-tag`：必须排除。
+- 普通词：等同于必须包含。
+- 逗号、中文逗号、换行也可以作为分隔。
+
+示例：
+
+```text
++1girl +blue_hair -2girls -watermark
+```
+
+也可以使用面板里的 **必须包含** / **必须排除** 输入框：
+
+```text
+必须包含：1girl, blue_eyes
+必须排除：2girls, multiple_girls, text
+```
+
+搜索结果会显示：
+
+```text
+ID / Booru / Post ID / Score / Rating / Tags
+```
+
+---
+
+## 规则池
+
+规则池是筛选池的升级版，适合大量缓存时反复使用。
+
+一个规则包含：
+
+- 规则名称。
+- 搜索语法。
+- 必须包含。
+- 必须排除。
+- 排序方式：`ID`、`Newest`、`Oldest`、`High Score`、`Low Score`、`Random`。
+- 读取上限：`0` 表示不限。
+
+典型流程：
+
+1. 在 **标签筛选池** 输入搜索语法，例如：
+
+   ```text
+   +1girl +blue_eyes -2girls -text
+   ```
+
+2. 点击 **筛选标签** 预览命中记录。
+3. 填写规则名称，例如 `blue eyes solo`。
+4. 点击 **保存并启用规则池**。
+5. 勾选 **使用筛选池（而非主缓存）** 并点击 **切换**。
+6. 之后 **取出下一条** 或 **生成时使用此缓存** 会从当前规则池读取。
+
+仍然保留手动 ID 池：
+
+- 在 **手动 ID** 中输入 `1,5,10,23`。
+- 点击 **用手动 ID 创建筛选池**。
+- 适合少量精确挑选。
+
+批量操作：
+
+- **刷新规则列表**：查看所有规则。
+- **启用规则**：输入规则 ID 后切换到该规则池。
+- **删除规则**：删除不再需要的规则。
+- **删除当前筛选命中**：按当前搜索/包含/排除条件批量删除缓存记录。为空条件时会拒绝执行，避免误删全部缓存。
+
+---
+
+## 提示词写入模式
+
+写入模式控制 tag 如何写入目标 Prompt：
+
+- **追加到后面**：`原 prompt,缓存 tag`
+- **追加到前面**：`缓存 tag,原 prompt`
+- **替换**：直接用缓存 tag 替换原 prompt
+- **只输出**：只显示结果，不写入 Prompt
+
+这些模式适用于：
+
+- 生成提示词按钮。
+- 缓存下一条写入。
+- 按缓存 ID 写入。
+- 生成时使用本地缓存。
+
+---
+
+## 抓取过滤与质量控制
+
+批量抓取时可以控制入库质量：
+
+- **Remove bad tags**：使用插件内置坏标签黑名单永久过滤低价值 tag。
+- **Tags to Remove (Post)**：追加你自己的移除规则，支持 `*` 通配。
+- **入库去重**：避免同一站点同一 post 重复入库。
+- **启用最低分过滤**：只保存 score 大于等于指定值的记录。
+- 抓取结果会显示新增、重复跳过、低分跳过、空 tag 跳过和缓存总数。
+
+没有做的控制：
+
+- 不按 tag 字符串相似度去重。
+- 不做最少 tag 数过滤。
+
+---
+
+## 其他功能
+
+### Img2Img / ControlNet / DeepBooru
+
+- **Use img2img**：启用图生图流程。
+- **Send to Controlnet**：把图像发送到 ControlNet，需安装 ControlNet。
+- **Denoising**：重绘强度。
+- **Use last image as img2img**：使用上一张图作为输入。
+- **Crop Center**：中心裁剪。
+- **Use Deepbooru**：如果当前 WebUI 构建提供 DeepBooru，则可自动打标；Forge Classic Neo 不提供旧 DeepBooru 模块时，此项会禁用。
+
+### LoRAnado
+
+- 从指定 LoRA 子文件夹随机挑选 LoRA。
+- 支持数量、权重范围、自定义权重和锁定上一轮组合。
+
+### 文件驱动 tag
+
+- `user/search/tags_search.txt`
+- `user/remove/tags_remove.txt`
+
+适合维护固定的搜索池和移除池。
 
 ---
 
 ## 凭证与隐私
 
-gelbooru 与 rule34 可能需要 API 凭证：
+`gelbooru` 与 `rule34` 可能需要 API 凭证：
+
 - API Key
 - User ID
 
-**保存后写入本地：**
-`user/credentials/credentials.json`
+保存后写入：
 
-你可通过 **Clear saved credentials** 清除。
+```text
+user/credentials/credentials.json
+```
 
-> **注意：** 建议不要公开上传你的凭证文件。
+不要公开上传你的凭证文件。
 
 ---
 
-## 典型使用场景
+## 常见问题
 
-**场景 1：快速随机探索**
-- 开启 Remove bad tags + Shuffle tags
-- Sorting Order = Random
-- 多次点击生成，快速探索构图方向
+### 提示 No posts found？
 
-**场景 2：批量不重复生成**
-- 先批量抓取标签到缓存
-- 生成时启用缓存读取 + 循环
-- 关闭 Use same prompt for all images
+降低 `Max Pages`、减少搜索 tag、切换站点，或检查网络/API 凭证。
 
-**场景 3：高可控角色批量**
-- 使用筛选池保留“必须元素”
-- 排除不希望出现的角色数或题材标签
-- 再结合 LoRAnado 做风格微随机
+### 缓存 ID 和站点 Post ID 是一回事吗？
+
+不是。缓存 ID 是本地 SQLite 的自增 ID；站点 Post ID 是 Booru 返回的原始帖子 ID。按 ID 取 tag 使用的是本地缓存 ID。
+
+### 规则池会把 score、URL 等元数据写进 Prompt 吗？
+
+不会。规则池只用元数据筛选和排序，写入 Prompt 的始终只有清理后的 `tags_prompt`。
+
+### 如何完全离线使用？
+
+先批量爬取到本地缓存，然后勾选 **生成时使用此缓存**。如果启用了规则池，生成会从规则池读取；否则从主缓存读取。
+
+### 缓存索引怎么重置？
+
+在缓存管理面板点击 **重置索引**。
 
 ---
 
@@ -218,8 +318,7 @@ gelbooru 与 rule34 可能需要 API 凭证：
 sd-webui-ranbooru-reforge/
 ├── scripts/
 │   ├── ranbooru.py
-│   ├── cache_db.py
-│   └── prompt_cleaner.py
+│   └── cache_db.py
 ├── user/
 │   ├── search/
 │   │   └── tags_search.txt
@@ -236,34 +335,15 @@ sd-webui-ranbooru-reforge/
 ├── 更新日志.txt
 └── install.py
 ```
+
 ---
 
-## 已知问题
-- 批次较大时，Chaos/Negative 模式可能偶发异常（重试通常可恢复）
-- 与 `sd-dynamic-prompts` 同用时可能冲突
-- 当前 Img2Img/ControlNet 流程存在占位图步骤（属于现有实现限制）
----
-## 常见问题 FAQ
-Q1：提示 No posts found？
-
-A：降低 Max Pages、减少标签数量、切换站点、检查网络。
-
-Q2：标签太多/太少？
-
-A：调整 Limit tags 与 Max tags，并结合标签分类/移除规则。
-
-Q3：如何完全离线使用？
-
-A：先批量爬取到本地缓存，然后生成时启用缓存读取。
-
-Q4：缓存索引怎么重置？
-
-A：在缓存管理面板点击“重置索引
----
 ## 更新记录与反馈
-详细说明请查看：
+
+详细说明可查看：
+
 - `更新日志.txt`
 - `使用说明.txt`
 - `usage.md`
-欢迎提交 Issue / PR 提出改进建议。  
-本项目基于社区版本改造与增强，感谢原作者及贡献。
+
+欢迎提交 Issue / PR 提出改进建议。
