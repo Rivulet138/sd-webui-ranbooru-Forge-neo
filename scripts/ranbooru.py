@@ -1,6 +1,7 @@
 from io import BytesIO
 import html
 import random
+import re
 import requests
 import modules.scripts as scripts
 from modules.scripts import OnComponent
@@ -19,12 +20,42 @@ except Exception:
 
 from modules.processing import process_images, StableDiffusionProcessingImg2Img
 from modules import shared
-from modules.sd_hijack import model_hijack
-from modules import deepbooru
+try:
+    from modules.sd_hijack import model_hijack
+except Exception:
+    model_hijack = None
+try:
+    from modules import sd_models
+except Exception:
+    sd_models = None
+try:
+    from modules import deepbooru
+except Exception:
+    deepbooru = None
 try:
     from modules.ui_components import InputAccordion
 except Exception:
     InputAccordion = gr.Accordion
+
+
+def get_prompt_lengths(prompt):
+    if model_hijack is not None and hasattr(model_hijack, "get_prompt_lengths"):
+        return model_hijack.get_prompt_lengths(prompt)
+
+    sd_model = getattr(shared, "sd_model", None)
+    if sd_model is None and sd_models is not None:
+        sd_model = getattr(getattr(sd_models, "model_data", None), "sd_model", None)
+
+    get_lengths = getattr(sd_model, "get_prompt_lengths_on_ui", None)
+    if get_lengths is not None:
+        return get_lengths(prompt)
+
+    token_count = len(str(prompt).strip("!,. ").replace(" ", ",").replace(".", ",").replace("!", ",").split(","))
+    return token_count, max(75, ((max(token_count, 1) + 74) // 75) * 75)
+
+
+def has_deepbooru():
+    return deepbooru is not None and getattr(deepbooru, "model", None) is not None
 
 
 
@@ -988,8 +1019,9 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                      remove_bad_tags, remove_tags_str, shuffle_tags, change_dash,
                      limit_tags, max_tags, mature_rating,
                      api_key='', user_id_str='', save_credentials=False,
-                     use_remove_txt=False, choose_remove_txt='', tag_categories=None):
-    """从 booru 批量抓取多页帖子的 tags，返回 cleaned tag 字符串列表"""
+                     use_remove_txt=False, choose_remove_txt='', tag_categories=None,
+                     min_score_enabled=False, min_score=0):
+    """Fetch posts from booru and return metadata records with cleaned prompt tags."""
     max_pages = int(max_pages)
 
     gelbooru_api_key = None
@@ -1054,7 +1086,15 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
         except Exception:
             pass
 
-    all_tags = []
+    records = []
+    stats = {
+        "pages_done": 0,
+        "posts_seen": 0,
+        "kept": 0,
+        "skipped_score": 0,
+        "skipped_empty": 0,
+    }
+    min_score_value = int(min_score or 0)
     for page in range(max_pages):
         try:
             if hasattr(api, 'get_data_page'):
@@ -1070,11 +1110,21 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
             if len(posts) == 0:
                 print(f"[TagCache] 第 {page+1} 页无数据，停止抓取")
                 break
+            stats["pages_done"] += 1
+            stats["posts_seen"] += len(posts)
             for post in posts:
                 if not isinstance(post, dict):
                     continue
+                try:
+                    score = int(float(post.get('score') or 0))
+                except Exception:
+                    score = 0
+                if min_score_enabled and score < min_score_value:
+                    stats["skipped_score"] += 1
+                    continue
                 raw_tags = post.get('tags', '')
                 if not raw_tags:
+                    stats["skipped_empty"] += 1
                     continue
                 # Split and filter bad tags first
                 tag_list = raw_tags.split(' ')
@@ -1093,13 +1143,27 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                 if max_tags > 0:
                     prompt_str = limit_prompt_tags(prompt_str, int(max_tags), 'Max')
                 if prompt_str.strip():
-                    all_tags.append(prompt_str)
+                    post_id = post.get('id') or post.get('post_id') or post.get('md5') or ''
+                    records.append({
+                        "booru": booru_name,
+                        "post_id": post_id,
+                        "tags_raw": raw_tags,
+                        "tags_prompt": prompt_str,
+                        "score": score,
+                        "rating": post.get('rating') or '',
+                        "source_url": post.get('source') or post.get('file_url') or post.get('sample_url') or post.get('jpeg_url') or '',
+                        "preview_url": post.get('preview_url') or post.get('preview_file_url') or post.get('sample_url') or '',
+                        "search_query": tags_search or '',
+                    })
+                    stats["kept"] += 1
+                else:
+                    stats["skipped_empty"] += 1
             print(f"[TagCache] 第 {page+1}/{max_pages} 页完成，获取 {len(posts)} 条")
         except Exception as ex:
             print(f"[TagCache] 第 {page+1} 页出错: {ex}")
             break
 
-    return all_tags
+    return records, stats
 
 
 def _is_hires_second_pass(p):
@@ -1241,25 +1305,34 @@ class Script(scripts.Script):
                            remove_bad_tags, remove_tags_str, shuffle_tags,
                            change_dash, limit_tags, max_tags, mature_rating,
                            api_key, user_id_str, save_credentials,
-                           use_remove_txt, choose_remove_txt, append_mode, tag_categories):
+                           use_remove_txt, choose_remove_txt, append_mode, tag_categories,
+                           cache_dedupe, min_score_enabled, min_score):
         """批量爬取并保存到缓存"""
         try:
-            tags_list = batch_fetch_tags(
+            records, fetch_stats = batch_fetch_tags(
                 booru, tags_search, max_pages, fringe_benefits,
                 remove_bad_tags, remove_tags_str, shuffle_tags, change_dash,
                 limit_tags, max_tags, mature_rating,
                 api_key, user_id_str, save_credentials,
-                use_remove_txt, choose_remove_txt, tag_categories
+                use_remove_txt, choose_remove_txt, tag_categories,
+                min_score_enabled, min_score
             )
-            if not tags_list:
+            if not records:
                 return "未抓取到任何 tag 数据", tag_cache_manager.get_status()
             if append_mode:
-                total = tag_cache_manager.append_cache(tags_list)
-                msg = f"✅ 追加完成！本次新增 {len(tags_list)} 条，缓存总计 {total} 条"
+                save_stats = tag_cache_manager.append_records(records, dedupe=cache_dedupe)
+                msg = (
+                    f"追加完成：新增 {save_stats['inserted']} 条，重复跳过 {save_stats['skipped_duplicate']} 条，"
+                    f"低分跳过 {fetch_stats['skipped_score']} 条，空 tag 跳过 {fetch_stats['skipped_empty']} 条，"
+                    f"缓存总计 {save_stats['total']} 条"
+                )
             else:
-                tag_cache_manager.save_cache(tags_list)
+                save_stats = tag_cache_manager.save_records(records, dedupe=cache_dedupe)
                 tag_cache_manager.reset_index()
-                msg = f"✅ 覆盖保存完成！共 {len(tags_list)} 条（索引已重置）"
+                msg = (
+                    f"覆盖保存完成：写入 {save_stats['inserted']} 条，重复跳过 {save_stats['skipped_duplicate']} 条，"
+                    f"低分跳过 {fetch_stats['skipped_score']} 条，索引已重置"
+                )
             return msg, tag_cache_manager.get_status()
         except Exception as ex:
             return f"❌ 错误: {ex}", tag_cache_manager.get_status()
@@ -1292,20 +1365,59 @@ class Script(scripts.Script):
         return results if results else []
 
     @staticmethod
+    def _parse_cache_id(tag_id):
+        if tag_id is None:
+            return None
+        match = re.search(r"\d+", str(tag_id))
+        return int(match.group(0)) if match else None
+
+    @staticmethod
+    def _combine_prompt(base_prompt, tags):
+        if base_prompt and str(base_prompt).strip():
+            return f"{str(base_prompt).strip()},{tags}"
+        return tags
+
+    @staticmethod
+    def _apply_write_mode(current_prompt, tags, write_mode):
+        current_prompt = str(current_prompt or "").strip()
+        tags = str(tags or "").strip()
+        if not tags or write_mode == "只输出":
+            return current_prompt
+        if write_mode == "替换":
+            return tags
+        if write_mode == "追加到前面":
+            return f"{tags},{current_prompt}" if current_prompt else tags
+        return f"{current_prompt},{tags}" if current_prompt else tags
+
+    @staticmethod
     def _cache_fill_by_id(tag_id):
         """根据ID填充标签"""
-        tags = tag_cache_manager.get_by_id(int(tag_id))
+        cache_id = Script._parse_cache_id(tag_id)
+        if cache_id is None:
+            return "", "请输入有效的缓存 ID"
+        tags = tag_cache_manager.get_by_id(cache_id)
         if tags:
-            return tags, f"✅ 已填充 ID {int(tag_id)}"
-        return "", f"❌ 未找到 ID {int(tag_id)}"
+            return tags, f"已取出 ID {cache_id}"
+        return "", f"未找到 ID {cache_id}"
+
+    @staticmethod
+    def _cache_fill_id_to_tag_prompt(tag_id, tag_prompt_text, write_mode):
+        """Fill Tag Prompt with a cached tag row by ID."""
+        tags, msg = Script._cache_fill_by_id(tag_id)
+        if not tags:
+            return "", msg, tag_prompt_text
+        return tags, msg, Script._apply_write_mode(tag_prompt_text, tags, write_mode)
 
     @staticmethod
     def _cache_delete_by_id(tag_id):
         """根据ID删除标签"""
-        success = tag_cache_manager.delete_by_id(int(tag_id))
+        cache_id = Script._parse_cache_id(tag_id)
+        if cache_id is None:
+            return "请输入有效的缓存 ID", tag_cache_manager.get_status()
+        success = tag_cache_manager.delete_by_id(cache_id)
         if success:
-            return f"✅ 已删除 ID {int(tag_id)}", tag_cache_manager.get_status()
-        return f"❌ 删除失败", tag_cache_manager.get_status()
+            return f"已删除 ID {cache_id}", tag_cache_manager.get_status()
+        return "删除失败", tag_cache_manager.get_status()
 
     @staticmethod
     def _cache_refresh_status():
@@ -1317,7 +1429,7 @@ class Script(scripts.Script):
         return status_msg
 
     @staticmethod
-    def _cache_get_next_and_set(loop_mode, tag_prompt_text, current_prompt):
+    def _cache_get_next_and_set(loop_mode, tag_prompt_text, current_prompt, write_mode):
         """从缓存顺序取出下一条并设置到提示词"""
         tags, idx, total = tag_cache_manager.get_next_tags_from_pool(loop=loop_mode)
         if tags is None:
@@ -1325,17 +1437,17 @@ class Script(scripts.Script):
                 return "缓存为空，请先批量爬取", tag_cache_manager.get_status(), current_prompt
             else:
                 return f"已到达缓存末尾 (索引 {idx}/{total})", tag_cache_manager.get_status(), current_prompt
-        if tag_prompt_text and tag_prompt_text.strip():
-            combined = f"{tag_prompt_text.strip()},{tags}"
-        else:
-            combined = tags
+        tag_payload = Script._combine_prompt(tag_prompt_text, tags)
+        combined = Script._apply_write_mode(current_prompt, tag_payload, write_mode)
         return tags, tag_cache_manager.get_status(), combined
 
     @staticmethod
-    def _filter_tags(must_include, must_exclude):
+    def _filter_tags(query, must_include, must_exclude, sort_order, preview_limit):
         """筛选标签"""
         try:
-            results = tag_cache_manager.filter_tags_by_keywords(must_include, must_exclude)
+            results = tag_cache_manager.filter_tags_by_keywords(
+                must_include, must_exclude, query, sort_order=sort_order, limit=int(preview_limit or 200)
+            )
             if not results:
                 return [], "未找到匹配的标签"
             return results, f"找到 {len(results)} 条匹配标签"
@@ -1350,7 +1462,7 @@ class Script(scripts.Script):
             if not selected_ids_str or not selected_ids_str.strip():
                 return "请输入要添加的 ID（逗号分隔）", tag_cache_manager.get_filtered_pool_status()
             
-            id_list = [int(x.strip()) for x in selected_ids_str.split(',') if x.strip().isdigit()]
+            id_list = list(dict.fromkeys(int(x) for x in re.findall(r"\d+", selected_ids_str)))
             if not id_list:
                 return "未找到有效的 ID", tag_cache_manager.get_filtered_pool_status()
             
@@ -1359,6 +1471,51 @@ class Script(scripts.Script):
         except Exception as e:
             print(f"[FilterPool] Error: {e}")
             return f"创建失败: {e}", tag_cache_manager.get_filtered_pool_status()
+
+    @staticmethod
+    def _create_filtered_pool_from_filter(rule_name, query, must_include, must_exclude, sort_order, limit_count):
+        """Create and activate a saved rule pool from include/exclude rules."""
+        try:
+            rule_id, count = tag_cache_manager.create_rule(
+                rule_name, query, must_include, must_exclude, sort_order, int(limit_count or 0)
+            )
+            if count <= 0:
+                return f"规则 #{rule_id} 已创建，但当前没有匹配条目", tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
+            return f"规则池已创建并启用：#{rule_id}，当前匹配 {count} 条", tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
+        except Exception as e:
+            print(f"[FilterPool] Error: {e}")
+            return f"创建失败: {e}", tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
+
+    @staticmethod
+    def _list_rules():
+        return tag_cache_manager.list_rules()
+
+    @staticmethod
+    def _activate_rule(rule_id):
+        cache_id = Script._parse_cache_id(rule_id)
+        if cache_id is None:
+            return "请输入有效的规则 ID", tag_cache_manager.get_filtered_pool_status()
+        return tag_cache_manager.activate_rule(cache_id), tag_cache_manager.get_filtered_pool_status()
+
+    @staticmethod
+    def _delete_rule(rule_id):
+        cache_id = Script._parse_cache_id(rule_id)
+        if cache_id is None:
+            return "请输入有效的规则 ID", tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
+        ok = tag_cache_manager.delete_rule(cache_id)
+        msg = f"已删除规则 #{cache_id}" if ok else f"未找到规则 #{cache_id}"
+        return msg, tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
+
+    @staticmethod
+    def _delete_filter_matches(query, must_include, must_exclude):
+        try:
+            if not any(str(value or "").strip() for value in (query, must_include, must_exclude)):
+                return "请先输入搜索语法、包含或排除条件，避免误删全部缓存", tag_cache_manager.get_status()
+            count = tag_cache_manager.delete_by_filter(must_include, must_exclude, query)
+            tag_cache_manager.reset_index()
+            return f"已删除当前筛选命中的 {count} 条缓存", tag_cache_manager.get_status()
+        except Exception as e:
+            return f"删除失败: {e}", tag_cache_manager.get_status()
 
     @staticmethod
     def _switch_to_filtered_pool(use_pool):
@@ -1459,7 +1616,7 @@ class Script(scripts.Script):
                             denoising = gr.Slider(value=0.75, label="Denoising", minimum=0.05, maximum=1.0, step=0.05)
                             use_last_img = gr.Checkbox(label="Use last image as img2img", value=False)
                             crop_center = gr.Checkbox(label="Crop Center", value=False)
-                            use_deepbooru = gr.Checkbox(label="Use Deepbooru", value=False)
+                            use_deepbooru = gr.Checkbox(label="Use Deepbooru", value=False, interactive=has_deepbooru())
                             type_deepbooru = gr.Radio(["Add Before", "Add After", "Replace"], label="Deepbooru Tags Position", value="Add Before")
                         with gr.Accordion("File", open=False):
                             use_search_txt = gr.Checkbox(label="Use tags_search.txt", value=False)
@@ -1491,6 +1648,10 @@ class Script(scripts.Script):
                             with gr.Row():
                                 cache_pages = gr.Number(label="爬取页数", minimum=1, maximum=100, value=5, step=1, precision=0)
                                 cache_append_mode = gr.Checkbox(label="追加模式（不覆盖已有缓存）", value=True)
+                                cache_dedupe = gr.Checkbox(label="入库去重", value=True)
+                            with gr.Row():
+                                cache_min_score_enabled = gr.Checkbox(label="启用最低分过滤", value=False)
+                                cache_min_score = gr.Number(label="最低 Score", value=0, step=1, precision=0)
                             cache_fetch_btn = gr.Button("🚀 开始批量爬取", variant="primary")
                             cache_fetch_result = gr.Textbox(label="爬取结果", interactive=False, lines=2)
 
@@ -1500,6 +1661,15 @@ class Script(scripts.Script):
                             with gr.Row():
                                 cache_next_btn = gr.Button("▶ 取出下一条")
                                 cache_next_set_btn = gr.Button("▶ 取出并设置到提示词", variant="primary")
+                                cache_prompt_write_mode = gr.Dropdown(
+                                    ["追加到后面", "追加到前面", "替换", "只输出"],
+                                    label="写入模式",
+                                    value="追加到后面"
+                                )
+                            with gr.Row():
+                                cache_lookup_id = gr.Textbox(label="按缓存 ID 取 Tag", placeholder="例如: 544", lines=1)
+                                cache_lookup_id_btn = gr.Button("按 ID 取出")
+                                cache_lookup_id_set_btn = gr.Button("按 ID 写入 Tag Prompt")
                             cache_next_output = gr.Textbox(label="当前取出的 Tag", interactive=False, lines=3)
                             
                             gr.Markdown("#### ⚙️ 生成设置")
@@ -1511,10 +1681,10 @@ class Script(scripts.Script):
                         with gr.Accordion("缓存管理操作", open=False):
                             gr.Markdown("### 🔧 搜索、删除、重置缓存")
                             with gr.Row():
-                                cache_search_keyword = gr.Textbox(label="搜索关键词", placeholder="输入关键词搜索缓存", lines=1)
+                                cache_search_keyword = gr.Textbox(label="搜索语法", placeholder="例如: +1girl +blue_eyes -2girls -text", lines=1)
                                 cache_search_btn = gr.Button("🔍 搜索")
                             cache_search_results = gr.Dataframe(
-                                headers=["ID", "Tags"],
+                                headers=["ID", "Booru", "Post ID", "Score", "Rating", "Tags"],
                                 label="搜索结果",
                                 interactive=False,
                                 wrap=True
@@ -1530,7 +1700,12 @@ class Script(scripts.Script):
 
                         # ─── 标签筛选池面板 ────────────────────────────────
                         with gr.Accordion("标签筛选池", open=False):
-                            gr.Markdown("### 🎯 从缓存中筛选特定标签，创建自定义标签池")
+                            gr.Markdown("### 🎯 用搜索语法创建可复用规则池")
+                            filter_query = gr.Textbox(
+                                label="搜索语法",
+                                placeholder="例如: +1girl +blue_eyes -2girls -text",
+                                lines=1
+                            )
                             
                             with gr.Row():
                                 filter_must_include = gr.Textbox(
@@ -1543,24 +1718,37 @@ class Script(scripts.Script):
                                     placeholder="例如: 2girls,multiple_girls",
                                     lines=1
                                 )
+                            with gr.Row():
+                                filter_sort_order = gr.Dropdown(
+                                    ["ID", "Newest", "Oldest", "High Score", "Low Score", "Random"],
+                                    label="规则排序",
+                                    value="ID"
+                                )
+                                filter_preview_limit = gr.Number(label="预览数量", minimum=1, maximum=2000, value=200, step=1, precision=0)
+                                filter_rule_limit = gr.Number(label="规则读取上限（0=不限）", minimum=0, maximum=100000, value=0, step=1, precision=0)
                             
-                            filter_search_btn = gr.Button("🔍 筛选标签", variant="primary")
+                            with gr.Row():
+                                filter_search_btn = gr.Button("🔍 筛选标签", variant="primary")
+                                filter_create_rule_pool_btn = gr.Button("✅ 保存并启用规则池", variant="primary")
                             filter_result_msg = gr.Textbox(label="筛选结果", interactive=False, lines=1)
                             
                             filter_results = gr.Dataframe(
-                                headers=["ID", "Tags"],
-                                label="筛选结果（可复制 ID）",
+                                headers=["ID", "Booru", "Post ID", "Score", "Rating", "Tags"],
+                                label="筛选预览",
                                 interactive=False,
                                 wrap=True
                             )
+
+                            filter_rule_name = gr.Textbox(label="规则名称", placeholder="可留空自动生成", lines=1)
                             
                             with gr.Row():
                                 filter_selected_ids = gr.Textbox(
-                                    label="选中的 ID（逗号分隔）",
+                                    label="手动 ID（可选，逗号分隔）",
                                     placeholder="例如: 1,5,10,23",
                                     lines=1
                                 )
-                                filter_create_pool_btn = gr.Button("✅ 创建筛选池", variant="primary")
+                                filter_create_pool_btn = gr.Button("✅ 用手动 ID 创建筛选池")
+                                filter_delete_matches_btn = gr.Button("🗑️ 删除当前筛选命中", variant="stop")
                             
                             with gr.Row():
                                 filter_pool_status = gr.Textbox(
@@ -1572,10 +1760,22 @@ class Script(scripts.Script):
                                 filter_refresh_status_btn = gr.Button("🔄 刷新")
                             
                             with gr.Row():
-                                filter_use_pool = gr.Checkbox(label="使用筛选池（而非主缓存）", value=False)
+                                filter_use_pool = gr.Checkbox(label="使用筛选池（而非主缓存）", value=tag_cache_manager.is_using_filtered_pool())
                                 filter_switch_btn = gr.Button("🔄 切换")
+                                filter_rule_id = gr.Textbox(label="规则 ID", placeholder="例如: 3", lines=1)
+                                filter_activate_rule_btn = gr.Button("启用规则")
+                                filter_delete_rule_btn = gr.Button("删除规则", variant="stop")
                             
                             filter_pool_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
+                            with gr.Row():
+                                filter_list_rules_btn = gr.Button("刷新规则列表")
+                            filter_rules = gr.Dataframe(
+                                headers=["ID", "Name", "Query", "Include", "Exclude", "Sort", "Limit", "Matches"],
+                                label="规则列表",
+                                value=tag_cache_manager.list_rules(),
+                                interactive=False,
+                                wrap=True
+                            )
 
         with InputAccordion(False, label="LoRAnado", elem_id=self.elem_id("lo_enable")) as lora_enabled:
             with gr.Group():
@@ -1626,7 +1826,8 @@ class Script(scripts.Script):
                     remove_bad_tags, remove_tags, shuffle_tags,
                     change_dash, limit_tags, max_tags, mature_rating,
                     api_key, user_id, save_credentials,
-                    use_remove_txt, choose_remove_txt, cache_append_mode, tag_categories],
+                    use_remove_txt, choose_remove_txt, cache_append_mode, tag_categories,
+                    cache_dedupe, cache_min_score_enabled, cache_min_score],
             outputs=[cache_fetch_result, cache_status_display]
         )
 
@@ -1634,6 +1835,18 @@ class Script(scripts.Script):
             fn=self._cache_get_next,
             inputs=[cache_loop_mode],
             outputs=[cache_next_output, cache_status_display]
+        )
+
+        cache_lookup_id_btn.click(
+            fn=self._cache_fill_by_id,
+            inputs=[cache_lookup_id],
+            outputs=[cache_next_output, cache_status_display]
+        )
+
+        cache_lookup_id_set_btn.click(
+            fn=self._cache_fill_id_to_tag_prompt,
+            inputs=[cache_lookup_id, tag_prompt_input, cache_prompt_write_mode],
+            outputs=[cache_next_output, cache_status_display, tag_prompt_input]
         )
 
         cache_reset_btn.click(
@@ -1669,8 +1882,14 @@ class Script(scripts.Script):
         # ─── 筛选池事件绑定 ───────────────────────────────────────────
         filter_search_btn.click(
             fn=self._filter_tags,
-            inputs=[filter_must_include, filter_must_exclude],
+            inputs=[filter_query, filter_must_include, filter_must_exclude, filter_sort_order, filter_preview_limit],
             outputs=[filter_results, filter_result_msg]
+        )
+
+        filter_create_rule_pool_btn.click(
+            fn=self._create_filtered_pool_from_filter,
+            inputs=[filter_rule_name, filter_query, filter_must_include, filter_must_exclude, filter_sort_order, filter_rule_limit],
+            outputs=[filter_pool_result, filter_pool_status, filter_rules]
         )
 
         filter_create_pool_btn.click(
@@ -1683,6 +1902,30 @@ class Script(scripts.Script):
             fn=self._switch_to_filtered_pool,
             inputs=[filter_use_pool],
             outputs=[filter_pool_result, filter_pool_status]
+        )
+
+        filter_activate_rule_btn.click(
+            fn=self._activate_rule,
+            inputs=[filter_rule_id],
+            outputs=[filter_pool_result, filter_pool_status]
+        )
+
+        filter_delete_rule_btn.click(
+            fn=self._delete_rule,
+            inputs=[filter_rule_id],
+            outputs=[filter_pool_result, filter_pool_status, filter_rules]
+        )
+
+        filter_delete_matches_btn.click(
+            fn=self._delete_filter_matches,
+            inputs=[filter_query, filter_must_include, filter_must_exclude],
+            outputs=[filter_pool_result, cache_status_display]
+        )
+
+        filter_list_rules_btn.click(
+            fn=self._list_rules,
+            inputs=[],
+            outputs=[filter_rules]
         )
 
         filter_refresh_status_btn.click(
@@ -1705,14 +1948,14 @@ class Script(scripts.Script):
         if target_prompt_box is not None:
             generate_prompt_btn.click(
                 fn=self.generate_and_set_prompt,
-                inputs=[booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_prompt_input, target_prompt_box, tag_categories],
+                inputs=[booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_prompt_input, target_prompt_box, tag_categories, cache_prompt_write_mode],
                 outputs=[prompt_output, target_prompt_box]
             )
 
             # Tag Cache: 取出并设置到提示词
             cache_next_set_btn.click(
                 fn=self._cache_get_next_and_set,
-                inputs=[cache_loop_mode, tag_prompt_input, target_prompt_box],
+                inputs=[cache_loop_mode, tag_prompt_input, target_prompt_box, cache_prompt_write_mode],
                 outputs=[cache_next_output, cache_status_display, target_prompt_box]
             )
         else:
@@ -1729,7 +1972,7 @@ class Script(scripts.Script):
                 outputs=[cache_next_output, cache_status_display]
             )
 
-        return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories]
+        return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, cache_prompt_write_mode]
 
     def check_orientation(self, img):
         """Check if image is portrait, landscape or square"""
@@ -1769,6 +2012,7 @@ class Script(scripts.Script):
 
     def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
         max_pages = int(max_pages)
+        cache_prompt_write_mode = args[0] if args else "追加到后面"
         if use_cache:
             if HAS_REQUESTS_CACHE and not requests_cache.patcher.is_installed():
                 requests_cache.install_cache('ranbooru_cache', backend='sqlite', expire_after=3600)
@@ -1831,8 +2075,7 @@ class Script(scripts.Script):
                     for j in range(total_images):
                         original = p.prompt[j] if j < len(p.prompt) else ""
                         addition = cache_prompts[j]
-                        # 逗号分隔
-                        combined = f"{original},{addition}" if original.strip() else addition
+                        combined = Script._apply_write_mode(original, addition, cache_prompt_write_mode)
                         new_prompts.append(combined)
                     p.prompt = new_prompts
                 else:
@@ -1841,7 +2084,7 @@ class Script(scripts.Script):
                     for j in range(total_images):
                         original = p.prompt
                         addition = cache_prompts[j]
-                        combined = f"{original},{addition}" if original.strip() else addition
+                        combined = Script._apply_write_mode(original, addition, cache_prompt_write_mode)
                         new_prompts.append(combined)
                     p.prompt = new_prompts
                 # 处理 Lora (保留原有的 Lora 逻辑)
@@ -2108,7 +2351,7 @@ class Script(scripts.Script):
                     p.negative_prompt = [p.negative_prompt for _ in range(0, p.batch_size * p.n_iter)]
                 neg_prompt_tokens = []
                 for pr in p.negative_prompt:
-                    neg_prompt_tokens.append(model_hijack.get_prompt_lengths(pr)[1])
+                    neg_prompt_tokens.append(get_prompt_lengths(pr)[1])
                 if len(set(neg_prompt_tokens)) != 1:
                     print('Padding negative prompts')
                     max_tokens = max(neg_prompt_tokens)
@@ -2116,7 +2359,7 @@ class Script(scripts.Script):
                         while neg < max_tokens:
                             p.negative_prompt[num] += random.choice(p.negative_prompt[num].split(','))
                             # p.negative_prompt[num] += '_'
-                            neg = model_hijack.get_prompt_lengths(p.negative_prompt[num])[1]
+                            neg = get_prompt_lengths(p.negative_prompt[num])[1]
 
             if limit_tags < 1:
                 if isinstance(p.prompt, list):
@@ -2372,15 +2615,13 @@ class Script(scripts.Script):
         final_prompt = f'{prompt_addition},{prompt}' if prompt_addition else prompt
         return final_prompt
 
-    def generate_and_set_prompt(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_prompt_text, current_prompt, tag_categories):
+    def generate_and_set_prompt(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_prompt_text, current_prompt, tag_categories, write_mode):
         final_prompt = self.generate_prompts_only(booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_categories)
         if not final_prompt or final_prompt.strip() == '' or final_prompt == '未找到符合条件的帖子':
             return final_prompt, current_prompt
-        if tag_prompt_text and tag_prompt_text.strip():
-            combined_prompt = f"{tag_prompt_text.strip()}{',' if final_prompt else ''}{final_prompt}"
-        else:
-            combined_prompt = final_prompt
-        return combined_prompt, combined_prompt
+        prompt_payload = Script._combine_prompt(tag_prompt_text, final_prompt)
+        combined_prompt = Script._apply_write_mode(current_prompt, prompt_payload, write_mode)
+        return prompt_payload, combined_prompt
 
     def random_number(self, sorting_order, size, count):
         """Generates random numbers based on the sorting_order
@@ -2420,6 +2661,8 @@ class Script(scripts.Script):
             list: the tagged prompts
         """
         if model == 'deepbooru':
+            if not has_deepbooru():
+                raise RuntimeError("DeepBooru is not available in this WebUI build.")
             if isinstance(self.original_prompt, str):
                 orig_prompt = [self.original_prompt]
             else:
