@@ -237,8 +237,6 @@ def check_exception(booru, parameters):
         raise Exception("Konachan does not support post IDs")
     if booru == 'yande.re' and post_id:
         raise Exception("Yande.re does not support post IDs")
-    if booru == 'e621' and post_id:
-        raise Exception("e621 does not support post IDs")
 
 
 class Booru():
@@ -252,6 +250,7 @@ class Booru():
     def fetch_with_retry(self, url, max_retries=3, timeout=10, **kwargs):
         """Fetch URL with retry logic for rate limiting and network errors."""
         import time
+        safe_url = re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(url))
         for attempt in range(max_retries):
             try:
                 response = requests.get(url, timeout=timeout, **kwargs)
@@ -268,9 +267,10 @@ class Booru():
                     time.sleep(2 ** attempt)
             except requests.exceptions.RequestException as e:
                 if attempt < max_retries - 1:
-                    print(f"[{self.booru}] Request error: {e}, retry {attempt + 1}/{max_retries}")
+                    safe_error = re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(e))
+                    print(f"[{self.booru}] Request error: {safe_error}, retry {attempt + 1}/{max_retries}")
                     time.sleep(2 ** attempt)
-        raise Exception(f"[{self.booru}] All {max_retries} attempts failed for {url}")
+        raise Exception(f"[{self.booru}] All {max_retries} attempts failed for {safe_url}")
 
     def get_data(self, add_tags, max_pages=10, id=''):
         pass
@@ -289,6 +289,7 @@ class Gelbooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         global COUNT
+        max_pages = _normalize_max_pages(max_pages)
         loop_msg = True
         for _ in range(2):
             local_add_tags = '' if id else add_tags
@@ -353,6 +354,7 @@ class e621(Booru):
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         global COUNT
+        max_pages = _normalize_max_pages(max_pages)
         loop_msg = True
         for loop in range(2):
             if id:
@@ -416,12 +418,14 @@ class e621(Booru):
     def get_post(self, add_tags, max_pages=10, id=''):
         if not id:
             return self.get_data(add_tags, max_pages, '', tag_categories=None)
-        self.booru_url = f"https://danbooru.donmai.us/posts/{id}.json"
+        self.booru_url = f"https://e621.net/posts/{id}.json"
         res = self.fetch_with_retry(self.booru_url, headers=self.headers, timeout=10)
         data = res.json()
         if isinstance(data, dict):
-            data['tags'] = data.get('tag_string', '')
-            return {'post': [data]}
+            post = data.get('post', data)
+            if isinstance(post, dict):
+                post['tags'] = self._filter_tags_by_category(post, None)
+                return {'post': [post]}
         return {'post': []}
 
 
@@ -433,19 +437,21 @@ class XBooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         global COUNT
+        max_pages = _normalize_max_pages(max_pages)
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
                 add_tags = ''
             url = f"{self.base_url}&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
             self.booru_url = url
-            print(url)
+            print(re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(url)))
             res = self.fetch_with_retry(url, timeout=10)
             data = res.json()
             COUNT = 0
             for post in data:
-                post['file_url'] = f"https://xbooru.com/images/{post['directory']}/{post['image']}"
-                COUNT += 1
+                if isinstance(post, dict) and 'directory' in post and 'image' in post:
+                    post['file_url'] = f"https://xbooru.com/images/{post['directory']}/{post['image']}"
+                    COUNT += 1
             if COUNT <= max_pages*POST_AMOUNT:
                 max_pages = COUNT // POST_AMOUNT+1
                 # If max_pages is bigger than available pages, loop the function with updated max_pages based on the value of COUNT
@@ -469,8 +475,9 @@ class XBooru(Booru):
         data = res.json()
         COUNT = 0
         for post in data:
-            post['file_url'] = f"https://xbooru.com/images/{post['directory']}/{post['image']}"
-            COUNT += 1
+            if isinstance(post, dict) and 'directory' in post and 'image' in post:
+                post['file_url'] = f"https://xbooru.com/images/{post['directory']}/{post['image']}"
+                COUNT += 1
         return {'post': data}
 
     def get_post(self, add_tags, max_pages=10, id=''):
@@ -486,6 +493,7 @@ class Rule34(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         global COUNT
+        max_pages = _normalize_max_pages(max_pages)
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -546,6 +554,7 @@ class Safebooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         global COUNT
+        max_pages = _normalize_max_pages(max_pages)
         loop_msg = True
         for loop in range(2):
             if id:
@@ -633,6 +642,7 @@ class Konachan(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         global COUNT
+        max_pages = _normalize_max_pages(max_pages)
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -691,6 +701,7 @@ class Yandere(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         global COUNT
+        max_pages = _normalize_max_pages(max_pages)
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
             if id:
@@ -757,6 +768,7 @@ class AIBooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         global COUNT
+        max_pages = _normalize_max_pages(max_pages)
         loop_msg = True
         for loop in range(2):
             if id:
@@ -765,8 +777,11 @@ class AIBooru(Booru):
             self.booru_url = url
             res = self.fetch_with_retry(url)
             data = res.json()
+            if not isinstance(data, list):
+                data = data.get('posts', []) if isinstance(data, dict) else []
             for post in data:
-                post['tags'] = self._filter_tags_by_category(post, tag_categories)
+                if isinstance(post, dict):
+                    post['tags'] = self._filter_tags_by_category(post, tag_categories)
             COUNT = len(data)
             if COUNT == 0:
                 max_pages = 2
@@ -787,8 +802,11 @@ class AIBooru(Booru):
         self.booru_url = url
         res = self.fetch_with_retry(url)
         data = res.json()
+        if not isinstance(data, list):
+            data = data.get('posts', []) if isinstance(data, dict) else []
         for post in data:
-            post['tags'] = self._filter_tags_by_category(post, tag_categories)
+            if isinstance(post, dict):
+                post['tags'] = self._filter_tags_by_category(post, tag_categories)
         COUNT = len(data)
         return {'post': data}
 
@@ -814,6 +832,7 @@ class Danbooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         global COUNT
+        max_pages = _normalize_max_pages(max_pages)
         loop_msg = True
         for loop in range(2):
             if id:
@@ -1015,6 +1034,184 @@ def limit_prompt_tags(prompt, limit_tags, mode):
 
 
 # ─── 批量爬取辅助函数 ─────────────────────────────────────────────────────────
+def _repeat_to_length(values, length):
+    if isinstance(values, list):
+        if not values:
+            return ['' for _ in range(length)]
+        return [str(values[i % len(values)] or '') for i in range(length)]
+    return [str(values or '') for _ in range(length)]
+
+
+def _append_tags(base_prompt, tags):
+    base_prompt = str(base_prompt or '').strip()
+    tags = str(tags or '').strip()
+    if base_prompt and tags:
+        return f'{base_prompt},{tags}'
+    return base_prompt or tags
+
+
+NO_POSTS_MESSAGE = 'Ranbooru: no posts found for these filters.'
+
+
+def _format_ranbooru_error(booru, error):
+    error_text = re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(error))
+    return (
+        f'Ranbooru: [{booru}] request failed: {error_text}. '
+        'Check proxy/TUN, lower Max Pages, or try another booru.'
+    )
+
+
+def _normalize_max_pages(value):
+    try:
+        return max(1, int(value))
+    except Exception:
+        return 1
+
+
+def _get_rating_tag(booru, mature_rating):
+    if mature_rating == 'All':
+        return ''
+    rating = RATINGS.get(booru, {}).get(mature_rating)
+    if not rating or rating == 'All':
+        return ''
+    return f'+rating:{rating}'
+
+
+def _safe_read_text_file(base_dir, filename):
+    if not filename:
+        return ''
+    safe_name = os.path.basename(str(filename))
+    path = os.path.join(base_dir, safe_name)
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as file:
+            return file.read()
+    except Exception as error:
+        print(f'[Ranbooru] Could not read {path}: {error}')
+        return ''
+
+
+def _safe_read_csv_file(base_dir, filename):
+    return _safe_read_text_file(base_dir, filename).split(',')
+
+
+def _get_post_tags(post):
+    if not isinstance(post, dict):
+        return ''
+    tags = post.get('tags', '')
+    if isinstance(tags, dict):
+        merged_tags = []
+        for category in ('general', 'artist', 'copyright', 'character', 'species', 'meta'):
+            values = tags.get(category, [])
+            if isinstance(values, list):
+                merged_tags.extend(values)
+        tags = ' '.join(merged_tags)
+    return str(tags or post.get('tag_string', '') or '').strip()
+
+
+def _get_post_file_url(post):
+    if not isinstance(post, dict):
+        return ''
+    for key in ('file_url', 'large_file_url', 'preview_file_url'):
+        if post.get(key):
+            return str(post.get(key))
+    for nested_key in ('file', 'sample', 'preview'):
+        nested = post.get(nested_key)
+        if isinstance(nested, dict) and nested.get('url'):
+            return str(nested.get('url'))
+    return ''
+
+
+def _normalize_post(post):
+    if not isinstance(post, dict):
+        return None
+    tags = _get_post_tags(post)
+    if not tags:
+        return None
+    post['tags'] = tags
+    file_url = _get_post_file_url(post)
+    if file_url:
+        post['file_url'] = file_url
+    return post
+
+
+def _normalize_posts(posts):
+    normalized = []
+    if not isinstance(posts, list):
+        return normalized
+    for post in posts:
+        normalized_post = _normalize_post(post)
+        if normalized_post is not None:
+            normalized.append(normalized_post)
+    return normalized
+
+
+def _fetch_booru_data(api_url, booru, add_tags, max_pages, post_id='', tag_categories=None):
+    if post_id:
+        return api_url.get_post(add_tags, max_pages, post_id)
+    if booru in ['danbooru', 'safebooru', 'aibooru', 'e621'] and tag_categories:
+        return api_url.get_data(add_tags, max_pages, '', tag_categories)
+    return api_url.get_data(add_tags, max_pages)
+
+
+def _fetch_image(fetcher, url, headers=None):
+    if not url:
+        return None
+    try:
+        response = fetcher(url, headers=headers or {}, timeout=10)
+        image = Image.open(BytesIO(response.content))
+        image.load()
+        return image.convert('RGB')
+    except Exception as error:
+        print(f'[Ranbooru] Could not fetch image {url}: {error}')
+        return None
+
+
+def _send_to_controlnet_legacy(p, image, denoising):
+    try:
+        controlnet_module = importlib.import_module(
+            'extensions.sd-webui-controlnet.scripts.external_code',
+            'external_code',
+        )
+        get_units = getattr(controlnet_module, 'get_all_units_in_processing', None)
+        update_units = getattr(controlnet_module, 'update_cn_script_in_processing', None)
+        if get_units is None or update_units is None:
+            print('[Ranbooru] ControlNet legacy API is unavailable; skipping Send to Controlnet.')
+            return False
+        controlnet_units = list(get_units(p) or [])
+        if not controlnet_units:
+            print('[Ranbooru] No ControlNet units found; skipping Send to Controlnet.')
+            return False
+        copied_network = controlnet_units[0].__dict__.copy()
+        copied_network['enabled'] = True
+        copied_network['weight'] = denoising
+        copied_network.setdefault('image', {})
+        if not isinstance(copied_network['image'], dict):
+            copied_network['image'] = {}
+        copied_network['image']['image'] = np.array(image)
+        update_units(p, [copied_network] + controlnet_units[1:])
+        return True
+    except Exception as error:
+        print(f'[Ranbooru] ControlNet send failed: {error}')
+        return False
+
+
+def _sync_prompt_lists(p):
+    prompts = p.prompt if isinstance(p.prompt, list) else [p.prompt]
+    negative_prompts = (
+        p.negative_prompt if isinstance(p.negative_prompt, list) else [p.negative_prompt]
+    )
+    prompt_count = max(len(prompts), len(negative_prompts), 1)
+    p.all_prompts = _repeat_to_length(prompts, prompt_count)
+    p.all_negative_prompts = _repeat_to_length(negative_prompts, prompt_count)
+    if prompt_count > 1:
+        p.prompt = p.all_prompts
+        p.negative_prompt = p.all_negative_prompts
+    else:
+        p.prompt = p.all_prompts[0]
+        p.negative_prompt = p.all_negative_prompts[0]
+    p.n_iter = max(1, (prompt_count + max(1, p.batch_size) - 1) // max(1, p.batch_size))
+
+
 def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                      remove_bad_tags, remove_tags_str, shuffle_tags, change_dash,
                      limit_tags, max_tags, mature_rating,
@@ -1022,7 +1219,7 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                      use_remove_txt=False, choose_remove_txt='', tag_categories=None,
                      min_score_enabled=False, min_score=0):
     """Fetch posts from booru and return metadata records with cleaned prompt tags."""
-    max_pages = int(max_pages)
+    max_pages = _normalize_max_pages(max_pages)
 
     gelbooru_api_key = None
     gelbooru_user_id = None
@@ -1066,10 +1263,7 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
     add_tags = '&tags=-animated'
     if tags_search:
         add_tags += '+' + tags_search.replace(',', '+')
-        if mature_rating != 'All' and booru_name in RATINGS:
-            rating_val = RATINGS[booru_name].get(mature_rating)
-            if rating_val and rating_val != 'All':
-                add_tags += f'+rating:{rating_val}'
+    add_tags += _get_rating_tag(booru_name, mature_rating)
 
     # Build bad_tags
     bad_tags = []
@@ -1081,10 +1275,7 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
         else:
             bad_tags.append(remove_tags_str)
     if use_remove_txt and choose_remove_txt:
-        try:
-            bad_tags.extend(open(os.path.join(user_remove_dir, choose_remove_txt), 'r').read().split(','))
-        except Exception:
-            pass
+        bad_tags.extend(_safe_read_csv_file(user_remove_dir, choose_remove_txt))
 
     records = []
     stats = {
@@ -1990,14 +2181,28 @@ class Script(scripts.Script):
             if lora_lock_prev:
                 lora_prompt = self.previous_loras
             else:
-                loras = []
-                loras = os.listdir(f'{lora_folder}')
+                try:
+                    loras = os.listdir(f'{lora_folder}')
+                except Exception as error:
+                    print(f'[Ranbooru] Could not list LoRA folder {lora_folder}: {error}')
+                    return p
                 # get only .safetensors files
                 loras = [lora.replace('.safetensors', '') for lora in loras if lora.endswith('.safetensors')]
+                if not loras:
+                    print(f'[Ranbooru] No .safetensors LoRAs found in {lora_folder}; skipping LoRA injection.')
+                    return p
+                custom_weights = []
+                if lora_custom_weights != '':
+                    custom_weights = [value.strip() for value in lora_custom_weights.split(',')]
                 for l in range(0, lora_amount):
                     lora_weight = 0
-                    if lora_custom_weights != '':
-                        lora_weight = float(lora_custom_weights.split(',')[l])
+                    if l < len(custom_weights):
+                        try:
+                            lora_weight = float(custom_weights[l])
+                        except Exception:
+                            lora_weight = 0
+                    if float(lora_min) == 0 and float(lora_max) == 0:
+                        lora_weight = 1.0
                     while lora_weight == 0:
                         lora_weight = round(random.uniform(lora_min, lora_max), 1)
                     lora_prompt += f'<lora:{random.choice(loras)}:{lora_weight}>'
@@ -2011,7 +2216,7 @@ class Script(scripts.Script):
         return p
 
     def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
-        max_pages = int(max_pages)
+        max_pages = _normalize_max_pages(max_pages)
         cache_prompt_write_mode = args[0] if args else "追加到后面"
         if use_cache:
             if HAS_REQUESTS_CACHE and not requests_cache.patcher.is_installed():
@@ -2078,6 +2283,7 @@ class Script(scripts.Script):
                         combined = Script._apply_write_mode(original, addition, cache_prompt_write_mode)
                         new_prompts.append(combined)
                     p.prompt = new_prompts
+                    _sync_prompt_lists(p)
                 else:
                     # 单字符串情况
                     new_prompts = []
@@ -2087,9 +2293,11 @@ class Script(scripts.Script):
                         combined = Script._apply_write_mode(original, addition, cache_prompt_write_mode)
                         new_prompts.append(combined)
                     p.prompt = new_prompts
+                    _sync_prompt_lists(p)
                 # 处理 Lora (保留原有的 Lora 逻辑)
                 if lora_enabled:
                     p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev)
+                    _sync_prompt_lists(p)
                 
                 # 直接结束 before_process，跳过后续所有联网代码
                 return
@@ -2134,9 +2342,13 @@ class Script(scripts.Script):
                 'xbooru': XBooru(),
                 'e621': e621(),
             }
-            self.original_prompt = p.prompt
+            self.original_prompt = p.prompt if isinstance(p.prompt, list) else str(p.prompt or '')
             # Check if compatible
-            check_exception(booru, {'tags': tags, 'post_id': post_id})
+            try:
+                check_exception(booru, {'tags': tags, 'post_id': post_id})
+            except Exception as error:
+                print(f'[Ranbooru] {error}; skipping prompt injection.')
+                return p
 
             # Manage Bad Tags — use global DEFAULT_BAD_TAGS
             bad_tags = []
@@ -2146,10 +2358,11 @@ class Script(scripts.Script):
             if ',' in remove_tags:
                 bad_tags.extend(remove_tags.split(','))
             else:
-                bad_tags.append(remove_tags)
+                if remove_tags:
+                    bad_tags.append(remove_tags)
 
             if use_remove_txt:
-                bad_tags.extend(open(os.path.join(user_remove_dir, choose_remove_txt), 'r').read().split(','))
+                bad_tags.extend(_safe_read_csv_file(user_remove_dir, choose_remove_txt))
 
             # Manage Backgrounds
             background_options = {
@@ -2161,7 +2374,10 @@ class Script(scripts.Script):
             if change_background in background_options:
                 prompt_addition, tags_to_remove = background_options[change_background]
                 bad_tags.extend(tags_to_remove)
-                p.prompt = f'{p.prompt},{prompt_addition}' if p.prompt else prompt_addition
+                if isinstance(p.prompt, list):
+                    p.prompt = [_append_tags(prompt, prompt_addition) for prompt in p.prompt]
+                else:
+                    p.prompt = _append_tags(p.prompt, prompt_addition)
 
             # Manage Colors
             color_options = {
@@ -2175,10 +2391,13 @@ class Script(scripts.Script):
                 if isinstance(color_option, list):
                     bad_tags.extend(color_option)
                 else:
-                    p.prompt = f'{p.prompt},{color_option}' if p.prompt else color_option
+                    if isinstance(p.prompt, list):
+                        p.prompt = [_append_tags(prompt, color_option) for prompt in p.prompt]
+                    else:
+                        p.prompt = _append_tags(p.prompt, color_option)
 
             if use_search_txt:
-                search_tags = open(os.path.join(user_search_dir, choose_search_txt), 'r').read()
+                search_tags = _safe_read_text_file(user_search_dir, choose_search_txt)
                 search_tags_r = search_tags.replace(" ", "")
                 split_tags = search_tags_r.splitlines()
                 filtered_tags = [line for line in split_tags if line.strip()]
@@ -2191,8 +2410,7 @@ class Script(scripts.Script):
             add_tags = '&tags=-animated'
             if tags:
                 add_tags += '+' + tags.replace(',', '+')
-                if mature_rating != 'All':
-                    add_tags += f'+rating:{RATINGS[booru][mature_rating]}'
+            add_tags += _get_rating_tag(booru, mature_rating)
 
             # Getting Data
             random_post = {'preview_url': ''}
@@ -2203,31 +2421,31 @@ class Script(scripts.Script):
             print(f'Using {booru}')
 
             # Manage Post ID
-            if post_id:
-                data = api_url.get_post(add_tags, max_pages, post_id)
-            else:
-                if booru in ['danbooru', 'safebooru', 'aibooru', 'e621'] and tag_categories:
-                    data = api_url.get_data(add_tags, max_pages, '', tag_categories)
-                else:
-                    data = api_url.get_data(add_tags, max_pages)
+            try:
+                data = _fetch_booru_data(api_url, booru, add_tags, max_pages, post_id, tag_categories)
+            except Exception as error:
+                print(_format_ranbooru_error(booru, error))
+                return p
 
-            print(api_url.booru_url)
-            posts = data.get('post', [])
-            if not isinstance(posts, list):
-                posts = []
+            print(re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(api_url.booru_url)))
+            posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
             if len(posts) == 0:
                 if booru == 'rule34' and add_tags.startswith('&tags=-animated'):
                     fallback_add_tags = '&tags='
                     if tags:
                         fallback_add_tags += tags.replace(',', '+')
-                    if mature_rating != 'All':
-                        fallback_add_tags += f'+rating:{RATINGS[booru][mature_rating]}'
-                    data = api_url.get_data(fallback_add_tags, max_pages)
-                    posts = data.get('post', []) if isinstance(data.get('post', []), list) else []
+                    fallback_add_tags += _get_rating_tag(booru, mature_rating)
+                    try:
+                        data = api_url.get_data(fallback_add_tags, max_pages)
+                    except Exception as error:
+                        print(_format_ranbooru_error(booru, error))
+                        return p
+                    posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
                 if len(posts) == 0:
                     print('No posts found; skipping Ranbooru prompt injection.')
                     return p
             COUNT = len(posts)
+            data = {'post': posts}
             # Replace null scores with 0s
             for post in posts:
                 if isinstance(post, dict):
@@ -2241,47 +2459,53 @@ class Script(scripts.Script):
                 data['post'] = sorted(posts, key=lambda k: (k.get('score') if isinstance(k, dict) else 0) or 0, reverse=True)
             elif sorting_order == 'Low Score':
                 data['post'] = sorted(posts, key=lambda k: (k.get('score') if isinstance(k, dict) else 0) or 0)
+            else:
+                data['post'] = posts
             if post_id:
                 print(f'Using post ID: {post_id}')
                 random_numbers = [0 for _ in range(0, p.batch_size * p.n_iter)]
             else:
                 random_numbers = self.random_number(sorting_order, p.batch_size * p.n_iter, len(data['post']))
             for random_number in random_numbers:
-                if same_prompt:
-                    random_post = data['post'][random_numbers[0]]
-                else:
-                    if mix_prompt:
-                        temp_tags = []
-                        mix_max_tags = 0
-                        for _ in range(0, mix_amount):
-                            random_mix_number = 0 if post_id else self.random_number(sorting_order, 1, len(data['post']))[0]
-                            temp_tags.extend(data['post'][random_mix_number]['tags'].split(' '))
-                            mix_max_tags = max(mix_max_tags, len(data['post'][random_mix_number]['tags'].split(' ')))
-                        # distinct temp_tags
-                        temp_tags = list(set(temp_tags))
-                        random_post = data['post'][random_number]
-                        mix_max_tags = min(max(len(temp_tags), 20), mix_max_tags)
-                        random_post['tags'] = ' '.join(random.sample(temp_tags, mix_max_tags))
-                    else:
-                        try:
-                            random_post = data['post'][random_number]
-                        except IndexError:
-                            raise Exception(
-                                "No posts found with those tags. Try lowering the pages or changing the tags.")
-                raw_tags = random_post['tags']
+                post_index = random_numbers[0] if same_prompt else random_number
+                if post_index >= len(data['post']):
+                    print('[Ranbooru] Selected post index is out of range; skipping this prompt.')
+                    continue
+                random_post = data['post'][post_index]
+                if not same_prompt and mix_prompt:
+                    temp_tags = []
+                    mix_max_tags = 0
+                    for _ in range(0, mix_amount):
+                        random_mix_number = 0 if post_id else self.random_number(sorting_order, 1, len(data['post']))[0]
+                        mix_tags = _get_post_tags(data['post'][random_mix_number]).split(' ')
+                        temp_tags.extend(mix_tags)
+                        mix_max_tags = max(mix_max_tags, len(mix_tags))
+                    temp_tags = list(set(temp_tags))
+                    mix_max_tags = min(max(len(temp_tags), 20), mix_max_tags)
+                    if temp_tags and mix_max_tags > 0:
+                        random_post['tags'] = ' '.join(random.sample(temp_tags, min(len(temp_tags), mix_max_tags)))
+                raw_tags = _get_post_tags(random_post)
+                if not raw_tags:
+                    continue
                 temp_tags = random.sample(raw_tags.split(' '), len(raw_tags.split(' '))) if shuffle_tags else raw_tags.split(' ')
                 prompts.append(' '.join(temp_tags))
-                preview_urls.append(random_post.get('file_url', 'https://pic.re/image'))
+                preview_urls.append(_get_post_file_url(random_post))
                 # Debug picture
                 if DEBUG:
                     print(random_post)
             # Get Images
             if use_img2img or use_deepbooru:
-                image_urls = [random_post['file_url']] if use_last_img else preview_urls
+                image_urls = [_get_post_file_url(random_post)] if use_last_img else preview_urls
 
                 for img in image_urls:
-                    response = self.fetch_with_retry(img, headers=api_url.headers, timeout=10)
-                    last_img.append(Image.open(BytesIO(response.content)))
+                    image = _fetch_image(api_url.fetch_with_retry, img, headers=api_url.headers)
+                    if image is not None:
+                        last_img.append(image)
+                if not last_img:
+                    print('[Ranbooru] Could not fetch any images; disabling img2img/DeepBooru for this run.')
+                    use_img2img = False
+                    use_ip = False
+                    use_deepbooru = False
             new_prompts = []
             # Cleaning Tags
             for prompt in prompts:
@@ -2294,20 +2518,42 @@ class Script(scripts.Script):
                     new_prompt = new_prompt.replace('_', ' ')
                 new_prompts.append(new_prompt)
             prompts = new_prompts
+            if not prompts:
+                print('No usable tags found after filtering; skipping Ranbooru prompt injection.')
+                return p
             if len(prompts) == 1:
                 print('Processing Single Prompt')
-                p.prompt = f"{p.prompt},{prompts[-1]}" if p.prompt else prompts[-1]
+                if isinstance(p.prompt, list):
+                    p.prompt = [_append_tags(prompt, prompts[-1]) for prompt in p.prompt]
+                else:
+                    p.prompt = _append_tags(p.prompt, prompts[-1])
                 if chaos_mode in ['Chaos', 'Less Chaos']:
-                    negative_prompt = '' if chaos_mode == 'Less Chaos' else p.negative_prompt
-                    p.prompt, negative_prompt = generate_chaos(p.prompt, negative_prompt, chaos_amount)
-                    p.negative_prompt = f"{p.negative_prompt},{negative_prompt}" if p.negative_prompt else negative_prompt
+                    base_prompts = p.prompt if isinstance(p.prompt, list) else [p.prompt]
+                    base_negative_prompts = _repeat_to_length(p.negative_prompt, len(base_prompts))
+                    new_prompts = []
+                    new_negative_prompts = []
+                    for prompt, base_negative_prompt in zip(base_prompts, base_negative_prompts):
+                        negative_prompt = '' if chaos_mode == 'Less Chaos' else base_negative_prompt
+                        tmp_prompt, generated_negative_prompt = generate_chaos(prompt, negative_prompt, chaos_amount)
+                        new_prompts.append(tmp_prompt)
+                        new_negative_prompts.append(
+                            _append_tags(base_negative_prompt, generated_negative_prompt)
+                            if chaos_mode == 'Less Chaos'
+                            else generated_negative_prompt
+                        )
+                    p.prompt = new_prompts if len(new_prompts) > 1 else new_prompts[0]
+                    p.negative_prompt = (
+                        new_negative_prompts if len(new_negative_prompts) > 1 else new_negative_prompts[0]
+                    )
             else:
                 print('Processing Multiple Prompts')
+                base_prompts = _repeat_to_length(p.prompt, len(prompts))
+                base_negative_prompts = _repeat_to_length(p.negative_prompt, len(prompts))
                 negative_prompts = []
                 new_prompts = []
                 if chaos_mode == 'Chaos':
-                    for prompt in prompts:
-                        tmp_prompt, negative_prompt = generate_chaos(prompt, p.negative_prompt, chaos_amount)
+                    for prompt, base_negative_prompt in zip(prompts, base_negative_prompts):
+                        tmp_prompt, negative_prompt = generate_chaos(prompt, base_negative_prompt, chaos_amount)
                         new_prompts.append(tmp_prompt)
                         negative_prompts.append(negative_prompt)
                     prompts = new_prompts
@@ -2318,33 +2564,48 @@ class Script(scripts.Script):
                         new_prompts.append(tmp_prompt)
                         negative_prompts.append(negative_prompt)
                     prompts = new_prompts
-                    p.negative_prompt = [p.negative_prompt + ',' + negative_prompt for negative_prompt in negative_prompts]
+                    p.negative_prompt = [
+                        _append_tags(base_negative_prompt, negative_prompt)
+                        for base_negative_prompt, negative_prompt in zip(base_negative_prompts, negative_prompts)
+                    ]
                 else:
-                    p.negative_prompt = [p.negative_prompt for _ in range(0, p.batch_size * p.n_iter)]
-                p.prompt = prompts if not p.prompt else [f"{p.prompt},{prompt}" for prompt in prompts]
-                if use_img2img:
+                    p.negative_prompt = base_negative_prompts
+                p.prompt = [
+                    _append_tags(base_prompt, prompt)
+                    for base_prompt, prompt in zip(base_prompts, prompts)
+                ]
+                if use_img2img and last_img:
                     if len(last_img) < p.batch_size * p.n_iter:
                         last_img = [last_img[0] for _ in range(0, p.batch_size * p.n_iter)]
             if negative_mode == 'Negative':
                 # remove tags from p.prompt using tags from the original prompt
-                orig_list = self.original_prompt.split(',')
+                original_prompts = (
+                    self.original_prompt if isinstance(self.original_prompt, list) else [self.original_prompt]
+                )
                 if isinstance(p.prompt, list):
                     new_positive_prompts = []
                     new_negative_prompts = []
-                    for pr, npp in zip(p.prompt, p.negative_prompt):
+                    negative_prompts = _repeat_to_length(p.negative_prompt, len(p.prompt))
+                    for pr, npp, original_prompt in zip(
+                        p.prompt,
+                        negative_prompts,
+                        _repeat_to_length(original_prompts, len(p.prompt)),
+                    ):
+                        orig_list = str(original_prompt or '').split(',')
                         clean_prompt = pr.split(',')
                         clean_prompt = [tag for tag in clean_prompt if tag not in orig_list]
                         clean_prompt = ','.join(clean_prompt)
-                        new_positive_prompts.append(self.original_prompt)
-                        new_negative_prompts.append(f'{npp},{clean_prompt}')
+                        new_positive_prompts.append(original_prompt)
+                        new_negative_prompts.append(_append_tags(npp, clean_prompt))
                     p.prompt = new_positive_prompts
                     p.negative_prompt = new_negative_prompts
                 else:
+                    orig_list = str(original_prompts[0] if original_prompts else '').split(',')
                     clean_prompt = p.prompt.split(',')
                     clean_prompt = [tag for tag in clean_prompt if tag not in orig_list]
                     clean_prompt = ','.join(clean_prompt)
-                    p.negative_prompt = f'{p.negative_prompt},{clean_prompt}'
-                    p.prompt = self.original_prompt
+                    p.negative_prompt = _append_tags(p.negative_prompt, clean_prompt)
+                    p.prompt = original_prompts[0] if original_prompts else ''
             if negative_mode == 'Negative' or chaos_mode in ['Chaos', 'Less Chaos']:
                 # NEGATIVE PROMPT FIX
                 if isinstance(p.negative_prompt, str):
@@ -2357,7 +2618,10 @@ class Script(scripts.Script):
                     max_tokens = max(neg_prompt_tokens)
                     for num, neg in enumerate(neg_prompt_tokens):
                         while neg < max_tokens:
-                            p.negative_prompt[num] += random.choice(p.negative_prompt[num].split(','))
+                            choices = [tag for tag in str(p.negative_prompt[num] or '').split(',') if tag]
+                            if not choices:
+                                break
+                            p.negative_prompt[num] += random.choice(choices)
                             # p.negative_prompt[num] += '_'
                             neg = get_prompt_lengths(p.negative_prompt[num])[1]
 
@@ -2379,53 +2643,59 @@ class Script(scripts.Script):
 
             # LORANADO
             p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev)
-            if use_deepbooru and not use_img2img:
+            if use_deepbooru and not use_img2img and last_img:
                 self.last_img = last_img
-                tagged_prompts = self.use_autotagger('deepbooru')
+                try:
+                    tagged_prompts = self.use_autotagger('deepbooru')
+                    if isinstance(p.prompt, list):
+                        tagged_prompts = _repeat_to_length(tagged_prompts, len(p.prompt))
+                        p.prompt = [modify_prompt(pr, tagged_prompts[num], type_deepbooru) for num, pr in enumerate(p.prompt)]
+                        p.prompt = [remove_repeated_tags(pr) for pr in p.prompt]
+                    else:
+                        tagged_prompt = tagged_prompts[0] if isinstance(tagged_prompts, list) and tagged_prompts else tagged_prompts
+                        p.prompt = modify_prompt(p.prompt, tagged_prompt, type_deepbooru)
+                        p.prompt = remove_repeated_tags(p.prompt)
+                except Exception as error:
+                    print(f'[Ranbooru] DeepBooru failed: {error}')
+            _sync_prompt_lists(p)
 
-                if isinstance(p.prompt, list):
-                    p.prompt = [modify_prompt(pr, tagged_prompts[num], type_deepbooru) for num, pr in enumerate(p.prompt)]
-                    p.prompt = [remove_repeated_tags(pr) for pr in p.prompt]
-                else:
-                    p.prompt = modify_prompt(p.prompt, tagged_prompts, type_deepbooru)
-                    p.prompt = remove_repeated_tags(p.prompt)
-
-            if use_img2img:
+            if use_img2img and last_img:
                 if not use_ip:
                     self.real_steps = p.steps
                     p.steps = 1
                     self.last_img = last_img
                 if use_ip:
-                    controlNetModule = importlib.import_module('extensions.sd-webui-controlnet.scripts.external_code', 'external_code')
-                    controlNetList = controlNetModule.get_all_units_in_processing(p)
-                    copied_network = controlNetList[0].__dict__.copy()
-                    copied_network['enabled'] = True
-                    copied_network['weight'] = denoising
-                    array_img = np.array(last_img[0])
-                    copied_network['image']['image'] = array_img
-                    copied_networks = [copied_network] + controlNetList[1:]
-                    controlNetModule.update_cn_script_in_processing(p, copied_networks)
+                    _send_to_controlnet_legacy(p, last_img[0], denoising)
 
         elif lora_enabled:
             p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev)
+            _sync_prompt_lists(p)
 
     def postprocess(self, p, processed, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
         if use_img2img and not use_ip and enabled:
             print('Using pictures')
+            if not hasattr(self, 'last_img') or not self.last_img:
+                print('[Ranbooru] No source images available for img2img; skipping postprocess img2img.')
+                return
             if crop_center:
                 width, height = p.width, p.height
                 self.last_img = [resize_image(img, width, height, cropping=True) for img in self.last_img]
             else:
                 width, height = self.check_orientation(self.last_img[0])
-            final_prompts = p.prompt
+            final_prompts = getattr(p, 'all_prompts', None) or p.prompt
             if use_deepbooru:
-                tagged_prompts = self.use_autotagger('deepbooru')
-                if isinstance(p.prompt, list):
-                    final_prompts = [modify_prompt(pr, tagged_prompts[num], type_deepbooru) for num, pr in enumerate(p.prompt)]
-                    final_prompts = [remove_repeated_tags(pr) for pr in final_prompts]
-                else:
-                    final_prompts = modify_prompt(p.prompt, tagged_prompts, type_deepbooru)
-                    final_prompts = remove_repeated_tags(final_prompts)
+                try:
+                    tagged_prompts = self.use_autotagger('deepbooru')
+                    if isinstance(final_prompts, list):
+                        tagged_prompts = _repeat_to_length(tagged_prompts, len(final_prompts))
+                        final_prompts = [modify_prompt(pr, tagged_prompts[num], type_deepbooru) for num, pr in enumerate(final_prompts)]
+                        final_prompts = [remove_repeated_tags(pr) for pr in final_prompts]
+                    else:
+                        tagged_prompt = tagged_prompts[0] if isinstance(tagged_prompts, list) and tagged_prompts else tagged_prompts
+                        final_prompts = modify_prompt(final_prompts, tagged_prompt, type_deepbooru)
+                        final_prompts = remove_repeated_tags(final_prompts)
+                except Exception as error:
+                    print(f'[Ranbooru] DeepBooru failed during postprocess: {error}')
             p = StableDiffusionProcessingImg2Img(
                 sd_model=shared.sd_model,
                 outpath_samples=shared.opts.outdir_samples or shared.opts.outdir_img2img_samples,
@@ -2455,7 +2725,7 @@ class Script(scripts.Script):
                     processed.images.append(img)
 
     def generate_prompts_only(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_categories):
-        max_pages = int(max_pages)
+        max_pages = _normalize_max_pages(max_pages)
         if use_cache:
             if HAS_REQUESTS_CACHE and not requests_cache.patcher.is_installed():
                 requests_cache.install_cache('ranbooru_cache', backend='sqlite', expire_after=3600)
@@ -2510,7 +2780,7 @@ class Script(scripts.Script):
             if remove_tags:
                 bad_tags.append(remove_tags)
         if use_remove_txt:
-            bad_tags.extend(open(os.path.join(user_remove_dir, choose_remove_txt), 'r').read().split(','))
+            bad_tags.extend(_safe_read_csv_file(user_remove_dir, choose_remove_txt))
 
         prompt_addition = ''
         background_options = {
@@ -2536,7 +2806,7 @@ class Script(scripts.Script):
                 prompt_addition = f'{prompt_addition},{co}' if prompt_addition else co
 
         if use_search_txt:
-            search_tags = open(os.path.join(user_search_dir, choose_search_txt), 'r').read()
+            search_tags = _safe_read_text_file(user_search_dir, choose_search_txt)
             search_tags_r = search_tags.replace(' ', '')
             split_tags = search_tags_r.splitlines()
             filtered_tags = [line for line in split_tags if line.strip()]
@@ -2547,30 +2817,26 @@ class Script(scripts.Script):
         add_tags = '&tags=-animated'
         if tags:
             add_tags += '+' + tags.replace(',', '+')
-            if mature_rating != 'All':
-                add_tags += f'+rating:{RATINGS[booru][mature_rating]}'
+        add_tags += _get_rating_tag(booru, mature_rating)
 
         api_url = booru_apis.get(booru, Gelbooru(fringe_benefits, gelbooru_api_key, gelbooru_user_id))
-        if post_id:
-            data = api_url.get_post(add_tags, max_pages, post_id)
-        else:
-            if booru in ['danbooru', 'safebooru', 'aibooru', 'e621'] and tag_categories:
-                data = api_url.get_data(add_tags, max_pages, '', tag_categories)
-            else:
-                data = api_url.get_data(add_tags, max_pages)
-        posts = data.get('post', [])
-        if not isinstance(posts, list):
-            posts = []
+        try:
+            data = _fetch_booru_data(api_url, booru, add_tags, max_pages, post_id, tag_categories)
+        except Exception as error:
+            return _format_ranbooru_error(booru, error)
+        posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
         if len(posts) == 0 and booru == 'rule34' and add_tags.startswith('&tags=-animated'):
             ft = '&tags='
             if tags:
                 ft += tags.replace(',', '+')
-            if mature_rating != 'All':
-                ft += f'+rating:{RATINGS[booru][mature_rating]}'
-            data = api_url.get_data(ft, max_pages)
-            posts = data.get('post', []) if isinstance(data.get('post', []), list) else []
+            ft += _get_rating_tag(booru, mature_rating)
+            try:
+                data = api_url.get_data(ft, max_pages)
+            except Exception as error:
+                return _format_ranbooru_error(booru, error)
+            posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
         if len(posts) == 0:
-            return '未找到符合条件的帖子'
+            return NO_POSTS_MESSAGE
 
         for post in posts:
             if isinstance(post, dict):
@@ -2590,16 +2856,20 @@ class Script(scripts.Script):
             mt = 0
             for _ in range(0, mix_amount):
                 rm = self.random_number(sorting_order, 1, len(posts))[0]
-                temp_tags.extend(posts[rm]['tags'].split(' '))
-                mt = max(mt, len(posts[rm]['tags'].split(' ')))
+                mix_tags = _get_post_tags(posts[rm]).split(' ')
+                temp_tags.extend(mix_tags)
+                mt = max(mt, len(mix_tags))
             temp_tags = list(set(temp_tags))
             rp = posts[rn]
             mt = min(max(len(temp_tags), 20), mt)
-            rp['tags'] = ' '.join(random.sample(temp_tags, mt))
+            if temp_tags and mt > 0:
+                rp['tags'] = ' '.join(random.sample(temp_tags, min(len(temp_tags), mt)))
         else:
             rp = posts[rn]
 
-        raw_tags = rp['tags']
+        raw_tags = _get_post_tags(rp)
+        if not raw_tags:
+            return NO_POSTS_MESSAGE
         temp_tags = random.sample(raw_tags.split(' '), len(raw_tags.split(' '))) if shuffle_tags else raw_tags.split(' ')
         tag_list = [t for t in temp_tags if t.strip() not in bad_tags]
         for bt in bad_tags:
@@ -2617,7 +2887,12 @@ class Script(scripts.Script):
 
     def generate_and_set_prompt(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_prompt_text, current_prompt, tag_categories, write_mode):
         final_prompt = self.generate_prompts_only(booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_categories)
-        if not final_prompt or final_prompt.strip() == '' or final_prompt == '未找到符合条件的帖子':
+        if (
+            not final_prompt
+            or final_prompt.strip() == ''
+            or final_prompt == NO_POSTS_MESSAGE
+            or final_prompt.startswith('Ranbooru:')
+        ):
             return final_prompt, current_prompt
         prompt_payload = Script._combine_prompt(tag_prompt_text, final_prompt)
         combined_prompt = Script._apply_write_mode(current_prompt, prompt_payload, write_mode)
@@ -2668,6 +2943,8 @@ class Script(scripts.Script):
             else:
                 orig_prompt = self.original_prompt
             deepbooru.model.start()
-            final_prompts = [prompt + ',' + deepbooru.model.tag_multi(img) for img, prompt in zip(self.last_img, orig_prompt)]
-            deepbooru.model.stop()
+            try:
+                final_prompts = [prompt + ',' + deepbooru.model.tag_multi(img) for img, prompt in zip(self.last_img, orig_prompt)]
+            finally:
+                deepbooru.model.stop()
             return final_prompts
