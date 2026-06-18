@@ -1094,18 +1094,96 @@ def _safe_read_csv_file(base_dir, filename):
     return _safe_read_text_file(base_dir, filename).split(',')
 
 
+def _normalize_tag_token(tag):
+    normalized = re.sub(r'[\s_]+', '_', str(tag or '').strip().lower())
+    normalized = re.sub(r'_+', '_', normalized).strip('_')
+    girl_match = re.fullmatch(r'(\d+)girls?', normalized)
+    if girl_match:
+        count = girl_match.group(1)
+        return '1girl' if count == '1' else f'{count}girls'
+    boy_match = re.fullmatch(r'(\d+)boys?', normalized)
+    if boy_match:
+        count = boy_match.group(1)
+        return '1boy' if count == '1' else f'{count}boys'
+    return normalized
+
+
+def _tag_value_to_text(value):
+    if not value:
+        return ''
+    if isinstance(value, dict):
+        parts = []
+        for category in ('general', 'artist', 'copyright', 'character', 'species', 'meta'):
+            item = value.get(category, [])
+            if isinstance(item, (list, tuple, set)):
+                parts.extend(str(tag) for tag in item if str(tag or '').strip())
+            elif item:
+                parts.append(str(item))
+        return ' '.join(parts)
+    if isinstance(value, (list, tuple, set)):
+        return ' '.join(str(tag) for tag in value if str(tag or '').strip())
+    return str(value)
+
+
+def _split_tag_tokens(value):
+    if not value:
+        return []
+    normalized = _tag_value_to_text(value).replace('，', ',').replace('\n', ' ').replace('\r', ' ')
+    tokens = []
+    for item in re.split(r'[\s,]+', normalized):
+        token = _normalize_tag_token(item)
+        if token:
+            tokens.append(token)
+    return list(dict.fromkeys(tokens))
+
+
+def _split_tag_filter(value):
+    return _split_tag_tokens(value)
+
+
+def _positive_search_tags(value):
+    tokens = []
+    for token in _split_tag_tokens(value):
+        if not token or token.startswith('-') or token.startswith('rating:'):
+            continue
+        tokens.append(token)
+    return list(dict.fromkeys(tokens))
+
+
+def _join_tag_filters(*values):
+    tokens = []
+    for value in values:
+        tokens.extend(_split_tag_filter(value))
+    return ','.join(dict.fromkeys(tokens))
+
+
+def _post_has_required_tags(tag_list, required_all='', required_any=''):
+    normalized_tags = set(_split_tag_tokens(tag_list))
+    required_all_tokens = _split_tag_filter(required_all)
+    required_any_tokens = _split_tag_filter(required_any)
+    if required_all_tokens and not all(tag in normalized_tags for tag in required_all_tokens):
+        return False
+    if required_any_tokens and not any(tag in normalized_tags for tag in required_any_tokens):
+        return False
+    return True
+
+
 def _get_post_tags(post):
     if not isinstance(post, dict):
         return ''
     tags = post.get('tags', '')
-    if isinstance(tags, dict):
-        merged_tags = []
-        for category in ('general', 'artist', 'copyright', 'character', 'species', 'meta'):
-            values = tags.get(category, [])
-            if isinstance(values, list):
-                merged_tags.extend(values)
-        tags = ' '.join(merged_tags)
-    return str(tags or post.get('tag_string', '') or '').strip()
+    if not tags:
+        tag_fields = [
+            'tag_string',
+            'tag_string_general',
+            'tag_string_artist',
+            'tag_string_copyright',
+            'tag_string_character',
+            'tag_string_species',
+            'tag_string_meta',
+        ]
+        tags = ' '.join(str(post.get(field) or '') for field in tag_fields)
+    return ' '.join(_split_tag_tokens(tags)).strip()
 
 
 def _get_post_file_url(post):
@@ -1217,9 +1295,15 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                      limit_tags, max_tags, mature_rating,
                      api_key='', user_id_str='', save_credentials=False,
                      use_remove_txt=False, choose_remove_txt='', tag_categories=None,
-                     min_score_enabled=False, min_score=0):
+                     min_score_enabled=False, min_score=0,
+                     cache_start_page=1,
+                     cache_keep_all_tags='', cache_keep_any_tags=''):
     """Fetch posts from booru and return metadata records with cleaned prompt tags."""
     max_pages = _normalize_max_pages(max_pages)
+    try:
+        start_page_index = max(0, int(cache_start_page or 1) - 1)
+    except Exception:
+        start_page_index = 0
 
     gelbooru_api_key = None
     gelbooru_user_id = None
@@ -1264,6 +1348,7 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
     if tags_search:
         add_tags += '+' + tags_search.replace(',', '+')
     add_tags += _get_rating_tag(booru_name, mature_rating)
+    effective_keep_all_tags = _join_tag_filters(_positive_search_tags(tags_search), cache_keep_all_tags)
 
     # Build bad_tags
     bad_tags = []
@@ -1276,17 +1361,30 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
             bad_tags.append(remove_tags_str)
     if use_remove_txt and choose_remove_txt:
         bad_tags.extend(_safe_read_csv_file(user_remove_dir, choose_remove_txt))
+    bad_tag_exact = {
+        _normalize_tag_token(tag)
+        for tag in bad_tags
+        if str(tag or '').strip() and '*' not in str(tag)
+    }
+    bad_tag_wildcards = [
+        _normalize_tag_token(str(tag).replace('*', ''))
+        for tag in bad_tags
+        if str(tag or '').strip() and '*' in str(tag)
+    ]
 
     records = []
     stats = {
         "pages_done": 0,
         "posts_seen": 0,
         "kept": 0,
+        "start_page": start_page_index + 1,
+        "end_page": start_page_index + max_pages,
         "skipped_score": 0,
+        "skipped_filter": 0,
         "skipped_empty": 0,
     }
     min_score_value = int(min_score or 0)
-    for page in range(max_pages):
+    for page in range(start_page_index, start_page_index + max_pages):
         try:
             if hasattr(api, 'get_data_page'):
                 if booru_name in ['danbooru', 'safebooru', 'aibooru', 'e621'] and tag_categories:
@@ -1295,14 +1393,15 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                     data = api.get_data_page(add_tags, page)
             else:
                 data = api.get_data(add_tags, max_pages=1)
-            posts = data.get('post', [])
-            if not isinstance(posts, list):
-                posts = []
-            if len(posts) == 0:
+            raw_posts = data.get('post', [])
+            if not isinstance(raw_posts, list):
+                raw_posts = []
+            if len(raw_posts) == 0:
                 print(f"[TagCache] 第 {page+1} 页无数据，停止抓取")
                 break
+            posts = _normalize_posts(raw_posts)
             stats["pages_done"] += 1
-            stats["posts_seen"] += len(posts)
+            stats["posts_seen"] += len(raw_posts)
             for post in posts:
                 if not isinstance(post, dict):
                     continue
@@ -1313,18 +1412,20 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                 if min_score_enabled and score < min_score_value:
                     stats["skipped_score"] += 1
                     continue
-                raw_tags = post.get('tags', '')
+                raw_tags = _get_post_tags(post)
                 if not raw_tags:
                     stats["skipped_empty"] += 1
                     continue
-                # Split and filter bad tags first
-                tag_list = raw_tags.split(' ')
+                tag_list = _split_tag_tokens(raw_tags)
+                if not _post_has_required_tags(tag_list, effective_keep_all_tags, cache_keep_any_tags):
+                    stats["skipped_filter"] += 1
+                    continue
                 if shuffle_tags:
                     random.shuffle(tag_list)
-                tag_list = [t for t in tag_list if t.strip() not in bad_tags]
-                for bt in bad_tags:
-                    if '*' in bt:
-                        tag_list = [t for t in tag_list if bt.replace('*', '') not in t]
+                tag_list = [t for t in tag_list if t not in bad_tag_exact]
+                for bt in bad_tag_wildcards:
+                    if bt:
+                        tag_list = [t for t in tag_list if bt not in t]
                 # Join with commas
                 prompt_str = ','.join(tag_list)
                 if change_dash:
@@ -1349,7 +1450,7 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                     stats["kept"] += 1
                 else:
                     stats["skipped_empty"] += 1
-            print(f"[TagCache] 第 {page+1}/{max_pages} 页完成，获取 {len(posts)} 条")
+            print(f"[TagCache] 第 {page+1}/{start_page_index + max_pages} 页完成，获取 {len(raw_posts)} 条，规范化 {len(posts)} 条")
         except Exception as ex:
             print(f"[TagCache] 第 {page+1} 页出错: {ex}")
             break
@@ -1492,13 +1593,14 @@ class Script(scripts.Script):
 
     # ─── Tag Cache 面板回调 ───────────────────────────────────────────────
     @staticmethod
-    def _cache_batch_fetch(booru, tags_search, max_pages, fringe_benefits,
+    def _cache_batch_fetch(booru, tags_search, max_pages, cache_start_page, fringe_benefits,
                            remove_bad_tags, remove_tags_str, shuffle_tags,
                            change_dash, limit_tags, max_tags, mature_rating,
                            api_key, user_id_str, save_credentials,
                            use_remove_txt, choose_remove_txt, append_mode, tag_categories,
-                           cache_dedupe, min_score_enabled, min_score):
-        """批量爬取并保存到缓存"""
+                           cache_dedupe, min_score_enabled, min_score,
+                           cache_keep_all_tags, cache_keep_any_tags):
+        """Batch fetch posts, clean tags, and save them into the local cache."""
         try:
             records, fetch_stats = batch_fetch_tags(
                 booru, tags_search, max_pages, fringe_benefits,
@@ -1506,27 +1608,31 @@ class Script(scripts.Script):
                 limit_tags, max_tags, mature_rating,
                 api_key, user_id_str, save_credentials,
                 use_remove_txt, choose_remove_txt, tag_categories,
-                min_score_enabled, min_score
+                min_score_enabled, min_score,
+                cache_start_page,
+                cache_keep_all_tags, cache_keep_any_tags,
             )
             if not records:
-                return "未抓取到任何 tag 数据", tag_cache_manager.get_status()
+                return "未抓取到符合缓存过滤条件的 tag 数据", tag_cache_manager.get_status()
             if append_mode:
                 save_stats = tag_cache_manager.append_records(records, dedupe=cache_dedupe)
-                msg = (
-                    f"追加完成：新增 {save_stats['inserted']} 条，重复跳过 {save_stats['skipped_duplicate']} 条，"
-                    f"低分跳过 {fetch_stats['skipped_score']} 条，空 tag 跳过 {fetch_stats['skipped_empty']} 条，"
-                    f"缓存总计 {save_stats['total']} 条"
-                )
+                action = "追加完成"
             else:
                 save_stats = tag_cache_manager.save_records(records, dedupe=cache_dedupe)
                 tag_cache_manager.reset_index()
-                msg = (
-                    f"覆盖保存完成：写入 {save_stats['inserted']} 条，重复跳过 {save_stats['skipped_duplicate']} 条，"
-                    f"低分跳过 {fetch_stats['skipped_score']} 条，索引已重置"
-                )
+                action = "覆盖保存完成"
+            msg = (
+                f"{action}: 写入 {save_stats['inserted']} 条，"
+                f"重复跳过 {save_stats['skipped_duplicate']} 条，"
+                f"低分跳过 {fetch_stats['skipped_score']} 条，"
+                f"缓存过滤跳过 {fetch_stats['skipped_filter']} 条，"
+                f"空 tag 跳过 {fetch_stats['skipped_empty']} 条，"
+                f"页段 {fetch_stats['start_page']}-{fetch_stats['end_page']}，"
+                f"缓存总计 {save_stats['total']} 条"
+            )
             return msg, tag_cache_manager.get_status()
         except Exception as ex:
-            return f"❌ 错误: {ex}", tag_cache_manager.get_status()
+            return f"错误: {ex}", tag_cache_manager.get_status()
 
     @staticmethod
     def _cache_get_next(loop_mode):
@@ -1548,6 +1654,15 @@ class Script(scripts.Script):
     def _cache_delete():
         tag_cache_manager.delete_cache()
         return "✅ 缓存文件已删除", tag_cache_manager.get_status()
+
+    @staticmethod
+    def _cache_compact_duplicates():
+        stats = tag_cache_manager.compact_duplicates()
+        tag_cache_manager.reset_index()
+        return (
+            f"重复整理完成: 重建 {stats['updated']} 条，"
+            f"删除重复 {stats['removed']} 条，总计 {stats['total']} 条"
+        ), tag_cache_manager.get_status()
 
     @staticmethod
     def _cache_search(keyword):
@@ -1676,6 +1791,20 @@ class Script(scripts.Script):
         except Exception as e:
             print(f"[FilterPool] Error: {e}")
             return f"创建失败: {e}", tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
+
+    @staticmethod
+    def _use_filter_once(query, must_include, must_exclude, sort_order, limit_count):
+        try:
+            count = tag_cache_manager.create_filtered_pool_by_keywords(
+                must_include, must_exclude, query, sort_order=sort_order, limit=int(limit_count or 0)
+            )
+            if count <= 0:
+                return "当前筛选没有命中缓存条目", tag_cache_manager.get_filtered_pool_status()
+            msg = tag_cache_manager.use_filtered_pool(True)
+            return f"{msg}: {count} 条", tag_cache_manager.get_filtered_pool_status()
+        except Exception as e:
+            print(f"[FilterPool] Error: {e}")
+            return f"筛选失败: {e}", tag_cache_manager.get_filtered_pool_status()
 
     @staticmethod
     def _list_rules():
@@ -1838,11 +1967,23 @@ class Script(scripts.Script):
                             gr.Markdown("#### 爬取设置")
                             with gr.Row():
                                 cache_pages = gr.Number(label="爬取页数", minimum=1, maximum=100, value=5, step=1, precision=0)
+                                cache_start_page = gr.Number(label="从第几页开始缓存", minimum=1, maximum=100000, value=1, step=1, precision=0)
                                 cache_append_mode = gr.Checkbox(label="追加模式（不覆盖已有缓存）", value=True)
-                                cache_dedupe = gr.Checkbox(label="入库去重", value=True)
+                                cache_dedupe = gr.Checkbox(label="强制入库去重（完全相同 Tag 必删）", value=True, interactive=False)
                             with gr.Row():
                                 cache_min_score_enabled = gr.Checkbox(label="启用最低分过滤", value=False)
                                 cache_min_score = gr.Number(label="最低 Score", value=0, step=1, precision=0)
+                            with gr.Row():
+                                cache_keep_all_tags = gr.Textbox(
+                                    label="缓存必须全部包含",
+                                    placeholder="例如: kafuu_chino",
+                                    lines=1,
+                                )
+                                cache_keep_any_tags = gr.Textbox(
+                                    label="缓存必须任意包含",
+                                    placeholder="例如: 1girl,2girls",
+                                    lines=1,
+                                )
                             cache_fetch_btn = gr.Button("🚀 开始批量爬取", variant="primary")
                             cache_fetch_result = gr.Textbox(label="爬取结果", interactive=False, lines=2)
 
@@ -1887,11 +2028,12 @@ class Script(scripts.Script):
                             with gr.Row():
                                 cache_reset_btn = gr.Button("🔁 重置索引")
                                 cache_delete_btn = gr.Button("🗑️ 删除全部缓存", variant="stop")
+                                cache_compact_btn = gr.Button("手动清除完全一致 Tag", variant="secondary")
                             cache_manage_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
 
                         # ─── 标签筛选池面板 ────────────────────────────────
-                        with gr.Accordion("标签筛选池", open=False):
-                            gr.Markdown("### 🎯 用搜索语法创建可复用规则池")
+                        with gr.Accordion("缓存筛选 / 标签筛选池", open=False):
+                            gr.Markdown("### 🎯 直接筛选缓存，必要时再保存为规则池")
                             filter_query = gr.Textbox(
                                 label="搜索语法",
                                 placeholder="例如: +1girl +blue_eyes -2girls -text",
@@ -1920,6 +2062,7 @@ class Script(scripts.Script):
                             
                             with gr.Row():
                                 filter_search_btn = gr.Button("🔍 筛选标签", variant="primary")
+                                filter_quick_use_btn = gr.Button("⚡ 直接启用当前筛选", variant="secondary")
                                 filter_create_rule_pool_btn = gr.Button("✅ 保存并启用规则池", variant="primary")
                             filter_result_msg = gr.Textbox(label="筛选结果", interactive=False, lines=1)
                             
@@ -2013,12 +2156,13 @@ class Script(scripts.Script):
 
         cache_fetch_btn.click(
             fn=self._cache_batch_fetch,
-            inputs=[booru, tags, cache_pages, fringe_benefits,
+            inputs=[booru, tags, cache_pages, cache_start_page, fringe_benefits,
                     remove_bad_tags, remove_tags, shuffle_tags,
                     change_dash, limit_tags, max_tags, mature_rating,
                     api_key, user_id, save_credentials,
                     use_remove_txt, choose_remove_txt, cache_append_mode, tag_categories,
-                    cache_dedupe, cache_min_score_enabled, cache_min_score],
+                    cache_dedupe, cache_min_score_enabled, cache_min_score,
+                    cache_keep_all_tags, cache_keep_any_tags],
             outputs=[cache_fetch_result, cache_status_display]
         )
 
@@ -2052,6 +2196,12 @@ class Script(scripts.Script):
             outputs=[cache_manage_result, cache_status_display]
         )
 
+        cache_compact_btn.click(
+            fn=self._cache_compact_duplicates,
+            inputs=[],
+            outputs=[cache_manage_result, cache_status_display]
+        )
+
         cache_search_btn.click(
             fn=self._cache_search,
             inputs=[cache_search_keyword],
@@ -2081,6 +2231,12 @@ class Script(scripts.Script):
             fn=self._create_filtered_pool_from_filter,
             inputs=[filter_rule_name, filter_query, filter_must_include, filter_must_exclude, filter_sort_order, filter_rule_limit],
             outputs=[filter_pool_result, filter_pool_status, filter_rules]
+        )
+
+        filter_quick_use_btn.click(
+            fn=self._use_filter_once,
+            inputs=[filter_query, filter_must_include, filter_must_exclude, filter_sort_order, filter_rule_limit],
+            outputs=[filter_pool_result, filter_pool_status]
         )
 
         filter_create_pool_btn.click(

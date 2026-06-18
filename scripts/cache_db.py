@@ -1,8 +1,11 @@
 """
 SQLite tag cache for Ranbooru.
 
-The prompt-facing API still returns only cleaned tag strings. Metadata is stored
-for filtering, previewing, dedupe, and future maintenance.
+Focus:
+- hard dedupe for exact tag sets
+- stable ordered reading for large caches
+- lightweight keyword filtering
+- optional filtered pools / rules for power users
 """
 
 import os
@@ -12,8 +15,6 @@ import sqlite3
 
 
 class TagCacheManager:
-    """SQLite-backed tag cache with metadata, rules, and legacy API shims."""
-
     TAG_COLUMNS = {
         "booru": "TEXT",
         "post_id": "TEXT",
@@ -99,7 +100,8 @@ class TagCacheManager:
             )
             self._migrate_tags_table(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_post ON tags (booru, post_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_duplicate ON tags (duplicate_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_score ON tags (score)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_filtered_pool_tag_id ON filtered_pool (tag_id)")
             conn.commit()
         finally:
             conn.close()
@@ -109,22 +111,9 @@ class TagCacheManager:
         for name, column_type in self.TAG_COLUMNS.items():
             if name not in existing:
                 conn.execute(f"ALTER TABLE tags ADD COLUMN {name} {column_type}")
-
         conn.execute("UPDATE tags SET tags_prompt = tags WHERE tags_prompt IS NULL OR tags_prompt = ''")
         conn.execute("UPDATE tags SET tags_raw = tags WHERE tags_raw IS NULL OR tags_raw = ''")
-        rows = conn.execute("SELECT id, booru, post_id, tags_prompt, duplicate_key FROM tags").fetchall()
-        for row in rows:
-            if row["duplicate_key"]:
-                continue
-            duplicate_key = self._make_duplicate_key(
-                {
-                    "booru": row["booru"],
-                    "post_id": row["post_id"],
-                    "tags_prompt": row["tags_prompt"],
-                    "tags": row["tags_prompt"],
-                }
-            )
-            conn.execute("UPDATE tags SET duplicate_key = ? WHERE id = ?", (duplicate_key, row["id"]))
+        self._apply_duplicate_key_migration(conn, force=True)
 
     def _load_index(self):
         conn = self._connect()
@@ -151,11 +140,58 @@ class TagCacheManager:
                 conn.close()
 
     @staticmethod
+    def _normalize_tag_token(tag):
+        normalized = re.sub(r"[\s_]+", "_", str(tag or "").strip().lower())
+        normalized = re.sub(r"_+", "_", normalized).strip("_")
+        girl_match = re.fullmatch(r"(\d+)girls?", normalized)
+        if girl_match:
+            count = girl_match.group(1)
+            return "1girl" if count == "1" else f"{count}girls"
+        boy_match = re.fullmatch(r"(\d+)boys?", normalized)
+        if boy_match:
+            count = boy_match.group(1)
+            return "1boy" if count == "1" else f"{count}boys"
+        return normalized
+
+    @staticmethod
     def _split_keywords(keywords):
         if not keywords:
             return []
         normalized = str(keywords).replace("，", ",").replace("\n", ",").replace("\r", ",")
-        return [keyword.strip() for keyword in normalized.split(",") if keyword.strip()]
+        tokens = []
+        seen = set()
+        for keyword in normalized.split(","):
+            token = TagCacheManager._normalize_tag_token(keyword)
+            if token and token not in seen:
+                seen.add(token)
+                tokens.append(token)
+        return tokens
+
+    @staticmethod
+    def _split_prompt_tokens(tags):
+        if not tags:
+            return []
+        if isinstance(tags, (list, tuple, set)):
+            raw_tokens = tags
+        else:
+            normalized = str(tags).replace("，", ",").replace("\n", ",").replace("\r", ",")
+            raw_tokens = normalized.split(",") if "," in normalized else normalized.split()
+        tokens = []
+        seen = set()
+        for token in raw_tokens:
+            normalized = TagCacheManager._normalize_tag_token(token)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                tokens.append(normalized)
+        return tokens
+
+    @staticmethod
+    def _canonical_tag_key(tags):
+        return "|".join(sorted(TagCacheManager._split_prompt_tokens(tags)))
+
+    @staticmethod
+    def _escape_like(value):
+        return str(value or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
     @staticmethod
     def _safe_int(value, default=0):
@@ -168,14 +204,19 @@ class TagCacheManager:
 
     @staticmethod
     def _normalize_tags(tags):
-        return re.sub(r"\s+", " ", str(tags or "").strip().lower())
+        return ",".join(TagCacheManager._split_prompt_tokens(tags))
 
     def _make_duplicate_key(self, record):
+        tag_key = self._canonical_tag_key(
+            record.get("tags_prompt") or record.get("tags") or record.get("tags_raw") or ""
+        )
+        if tag_key:
+            return f"tags:{tag_key}"
         booru = str(record.get("booru") or "").strip()
         post_id = str(record.get("post_id") or "").strip()
         if booru and post_id:
             return f"post:{booru}:{post_id}"
-        return f"tags:{self._normalize_tags(record.get('tags_prompt') or record.get('tags') or '')}"
+        return "tags:"
 
     def _coerce_record(self, record):
         if isinstance(record, str):
@@ -194,7 +235,7 @@ class TagCacheManager:
             "preview_url": record.get("preview_url") or "",
             "search_query": record.get("search_query") or "",
         }
-        coerced["duplicate_key"] = record.get("duplicate_key") or self._make_duplicate_key(coerced)
+        coerced["duplicate_key"] = self._make_duplicate_key(coerced)
         return coerced
 
     def _set_metadata(self, key, value, conn=None):
@@ -215,6 +256,65 @@ class TagCacheManager:
             return row["value"] if row else default
         finally:
             conn.close()
+
+    def _rebuild_duplicate_keys(self, conn):
+        rows = conn.execute(
+            "SELECT id, booru, post_id, tags, tags_prompt, tags_raw, duplicate_key FROM tags ORDER BY id"
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            tags_prompt = str(row["tags_prompt"] or row["tags_raw"] or row["tags"] or "").strip()
+            tags_raw = str(row["tags_raw"] or row["tags"] or tags_prompt).strip()
+            duplicate_key = self._make_duplicate_key(
+                {
+                    "booru": row["booru"],
+                    "post_id": row["post_id"],
+                    "tags_prompt": tags_prompt,
+                    "tags": tags_raw,
+                }
+            )
+            if row["duplicate_key"] != duplicate_key or row["tags_prompt"] != tags_prompt or row["tags_raw"] != tags_raw:
+                conn.execute(
+                    "UPDATE tags SET tags_prompt = ?, tags_raw = ?, duplicate_key = ? WHERE id = ?",
+                    (tags_prompt, tags_raw, duplicate_key, row["id"]),
+                )
+                updated += 1
+        return updated
+
+    def _compact_duplicate_rows(self, conn):
+        rows = conn.execute(
+            "SELECT id, duplicate_key, score FROM tags ORDER BY duplicate_key, score DESC, id ASC"
+        ).fetchall()
+        seen = set()
+        removed = 0
+        for row in rows:
+            duplicate_key = str(row["duplicate_key"] or "")
+            if duplicate_key in seen:
+                conn.execute("DELETE FROM tags WHERE id = ?", (row["id"],))
+                removed += 1
+            else:
+                seen.add(duplicate_key)
+        return removed
+
+    def _ensure_duplicate_index(self, conn):
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_duplicate ON tags (duplicate_key)")
+
+    def _apply_duplicate_key_migration(self, conn, force=False):
+        row = conn.execute(
+            "SELECT value FROM metadata WHERE key = ?",
+            ("duplicate_key_migration_v2",),
+        ).fetchone()
+        if not force and row and row["value"] == "2":
+            return {"updated": 0, "removed": 0}
+        conn.execute("DROP INDEX IF EXISTS idx_tags_duplicate")
+        updated = self._rebuild_duplicate_keys(conn)
+        removed = self._compact_duplicate_rows(conn)
+        self._ensure_duplicate_index(conn)
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+            ("duplicate_key_migration_v2", "2"),
+        )
+        return {"updated": updated, "removed": removed}
 
     def save_cache(self, tags_list):
         return self.save_records([{"tags_prompt": tags} for tags in tags_list])
@@ -247,17 +347,9 @@ class TagCacheManager:
                 if min_score is not None and record["score"] < int(min_score):
                     stats["skipped_score"] += 1
                     continue
-                if dedupe:
-                    exists = conn.execute(
-                        "SELECT 1 FROM tags WHERE duplicate_key = ? LIMIT 1",
-                        (record["duplicate_key"],),
-                    ).fetchone()
-                    if exists:
-                        stats["skipped_duplicate"] += 1
-                        continue
-                conn.execute(
+                cursor = conn.execute(
                     """
-                    INSERT INTO tags (
+                    INSERT OR IGNORE INTO tags (
                         booru, post_id, tags, tags_raw, tags_prompt, score, rating,
                         source_url, preview_url, search_query, duplicate_key
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -276,7 +368,10 @@ class TagCacheManager:
                         record["duplicate_key"],
                     ),
                 )
-                stats["inserted"] += 1
+                if cursor.rowcount == 0:
+                    stats["skipped_duplicate"] += 1
+                else:
+                    stats["inserted"] += 1
             conn.commit()
             stats["total"] = conn.execute("SELECT COUNT(*) AS c FROM tags").fetchone()["c"]
             return stats
@@ -299,6 +394,16 @@ class TagCacheManager:
             self._save_index()
         except Exception as e:
             print(f"[CacheDB] Delete failed: {e}")
+
+    def compact_duplicates(self):
+        conn = self._connect()
+        try:
+            result = self._apply_duplicate_key_migration(conn, force=True)
+            conn.commit()
+            total = conn.execute("SELECT COUNT(*) AS c FROM tags").fetchone()["c"]
+            return {"updated": result.get("updated", 0), "removed": result.get("removed", 0), "total": total}
+        finally:
+            conn.close()
 
     def get_status(self):
         conn = self._connect()
@@ -329,13 +434,13 @@ class TagCacheManager:
             elif lowered.startswith(("exclude:", "排除:")):
                 exclude.extend(TagCacheManager._split_keywords(token.split(":", 1)[1]))
             elif token.startswith("+") and len(token) > 1:
-                include.append(token[1:])
+                include.append(TagCacheManager._normalize_tag_token(token[1:]))
             elif token.startswith("-") and len(token) > 1:
-                exclude.append(token[1:])
+                exclude.append(TagCacheManager._normalize_tag_token(token[1:]))
             else:
-                include.append(token)
-        include = list(dict.fromkeys(include))
-        exclude = list(dict.fromkeys(exclude))
+                include.append(TagCacheManager._normalize_tag_token(token))
+        include = list(dict.fromkeys([item for item in include if item]))
+        exclude = list(dict.fromkeys([item for item in exclude if item]))
         return include, exclude
 
     def _where_for_terms(self, include=None, exclude=None):
@@ -343,12 +448,22 @@ class TagCacheManager:
         exclude = exclude or []
         clauses = []
         params = []
+        tag_expr = (
+            "(',' || LOWER(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(tags_prompt, tags), "
+            "'，', ','), CHAR(10), ','), CHAR(13), ','), ' ', '_')) || ',')"
+        )
+        raw_expr = (
+            "(',' || LOWER(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(tags_raw, tags), "
+            "'，', ','), CHAR(10), ','), CHAR(13), ','), ' ', ',')) || ',')"
+        )
         for keyword in include:
-            clauses.append("(COALESCE(tags_prompt, tags) LIKE ? OR COALESCE(tags_raw, tags) LIKE ?)")
-            params.extend([f"%{keyword}%", f"%{keyword}%"])
+            pattern = f"%,{self._escape_like(keyword)},%"
+            clauses.append(f"({tag_expr} LIKE ? ESCAPE '\\' OR {raw_expr} LIKE ? ESCAPE '\\')")
+            params.extend([pattern, pattern])
         for keyword in exclude:
-            clauses.append("(COALESCE(tags_prompt, tags) NOT LIKE ? AND COALESCE(tags_raw, tags) NOT LIKE ?)")
-            params.extend([f"%{keyword}%", f"%{keyword}%"])
+            pattern = f"%,{self._escape_like(keyword)},%"
+            clauses.append(f"({tag_expr} NOT LIKE ? ESCAPE '\\' AND {raw_expr} NOT LIKE ? ESCAPE '\\')")
+            params.extend([pattern, pattern])
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         return where, params
 
@@ -433,8 +548,17 @@ class TagCacheManager:
 
     def delete_by_filter(self, must_include="", must_exclude="", query=""):
         include, exclude = self.parse_search_syntax(query, must_include, must_exclude)
-        rows = self._query_records(include, exclude, limit=0)
-        return self.delete_by_ids([row[0] for row in rows])
+        where, params = self._where_for_terms(include, exclude)
+        conn = self._connect()
+        try:
+            cursor = conn.execute(f"DELETE FROM tags {where}", params)
+            conn.commit()
+            return cursor.rowcount
+        except Exception as e:
+            print(f"[CacheDB] Delete filter failed: {e}")
+            return 0
+        finally:
+            conn.close()
 
     def create_filtered_pool(self, filtered_ids):
         if not filtered_ids:
@@ -452,6 +576,7 @@ class TagCacheManager:
             )
             count = conn.execute("SELECT COUNT(*) AS c FROM filtered_pool").fetchone()["c"]
             self.current_index = 0
+            self._set_metadata("active_rule_id", "", conn)
             self._save_index(conn)
             conn.commit()
             return count
@@ -462,8 +587,38 @@ class TagCacheManager:
             conn.close()
 
     def create_filtered_pool_by_keywords(self, must_include="", must_exclude="", query="", sort_order="ID", limit=0):
-        rows = self.filter_tags_by_keywords(must_include, must_exclude, query, sort_order=sort_order, limit=limit)
-        return self.create_filtered_pool([row[0] for row in rows])
+        include, exclude = self.parse_search_syntax(query, must_include, must_exclude)
+        where, params = self._where_for_terms(include, exclude)
+        order = self.SORT_SQL.get(sort_order or "ID", "id ASC")
+        limit_sql = ""
+        if limit and int(limit) > 0:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+        conn = self._connect()
+        try:
+            conn.execute("DELETE FROM filtered_pool")
+            conn.execute(
+                f"""
+                INSERT INTO filtered_pool (tag_id, tags)
+                SELECT id, COALESCE(tags_prompt, tags)
+                FROM tags
+                {where}
+                ORDER BY {order}
+                {limit_sql}
+                """,
+                params,
+            )
+            count = conn.execute("SELECT COUNT(*) AS c FROM filtered_pool").fetchone()["c"]
+            self.current_index = 0
+            self._set_metadata("active_rule_id", "", conn)
+            self._save_index(conn)
+            conn.commit()
+            return count
+        except Exception as e:
+            print(f"[CacheDB] Create keyword filtered pool failed: {e}")
+            return 0
+        finally:
+            conn.close()
 
     def create_rule(self, name="", query="", must_include="", must_exclude="", sort_order="ID", limit_count=0):
         include, exclude = self.parse_search_syntax(query, must_include, must_exclude)
@@ -612,9 +767,29 @@ class TagCacheManager:
         )
         return rows, total
 
+    def _active_rule_next_row(self):
+        rule = self.get_rule(self.get_active_rule_id())
+        if not rule:
+            return None, 0
+        include, exclude = self.parse_search_syntax(rule["query"], rule["must_include"], rule["must_exclude"])
+        total = self._count_records(include, exclude)
+        limit_count = int(rule.get("limit_count") or 0)
+        if limit_count > 0:
+            total = min(total, limit_count)
+        if total == 0:
+            return None, 0
+        row = self._query_records(
+            include,
+            exclude,
+            sort_order=rule.get("sort_order") or "ID",
+            limit=1,
+            offset=self.current_index,
+        )
+        return (row[0] if row else None), total
+
     def get_next_tags_from_pool(self, loop=True):
         if self.is_using_filtered_pool() and self.get_active_rule_id():
-            rows, total = self._active_rule_rows()
+            row, total = self._active_rule_next_row()
             if total == 0:
                 return None, 0, 0
             if self.current_index >= total:
@@ -622,7 +797,10 @@ class TagCacheManager:
                     self.current_index = 0
                 else:
                     return None, self.current_index, total
-            tags = rows[self.current_index][5]
+                row, total = self._active_rule_next_row()
+            if row is None:
+                return None, self.current_index, total
+            tags = row[5]
             self.current_index += 1
             self._save_index()
             return tags, self.current_index, total
@@ -640,7 +818,7 @@ class TagCacheManager:
                 else:
                     return None, self.current_index, total
             row = conn.execute(
-                f"SELECT {tag_expr} AS tags_prompt FROM {table_name} LIMIT 1 OFFSET ?",
+                f"SELECT {tag_expr} AS tags_prompt FROM {table_name} ORDER BY id ASC LIMIT 1 OFFSET ?",
                 (self.current_index,),
             ).fetchone()
             if row:
