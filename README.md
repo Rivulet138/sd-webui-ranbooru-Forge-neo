@@ -13,10 +13,12 @@ Ranbooru Forge Neo 是适配 Stable Diffusion WebUI / Forge 的 Booru 标签扩�
 - 支持本地 SQLite tag 缓存。
 - 支持生成时直接从本地缓存读取 tag。
 - 支持从指定页开始批量缓存。
-- 支持缓存必须全部包含 / 任意包含过滤。
+- 支持缓存必须全部包含 / 任意包含 / 命中排除 tag 不入库过滤。
 - 支持 `1girl/2girl` 这类人数 tag 的规范化匹配。
 - 支持按规范化后的完整 tag 集合强制去重。
 - 支持手动清除完全一致的 tag 缓存。
+- 支持 90% 以上相似 tag 组最多保留指定数量，适合清理父图 / sibling 变体。
+- 支持按任意指定 tag 手动批量删除缓存，例如 `comic,text,speech_bubble`。
 - 支持缓存搜索、临时筛选池、可复用规则池。
 - 保留 Img2Img、ControlNet、DeepBooru、LoRAnado 等辅助流程。
 
@@ -102,6 +104,7 @@ user/cache/tag_cache.db
 - `启用最低分过滤`：只保存 score 达到阈值的 post。
 - `缓存必须全部包含`：这里列出的 tag 必须全部存在。
 - `缓存必须任意包含`：这里列出的 tag 至少命中一个。
+- `缓存排除 Tag（命中任意一个就不入库）`：这里列出的 tag 只要命中任意一个，整条 post 就不会写入缓存。
 
 设置好后点击 `开始批量爬取`。
 
@@ -113,6 +116,7 @@ user/cache/tag_cache.db
 Tags to Search (Pre): kafuu_chino
 缓存必须全部包含: kafuu_chino
 缓存必须任意包含: 1girl,2girl
+缓存排除 Tag: comic
 ```
 
 说明：
@@ -120,6 +124,7 @@ Tags to Search (Pre): kafuu_chino
 - `2girl` 会自动规范化为 Booru 常见 tag `2girls`。
 - `1girls` 会自动规范化为 `1girl`。
 - 搜索框里的正向 tag 会自动并入入库硬过滤；如果站点意外返回不含 `kafuu_chino` 的 post，它不会进入缓存。
+- `缓存排除 Tag` 是丢弃整条缓存；`Tags to Remove (Post)` 只是从 prompt 中移除 tag，二者用途不同。
 - 旧缓存中已经混入的错误数据不会自动变正确，需要删除旧缓存后重新抓取。
 
 ### 从指定页开始缓存
@@ -153,6 +158,8 @@ blue eyes,kafuu_chino,2girl
 
 点击 `手动清除完全一致 Tag` 可以整理旧缓存，删除规范化后 tag 集合完全一致的重复行。存在重复时会优先保留高分记录，然后保留更早的记录。
 
+点击 `清除相似 Tag (>=90%)` 可以整理 sibling / 父图变体这类高度相似缓存。它会按规范化后的 tag 集合计算相似度，默认阈值 `0.90`，默认每组最多保留 `2` 条；保留顺序优先高分，再按更早入库的记录。
+
 ## 缓存搜索语法
 
 缓存搜索、筛选池、规则池、按筛选删除都支持：
@@ -182,6 +189,8 @@ blue eyes,kafuu_chino,2girl
 - 删除全部缓存。
 - 重置顺序读取索引。
 - 手动清除完全一致 tag。
+- 手动清除 90% 以上相似 tag 组。
+- 按任意指定 tag 批量删除缓存；输入 `comic,text` 会删除包含其中任意一个 tag 的缓存。
 
 注意：本地缓存 ID 是 SQLite 自增 ID，不是 Booru 站点的 Post ID。
 
@@ -252,6 +261,8 @@ Tag 清理支持：
 
 - `Remove bad tags`：使用内置坏 tag 黑名单。
 - `Tags to Remove (Post)`：输入自定义移除 tag。
+- `缓存排除 Tag`：批量爬取时命中任意指定 tag 就跳过整条 post。
+- `按包含 Tag 删除缓存`：对已有缓存按任意指定 tag 批量删除。
 - `user/remove` 文件驱动移除。
 - `*` 通配移除。
 - 随机打乱 tag。
@@ -333,6 +344,8 @@ Gelbooru 可能返回 HTTP 429。降低抓取页数、等待后重试、填写�
 ### 旧缓存有重复
 
 点击 `手动清除完全一致 Tag`。它会重建 duplicate key，并删除规范化后完整 tag 集合完全一致的重复行。
+
+如果是 Danbooru 父图 / sibling 变体导致的高度相似缓存，点击 `清除相似 Tag (>=90%)`。默认会把 90% 以上相似的一组最多保留 2 条。
 
 ### 如何完全离线生成
 

@@ -9,6 +9,7 @@ Focus:
 """
 
 import os
+import math
 import re
 import shlex
 import sqlite3
@@ -143,6 +144,8 @@ class TagCacheManager:
     def _normalize_tag_token(tag):
         normalized = re.sub(r"[\s_]+", "_", str(tag or "").strip().lower())
         normalized = re.sub(r"_+", "_", normalized).strip("_")
+        if re.fullmatch(r"[+\-_]+", normalized or ""):
+            return ""
         girl_match = re.fullmatch(r"(\d+)girls?", normalized)
         if girl_match:
             count = girl_match.group(1)
@@ -405,6 +408,160 @@ class TagCacheManager:
         finally:
             conn.close()
 
+    @staticmethod
+    def _tag_jaccard(left, right):
+        if not left or not right:
+            return 0.0
+        intersection = len(left & right)
+        if intersection <= 0:
+            return 0.0
+        return intersection / float(len(left | right))
+
+    @staticmethod
+    def _can_reach_similarity(left_len, right_len, threshold):
+        if left_len <= 0 or right_len <= 0:
+            return False
+        return (min(left_len, right_len) / float(max(left_len, right_len))) >= threshold
+
+    def _delete_ids_in_chunks(self, conn, ids):
+        removed = 0
+        for start in range(0, len(ids), 800):
+            chunk = ids[start:start + 800]
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = conn.execute(f"DELETE FROM tags WHERE id IN ({placeholders})", chunk)
+            removed += cursor.rowcount
+        return removed
+
+    def compact_similar(self, threshold=0.9, keep_per_group=2, must_include="", must_exclude="", query=""):
+        try:
+            threshold = float(threshold)
+        except Exception:
+            threshold = 0.9
+        threshold = max(0.5, min(1.0, threshold))
+        try:
+            keep_per_group = int(keep_per_group)
+        except Exception:
+            keep_per_group = 2
+        keep_per_group = max(1, keep_per_group)
+
+        include, exclude = self.parse_search_syntax(query, must_include, must_exclude)
+        where, params = self._where_for_terms(include, exclude)
+        conn = self._connect()
+        try:
+            exact_result = self._apply_duplicate_key_migration(conn, force=True)
+            rows = conn.execute(
+                f"""
+                SELECT id, score, COALESCE(tags_prompt, tags_raw, tags) AS tags_prompt
+                FROM tags
+                {where}
+                ORDER BY score DESC, id ASC
+                """,
+                params,
+            ).fetchall()
+
+            token_frequency = {}
+            items = []
+            for row in rows:
+                tokens = set(self._split_prompt_tokens(row["tags_prompt"]))
+                if not tokens:
+                    continue
+                for token in tokens:
+                    token_frequency[token] = token_frequency.get(token, 0) + 1
+                items.append({"id": int(row["id"]), "tokens": tokens})
+
+            def prefix_tokens(tokens):
+                sorted_tokens = sorted(tokens, key=lambda item: (token_frequency.get(item, 0), item))
+                required_overlap = math.ceil(threshold * len(tokens))
+                prefix_len = max(1, len(tokens) - required_overlap + 1)
+                return sorted_tokens[:prefix_len]
+
+            groups = []
+            prefix_to_groups = {}
+            delete_ids = []
+            compared = 0
+
+            for item in items:
+                tokens = item["tokens"]
+                token_count = len(tokens)
+                candidate_group_ids = set()
+                item_prefix_tokens = prefix_tokens(tokens)
+                for token in item_prefix_tokens:
+                    candidate_group_ids.update(prefix_to_groups.get(token, ()))
+
+                matched_group = None
+                matched_group_id = None
+                for group_id in candidate_group_ids:
+                    group = groups[group_id]
+                    if not self._can_reach_similarity(token_count, group["min_len"], threshold) and not self._can_reach_similarity(token_count, group["max_len"], threshold):
+                        if token_count < group["min_len"] and (token_count / float(group["min_len"])) < threshold:
+                            continue
+                        if token_count > group["max_len"] and (group["max_len"] / float(token_count)) < threshold:
+                            continue
+                    for member_tokens in group["members"]:
+                        if not self._can_reach_similarity(token_count, len(member_tokens), threshold):
+                            continue
+                        compared += 1
+                        if self._tag_jaccard(tokens, member_tokens) >= threshold:
+                            matched_group = group
+                            matched_group_id = group_id
+                            break
+                    if matched_group is not None:
+                        break
+
+                if matched_group is None:
+                    group_id = len(groups)
+                    groups.append({
+                        "members": [tokens],
+                        "kept": 1,
+                        "min_len": token_count,
+                        "max_len": token_count,
+                    })
+                    for token in item_prefix_tokens:
+                        prefix_to_groups.setdefault(token, set()).add(group_id)
+                    continue
+
+                matched_group["members"].append(tokens)
+                matched_group["min_len"] = min(matched_group["min_len"], token_count)
+                matched_group["max_len"] = max(matched_group["max_len"], token_count)
+                for token in item_prefix_tokens:
+                    prefix_to_groups.setdefault(token, set()).add(matched_group_id)
+                if matched_group["kept"] < keep_per_group:
+                    matched_group["kept"] += 1
+                else:
+                    delete_ids.append(item["id"])
+
+            similar_removed = self._delete_ids_in_chunks(conn, delete_ids) if delete_ids else 0
+            conn.commit()
+            total = conn.execute("SELECT COUNT(*) AS c FROM tags").fetchone()["c"]
+            return {
+                "updated": exact_result.get("updated", 0),
+                "exact_removed": exact_result.get("removed", 0),
+                "similar_removed": similar_removed,
+                "checked": len(rows),
+                "compared": compared,
+                "groups": len(groups),
+                "threshold": threshold,
+                "keep_per_group": keep_per_group,
+                "total": total,
+            }
+        except Exception as e:
+            conn.rollback()
+            print(f"[CacheDB] Compact similar failed: {e}")
+            return {
+                "updated": 0,
+                "exact_removed": 0,
+                "similar_removed": 0,
+                "checked": 0,
+                "compared": 0,
+                "groups": 0,
+                "threshold": threshold,
+                "keep_per_group": keep_per_group,
+                "total": 0,
+                "error": str(e),
+            }
+        finally:
+            conn.close()
+
     def get_status(self):
         conn = self._connect()
         try:
@@ -556,6 +713,35 @@ class TagCacheManager:
             return cursor.rowcount
         except Exception as e:
             print(f"[CacheDB] Delete filter failed: {e}")
+            return 0
+        finally:
+            conn.close()
+
+    def delete_by_any_tags(self, tags):
+        terms = self._split_keywords(tags)
+        if not terms:
+            return 0
+        tag_expr = (
+            "(',' || LOWER(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(tags_prompt, tags), "
+            "'，', ','), CHAR(10), ','), CHAR(13), ','), ' ', '_')) || ',')"
+        )
+        raw_expr = (
+            "(',' || LOWER(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(tags_raw, tags), "
+            "'，', ','), CHAR(10), ','), CHAR(13), ','), ' ', ',')) || ',')"
+        )
+        clauses = []
+        params = []
+        for term in terms:
+            pattern = f"%,{self._escape_like(term)},%"
+            clauses.append(f"({tag_expr} LIKE ? ESCAPE '\\' OR {raw_expr} LIKE ? ESCAPE '\\')")
+            params.extend([pattern, pattern])
+        conn = self._connect()
+        try:
+            cursor = conn.execute(f"DELETE FROM tags WHERE {' OR '.join(clauses)}", params)
+            conn.commit()
+            return cursor.rowcount
+        except Exception as e:
+            print(f"[CacheDB] Delete by tags failed: {e}")
             return 0
         finally:
             conn.close()

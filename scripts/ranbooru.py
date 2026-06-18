@@ -1097,6 +1097,8 @@ def _safe_read_csv_file(base_dir, filename):
 def _normalize_tag_token(tag):
     normalized = re.sub(r'[\s_]+', '_', str(tag or '').strip().lower())
     normalized = re.sub(r'_+', '_', normalized).strip('_')
+    if re.fullmatch(r'[+\-_]+', normalized or ''):
+        return ''
     girl_match = re.fullmatch(r'(\d+)girls?', normalized)
     if girl_match:
         count = girl_match.group(1)
@@ -1166,6 +1168,14 @@ def _post_has_required_tags(tag_list, required_all='', required_any=''):
     if required_any_tokens and not any(tag in normalized_tags for tag in required_any_tokens):
         return False
     return True
+
+
+def _post_has_excluded_tags(tag_list, excluded_any=''):
+    excluded_tokens = _split_tag_filter(excluded_any)
+    if not excluded_tokens:
+        return False
+    normalized_tags = set(_split_tag_tokens(tag_list))
+    return any(tag in normalized_tags for tag in excluded_tokens)
 
 
 def _get_post_tags(post):
@@ -1297,7 +1307,8 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                      use_remove_txt=False, choose_remove_txt='', tag_categories=None,
                      min_score_enabled=False, min_score=0,
                      cache_start_page=1,
-                     cache_keep_all_tags='', cache_keep_any_tags=''):
+                     cache_keep_all_tags='', cache_keep_any_tags='',
+                     cache_exclude_tags=''):
     """Fetch posts from booru and return metadata records with cleaned prompt tags."""
     max_pages = _normalize_max_pages(max_pages)
     try:
@@ -1381,6 +1392,7 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
         "end_page": start_page_index + max_pages,
         "skipped_score": 0,
         "skipped_filter": 0,
+        "skipped_exclude": 0,
         "skipped_empty": 0,
     }
     min_score_value = int(min_score or 0)
@@ -1419,6 +1431,9 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                 tag_list = _split_tag_tokens(raw_tags)
                 if not _post_has_required_tags(tag_list, effective_keep_all_tags, cache_keep_any_tags):
                     stats["skipped_filter"] += 1
+                    continue
+                if _post_has_excluded_tags(tag_list, cache_exclude_tags):
+                    stats["skipped_exclude"] += 1
                     continue
                 if shuffle_tags:
                     random.shuffle(tag_list)
@@ -1599,7 +1614,7 @@ class Script(scripts.Script):
                            api_key, user_id_str, save_credentials,
                            use_remove_txt, choose_remove_txt, append_mode, tag_categories,
                            cache_dedupe, min_score_enabled, min_score,
-                           cache_keep_all_tags, cache_keep_any_tags):
+                           cache_keep_all_tags, cache_keep_any_tags, cache_exclude_tags):
         """Batch fetch posts, clean tags, and save them into the local cache."""
         try:
             records, fetch_stats = batch_fetch_tags(
@@ -1610,7 +1625,7 @@ class Script(scripts.Script):
                 use_remove_txt, choose_remove_txt, tag_categories,
                 min_score_enabled, min_score,
                 cache_start_page,
-                cache_keep_all_tags, cache_keep_any_tags,
+                cache_keep_all_tags, cache_keep_any_tags, cache_exclude_tags,
             )
             if not records:
                 return "未抓取到符合缓存过滤条件的 tag 数据", tag_cache_manager.get_status()
@@ -1626,6 +1641,7 @@ class Script(scripts.Script):
                 f"重复跳过 {save_stats['skipped_duplicate']} 条，"
                 f"低分跳过 {fetch_stats['skipped_score']} 条，"
                 f"缓存过滤跳过 {fetch_stats['skipped_filter']} 条，"
+                f"排除 tag 跳过 {fetch_stats.get('skipped_exclude', 0)} 条，"
                 f"空 tag 跳过 {fetch_stats['skipped_empty']} 条，"
                 f"页段 {fetch_stats['start_page']}-{fetch_stats['end_page']}，"
                 f"缓存总计 {save_stats['total']} 条"
@@ -1662,6 +1678,18 @@ class Script(scripts.Script):
         return (
             f"重复整理完成: 重建 {stats['updated']} 条，"
             f"删除重复 {stats['removed']} 条，总计 {stats['total']} 条"
+        ), tag_cache_manager.get_status()
+
+    @staticmethod
+    def _cache_compact_similar(threshold, keep_per_group):
+        stats = tag_cache_manager.compact_similar(threshold, keep_per_group)
+        tag_cache_manager.reset_index()
+        if stats.get("error"):
+            return f"相似整理失败: {stats['error']}", tag_cache_manager.get_status()
+        return (
+            f"相似整理完成: 阈值 {stats['threshold']:.2f}，每组保留 {stats['keep_per_group']} 条，"
+            f"检查 {stats['checked']} 条，删除完全一致 {stats['exact_removed']} 条，"
+            f"删除相似 {stats['similar_removed']} 条，总计 {stats['total']} 条"
         ), tag_cache_manager.get_status()
 
     @staticmethod
@@ -1724,6 +1752,14 @@ class Script(scripts.Script):
         if success:
             return f"已删除 ID {cache_id}", tag_cache_manager.get_status()
         return "删除失败", tag_cache_manager.get_status()
+
+    @staticmethod
+    def _cache_delete_by_tags(tags):
+        if not str(tags or "").strip():
+            return "请输入要删除的 tag，例如 comic,text,speech_bubble", tag_cache_manager.get_status()
+        count = tag_cache_manager.delete_by_any_tags(tags)
+        tag_cache_manager.reset_index()
+        return f"已删除包含指定 tag 的 {count} 条缓存", tag_cache_manager.get_status()
 
     @staticmethod
     def _cache_refresh_status():
@@ -1984,6 +2020,11 @@ class Script(scripts.Script):
                                     placeholder="例如: 1girl,2girls",
                                     lines=1,
                                 )
+                            cache_exclude_tags = gr.Textbox(
+                                label="缓存排除 Tag（命中任意一个就不入库）",
+                                placeholder="例如: comic,text,speech_bubble,english_text",
+                                lines=1,
+                            )
                             cache_fetch_btn = gr.Button("🚀 开始批量爬取", variant="primary")
                             cache_fetch_result = gr.Textbox(label="爬取结果", interactive=False, lines=2)
 
@@ -2029,6 +2070,30 @@ class Script(scripts.Script):
                                 cache_reset_btn = gr.Button("🔁 重置索引")
                                 cache_delete_btn = gr.Button("🗑️ 删除全部缓存", variant="stop")
                                 cache_compact_btn = gr.Button("手动清除完全一致 Tag", variant="secondary")
+                            with gr.Row():
+                                cache_delete_tags = gr.Textbox(
+                                    label="按包含 Tag 删除缓存",
+                                    placeholder="例如: comic,text,speech_bubble,english_text",
+                                    lines=1,
+                                )
+                                cache_delete_tags_btn = gr.Button("删除包含这些 Tag", variant="stop")
+                            with gr.Row():
+                                cache_similar_threshold = gr.Number(
+                                    label="相似去重阈值",
+                                    minimum=0.5,
+                                    maximum=1.0,
+                                    value=0.90,
+                                    step=0.01,
+                                )
+                                cache_similar_keep = gr.Number(
+                                    label="每组最多保留",
+                                    minimum=1,
+                                    maximum=20,
+                                    value=2,
+                                    step=1,
+                                    precision=0,
+                                )
+                                cache_compact_similar_btn = gr.Button("清除相似 Tag (>=90%)", variant="secondary")
                             cache_manage_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
 
                         # ─── 标签筛选池面板 ────────────────────────────────
@@ -2162,7 +2227,7 @@ class Script(scripts.Script):
                     api_key, user_id, save_credentials,
                     use_remove_txt, choose_remove_txt, cache_append_mode, tag_categories,
                     cache_dedupe, cache_min_score_enabled, cache_min_score,
-                    cache_keep_all_tags, cache_keep_any_tags],
+                    cache_keep_all_tags, cache_keep_any_tags, cache_exclude_tags],
             outputs=[cache_fetch_result, cache_status_display]
         )
 
@@ -2199,6 +2264,18 @@ class Script(scripts.Script):
         cache_compact_btn.click(
             fn=self._cache_compact_duplicates,
             inputs=[],
+            outputs=[cache_manage_result, cache_status_display]
+        )
+
+        cache_delete_tags_btn.click(
+            fn=self._cache_delete_by_tags,
+            inputs=[cache_delete_tags],
+            outputs=[cache_manage_result, cache_status_display]
+        )
+
+        cache_compact_similar_btn.click(
+            fn=self._cache_compact_similar,
+            inputs=[cache_similar_threshold, cache_similar_keep],
             outputs=[cache_manage_result, cache_status_display]
         )
 
