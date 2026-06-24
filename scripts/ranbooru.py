@@ -1636,6 +1636,7 @@ class Script(scripts.Script):
                 save_stats = tag_cache_manager.save_records(records, dedupe=cache_dedupe)
                 tag_cache_manager.reset_index()
                 action = "覆盖保存完成"
+            backup_note = f"，覆盖前备份 {save_stats.get('backup_path')}" if save_stats.get("backup_path") else ""
             msg = (
                 f"{action}: 写入 {save_stats['inserted']} 条，"
                 f"重复跳过 {save_stats['skipped_duplicate']} 条，"
@@ -1644,7 +1645,7 @@ class Script(scripts.Script):
                 f"排除 tag 跳过 {fetch_stats.get('skipped_exclude', 0)} 条，"
                 f"空 tag 跳过 {fetch_stats['skipped_empty']} 条，"
                 f"页段 {fetch_stats['start_page']}-{fetch_stats['end_page']}，"
-                f"缓存总计 {save_stats['total']} 条"
+                f"缓存总计 {save_stats['total']} 条{backup_note}"
             )
             return msg, tag_cache_manager.get_status()
         except Exception as ex:
@@ -1668,28 +1669,54 @@ class Script(scripts.Script):
 
     @staticmethod
     def _cache_delete():
-        tag_cache_manager.delete_cache()
-        return "✅ 缓存文件已删除", tag_cache_manager.get_status()
+        result = tag_cache_manager.delete_cache()
+        if result.get("error"):
+            return f"删除缓存失败: {result['error']}", tag_cache_manager.get_status()
+        backup_note = f"，备份: {result.get('backup_path')}" if result.get("backup_path") else ""
+        return f"✅ 缓存文件已删除，可撤销 {result.get('deleted', 0)} 条{backup_note}", tag_cache_manager.get_status()
+
+    @staticmethod
+    def _cache_backup():
+        try:
+            path = tag_cache_manager.backup_db("manual")
+            if not path:
+                return "当前没有可备份的缓存数据库"
+            return f"已备份缓存数据库：{path}"
+        except Exception as e:
+            return f"备份失败: {e}"
+
+    @staticmethod
+    def _cache_restore_last_deleted(dedupe=True):
+        result = tag_cache_manager.restore_last_deleted(dedupe=dedupe)
+        if not result.get("ok"):
+            return result.get("message", "撤销失败"), tag_cache_manager.get_status()
+        return (
+            f"撤销完成: 上次删除 {result.get('deleted_count', 0)} 条，恢复写入 {result.get('inserted', 0)} 条，"
+            f"重复跳过 {result.get('skipped_duplicate', 0)} 条，总计 {result.get('total', 0)} 条",
+            tag_cache_manager.get_status(),
+        )
 
     @staticmethod
     def _cache_compact_duplicates():
         stats = tag_cache_manager.compact_duplicates()
-        tag_cache_manager.reset_index()
+        if stats.get("error"):
+            return f"重复整理失败: {stats['error']}", tag_cache_manager.get_status()
+        backup_note = f"，备份: {stats.get('backup_path')}" if stats.get("backup_path") else ""
         return (
             f"重复整理完成: 重建 {stats['updated']} 条，"
-            f"删除重复 {stats['removed']} 条，总计 {stats['total']} 条"
+            f"删除重复 {stats['removed']} 条，总计 {stats['total']} 条{backup_note}"
         ), tag_cache_manager.get_status()
 
     @staticmethod
     def _cache_compact_similar(threshold, keep_per_group):
         stats = tag_cache_manager.compact_similar(threshold, keep_per_group)
-        tag_cache_manager.reset_index()
         if stats.get("error"):
             return f"相似整理失败: {stats['error']}", tag_cache_manager.get_status()
+        backup_note = f"，备份: {stats.get('backup_path')}" if stats.get("backup_path") else ""
         return (
             f"相似整理完成: 阈值 {stats['threshold']:.2f}，每组保留 {stats['keep_per_group']} 条，"
             f"检查 {stats['checked']} 条，删除完全一致 {stats['exact_removed']} 条，"
-            f"删除相似 {stats['similar_removed']} 条，总计 {stats['total']} 条"
+            f"删除相似 {stats['similar_removed']} 条，总计 {stats['total']} 条{backup_note}"
         ), tag_cache_manager.get_status()
 
     @staticmethod
@@ -1724,41 +1751,51 @@ class Script(scripts.Script):
         return f"{current_prompt},{tags}" if current_prompt else tags
 
     @staticmethod
-    def _cache_fill_by_id(tag_id):
-        """根据ID填充标签"""
-        cache_id = Script._parse_cache_id(tag_id)
-        if cache_id is None:
-            return "", "请输入有效的缓存 ID"
-        tags = tag_cache_manager.get_by_id(cache_id)
+    def _cache_fill_by_position(position):
+        """根据真实缓存序号填充标签"""
+        cache_position = Script._parse_cache_id(position)
+        if cache_position is None:
+            return "", "请输入有效的缓存序号"
+        tags = tag_cache_manager.get_by_position(cache_position)
         if tags:
-            return tags, f"已取出 ID {cache_id}"
-        return "", f"未找到 ID {cache_id}"
+            return tags, f"已取出第 {cache_position} 条"
+        return "", f"未找到第 {cache_position} 条"
 
     @staticmethod
-    def _cache_fill_id_to_tag_prompt(tag_id, tag_prompt_text, write_mode):
-        """Fill Tag Prompt with a cached tag row by ID."""
-        tags, msg = Script._cache_fill_by_id(tag_id)
+    def _cache_fill_position_to_tag_prompt(position, tag_prompt_text, write_mode):
+        """Fill Tag Prompt with a cached tag row by visible cache position."""
+        tags, msg = Script._cache_fill_by_position(position)
         if not tags:
             return "", msg, tag_prompt_text
         return tags, msg, Script._apply_write_mode(tag_prompt_text, tags, write_mode)
 
     @staticmethod
-    def _cache_delete_by_id(tag_id):
-        """根据ID删除标签"""
-        cache_id = Script._parse_cache_id(tag_id)
-        if cache_id is None:
-            return "请输入有效的缓存 ID", tag_cache_manager.get_status()
-        success = tag_cache_manager.delete_by_id(cache_id)
+    def _cache_jump_to_position(position):
+        """Move the sequential cache cursor so the next read starts at a 1-based position."""
+        result = tag_cache_manager.jump_to_position(position)
+        if result.get("ok"):
+            return (
+                f"已跳转到第 {result['position']} / {result['total']} 条；下一次顺序取出会从这里开始",
+                Script._cache_refresh_status(),
+            )
+        return result.get("message", "跳转失败"), Script._cache_refresh_status()
+
+    @staticmethod
+    def _cache_delete_by_position(position):
+        """根据真实缓存序号删除标签"""
+        cache_position = Script._parse_cache_id(position)
+        if cache_position is None:
+            return "请输入有效的缓存序号", tag_cache_manager.get_status()
+        success = tag_cache_manager.delete_by_position(cache_position)
         if success:
-            return f"已删除 ID {cache_id}", tag_cache_manager.get_status()
-        return "删除失败", tag_cache_manager.get_status()
+            return f"已删除第 {cache_position} 条", tag_cache_manager.get_status()
+        return f"删除失败：未找到第 {cache_position} 条", tag_cache_manager.get_status()
 
     @staticmethod
     def _cache_delete_by_tags(tags):
         if not str(tags or "").strip():
             return "请输入要删除的 tag，例如 comic,text,speech_bubble", tag_cache_manager.get_status()
         count = tag_cache_manager.delete_by_any_tags(tags)
-        tag_cache_manager.reset_index()
         return f"已删除包含指定 tag 的 {count} 条缓存", tag_cache_manager.get_status()
 
     @staticmethod
@@ -1769,6 +1806,79 @@ class Script(scripts.Script):
         if using_pool:
             status_msg += " [当前使用筛选池]"
         return status_msg
+
+    @staticmethod
+    def _format_cache_preview(record):
+        if not record:
+            return "缓存为空或没有下一条"
+        tags = str(record.get("tags_prompt") or "")
+        tag_preview = tags[:220] + ("..." if len(tags) > 220 else "")
+        meta = []
+        if record.get("booru"):
+            meta.append(str(record["booru"]))
+        if record.get("post_id"):
+            meta.append(f"post {record['post_id']}")
+        meta.append(f"score {record.get('score', 0)}")
+        if record.get("rating"):
+            meta.append(f"rating {record['rating']}")
+        return f"第 {record['position']} 条 | {' | '.join(meta)}\n{tag_preview}"
+
+    @staticmethod
+    def _format_delete_preview(result):
+        if not result.get("ok"):
+            return result.get("message", "预览失败")
+        lines = [
+            f"{result.get('title', '删除预览')}: 将删除 {result.get('count', 0)} 条"
+        ]
+        requested = result.get("requested")
+        if requested is not None and requested != result.get("count"):
+            lines[0] += f"（请求 {requested} 个序号，忽略不存在/重复项）"
+        if not result.get("sample"):
+            lines.append("没有命中记录，当前缓存不会被改变。")
+            return "\n".join(lines)
+        lines.append("样本：")
+        for record in result.get("sample", []):
+            tags = str(record.get("tags_prompt") or "")
+            tag_preview = tags[:140] + ("..." if len(tags) > 140 else "")
+            meta = []
+            if record.get("booru"):
+                meta.append(str(record["booru"]))
+            if record.get("post_id"):
+                meta.append(f"post {record['post_id']}")
+            if record.get("score") not in (None, ""):
+                meta.append(f"score {record.get('score', 0)}")
+            prefix = f"第 {record.get('position', '?')} 条"
+            if meta:
+                prefix += f" | {' | '.join(meta)}"
+            lines.append(f"{prefix}\n{tag_preview}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _cache_preview_next():
+        return Script._format_cache_preview(tag_cache_manager.get_next_preview())
+
+    @staticmethod
+    def _cache_preview_delete_all():
+        return Script._format_delete_preview(tag_cache_manager.preview_delete_all())
+
+    @staticmethod
+    def _cache_preview_delete_by_position(position):
+        cache_position = Script._parse_cache_id(position)
+        if cache_position is None:
+            return "请输入有效的缓存序号"
+        return Script._format_delete_preview(tag_cache_manager.preview_delete_by_positions(str(cache_position)))
+
+    @staticmethod
+    def _cache_preview_delete_by_position_range(position_spec):
+        if not str(position_spec or "").strip():
+            return "请输入要预览删除的缓存序号或范围，例如 100-140, 150"
+        return Script._format_delete_preview(tag_cache_manager.preview_delete_by_positions(position_spec))
+
+    @staticmethod
+    def _cache_preview_delete_by_tags(tags):
+        if not str(tags or "").strip():
+            return "请输入要预览删除的 tag，例如 comic,text,speech_bubble"
+        return Script._format_delete_preview(tag_cache_manager.preview_delete_by_any_tags(tags))
 
     @staticmethod
     def _cache_get_next_and_set(loop_mode, tag_prompt_text, current_prompt, write_mode):
@@ -1782,6 +1892,20 @@ class Script(scripts.Script):
         tag_payload = Script._combine_prompt(tag_prompt_text, tags)
         combined = Script._apply_write_mode(current_prompt, tag_payload, write_mode)
         return tags, tag_cache_manager.get_status(), combined
+
+    @staticmethod
+    def _cache_jump_take(position, loop_mode):
+        result = tag_cache_manager.jump_to_position(position)
+        if not result.get("ok"):
+            return result.get("message", "跳转失败"), Script._cache_refresh_status()
+        return Script._cache_get_next(loop_mode)
+
+    @staticmethod
+    def _cache_jump_take_and_set(position, loop_mode, tag_prompt_text, current_prompt, write_mode):
+        result = tag_cache_manager.jump_to_position(position)
+        if not result.get("ok"):
+            return result.get("message", "跳转失败"), Script._cache_refresh_status(), current_prompt
+        return Script._cache_get_next_and_set(loop_mode, tag_prompt_text, current_prompt, write_mode)
 
     @staticmethod
     def _filter_tags(query, must_include, must_exclude, sort_order, preview_limit):
@@ -1802,17 +1926,82 @@ class Script(scripts.Script):
         """创建筛选池"""
         try:
             if not selected_ids_str or not selected_ids_str.strip():
-                return "请输入要添加的 ID（逗号分隔）", tag_cache_manager.get_filtered_pool_status()
+                return "请输入要添加的缓存序号（逗号分隔）", tag_cache_manager.get_filtered_pool_status()
             
             id_list = list(dict.fromkeys(int(x) for x in re.findall(r"\d+", selected_ids_str)))
             if not id_list:
-                return "未找到有效的 ID", tag_cache_manager.get_filtered_pool_status()
+                return "未找到有效的缓存序号", tag_cache_manager.get_filtered_pool_status()
             
-            count = tag_cache_manager.create_filtered_pool(id_list)
+            count = tag_cache_manager.create_filtered_pool_by_positions(id_list)
             return f"✅ 筛选池已创建，包含 {count} 条标签", tag_cache_manager.get_filtered_pool_status()
         except Exception as e:
             print(f"[FilterPool] Error: {e}")
             return f"创建失败: {e}", tag_cache_manager.get_filtered_pool_status()
+
+    @staticmethod
+    def _cache_delete_by_position_range(position_spec):
+        if not str(position_spec or "").strip():
+            return "请输入要删除的缓存序号或范围，例如 100-140, 150", tag_cache_manager.get_status()
+        deleted, requested = tag_cache_manager.delete_by_position_spec(position_spec)
+        return f"已请求 {requested} 个序号，删除 {deleted} 条缓存", tag_cache_manager.get_status()
+
+    @staticmethod
+    def _create_filtered_pool_by_range(position_spec):
+        if not str(position_spec or "").strip():
+            return "请输入要加入筛选池的缓存序号或范围，例如 110-180, 205", tag_cache_manager.get_filtered_pool_status()
+        count, requested = tag_cache_manager.create_filtered_pool_by_position_spec(position_spec)
+        return f"已请求 {requested} 个序号，筛选池包含 {count} 条", tag_cache_manager.get_filtered_pool_status()
+
+    @staticmethod
+    def _cache_export(file_format):
+        try:
+            result = tag_cache_manager.export_records(file_format)
+            return f"已导出 {result['count']} 条 {result['format'].upper()}：{result['path']}"
+        except Exception as e:
+            return f"导出失败: {e}"
+
+    @staticmethod
+    def _cache_import(file_path, append_mode, dedupe):
+        result = tag_cache_manager.import_records(file_path, append=append_mode, dedupe=dedupe)
+        if not result.get("ok"):
+            return result.get("message", "导入失败"), tag_cache_manager.get_status()
+        backup_note = f"，覆盖前备份: {result.get('backup_path')}" if result.get("backup_path") else ""
+        return (
+            f"导入完成: 写入 {result['inserted']} 条，重复跳过 {result['skipped_duplicate']} 条，总计 {result['total']} 条{backup_note}",
+            tag_cache_manager.get_status(),
+        )
+
+    @staticmethod
+    def _format_import_preview(result):
+        if not result.get("ok"):
+            return result.get("message", "导入预检失败")
+        mode = "追加" if result.get("append") else "覆盖"
+        lines = [
+            f"导入预检 ({mode}): 文件记录 {result.get('source_count', 0)} 条，预计写入 {result.get('inserted', 0)} 条",
+            f"空记录跳过 {result.get('skipped_empty', 0)} 条，重复跳过 {result.get('skipped_duplicate', 0)} 条",
+            f"当前总数 {result.get('current_total', 0)} 条，导入后预计 {result.get('estimated_total', 0)} 条",
+        ]
+        if result.get("path"):
+            lines.append(f"文件: {result['path']}")
+        if result.get("sample"):
+            lines.append("可写入样本：")
+            for index, record in enumerate(result["sample"], start=1):
+                tags = str(record.get("tags_prompt") or "")
+                tag_preview = tags[:140] + ("..." if len(tags) > 140 else "")
+                meta = []
+                if record.get("booru"):
+                    meta.append(str(record["booru"]))
+                if record.get("post_id"):
+                    meta.append(f"post {record['post_id']}")
+                prefix = f"{index}."
+                if meta:
+                    prefix += f" {' | '.join(meta)}"
+                lines.append(f"{prefix} {tag_preview}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _cache_import_preflight(file_path, append_mode, dedupe):
+        return Script._format_import_preview(tag_cache_manager.preview_import_records(file_path, append=append_mode, dedupe=dedupe))
 
     @staticmethod
     def _create_filtered_pool_from_filter(rule_name, query, must_include, must_exclude, sort_order, limit_count):
@@ -1868,10 +2057,15 @@ class Script(scripts.Script):
             if not any(str(value or "").strip() for value in (query, must_include, must_exclude)):
                 return "请先输入搜索语法、包含或排除条件，避免误删全部缓存", tag_cache_manager.get_status()
             count = tag_cache_manager.delete_by_filter(must_include, must_exclude, query)
-            tag_cache_manager.reset_index()
             return f"已删除当前筛选命中的 {count} 条缓存", tag_cache_manager.get_status()
         except Exception as e:
             return f"删除失败: {e}", tag_cache_manager.get_status()
+
+    @staticmethod
+    def _preview_filter_matches(query, must_include, must_exclude):
+        if not any(str(value or "").strip() for value in (query, must_include, must_exclude)):
+            return "请先输入搜索语法、包含或排除条件，避免预览全部缓存"
+        return Script._format_delete_preview(tag_cache_manager.preview_delete_by_filter(must_include, must_exclude, query))
 
     @staticmethod
     def _switch_to_filtered_pool(use_pool):
@@ -2040,9 +2234,18 @@ class Script(scripts.Script):
                                     value="追加到后面"
                                 )
                             with gr.Row():
-                                cache_lookup_id = gr.Textbox(label="按缓存 ID 取 Tag", placeholder="例如: 544", lines=1)
-                                cache_lookup_id_btn = gr.Button("按 ID 取出")
-                                cache_lookup_id_set_btn = gr.Button("按 ID 写入 Tag Prompt")
+                                cache_lookup_id = gr.Textbox(label="按缓存序号取 Tag", placeholder="例如: 110", lines=1)
+                                cache_lookup_id_btn = gr.Button("按序号取出")
+                                cache_lookup_id_set_btn = gr.Button("按序号写入 Tag Prompt")
+                            with gr.Row():
+                                cache_jump_position = gr.Number(label="跳转到第几条", minimum=1, step=1, precision=0)
+                                cache_jump_position_btn = gr.Button("跳转到该条")
+                                cache_jump_take_btn = gr.Button("跳转并取出")
+                                cache_jump_take_set_btn = gr.Button("跳转并写入 Tag Prompt", variant="primary")
+                            cache_jump_result = gr.Textbox(label="跳转结果", interactive=False, lines=1)
+                            with gr.Row():
+                                cache_preview_next_btn = gr.Button("预览下一条")
+                            cache_preview_output = gr.Textbox(label="下一条预览", interactive=False, lines=3)
                             cache_next_output = gr.Textbox(label="当前取出的 Tag", interactive=False, lines=3)
                             
                             gr.Markdown("#### ⚙️ 生成设置")
@@ -2057,17 +2260,21 @@ class Script(scripts.Script):
                                 cache_search_keyword = gr.Textbox(label="搜索语法", placeholder="例如: +1girl +blue_eyes -2girls -text", lines=1)
                                 cache_search_btn = gr.Button("🔍 搜索")
                             cache_search_results = gr.Dataframe(
-                                headers=["ID", "Booru", "Post ID", "Score", "Rating", "Tags"],
+                                headers=["序号", "Booru", "Post ID", "Score", "Rating", "Tags"],
                                 label="搜索结果",
                                 interactive=False,
                                 wrap=True
                             )
                             with gr.Row():
-                                cache_select_id = gr.Number(label="选择ID", minimum=1, step=1, precision=0)
+                                cache_select_id = gr.Number(label="选择序号", minimum=1, step=1, precision=0)
                                 cache_fill_btn = gr.Button("📝 填充到输出")
+                                cache_preview_delete_id_btn = gr.Button("预览此条")
                                 cache_delete_id_btn = gr.Button("🗑️ 删除此条", variant="stop")
                             with gr.Row():
                                 cache_reset_btn = gr.Button("🔁 重置索引")
+                                cache_backup_btn = gr.Button("备份缓存")
+                                cache_restore_deleted_btn = gr.Button("撤销上一次删除")
+                                cache_preview_delete_all_btn = gr.Button("预览全部删除")
                                 cache_delete_btn = gr.Button("🗑️ 删除全部缓存", variant="stop")
                                 cache_compact_btn = gr.Button("手动清除完全一致 Tag", variant="secondary")
                             with gr.Row():
@@ -2076,7 +2283,17 @@ class Script(scripts.Script):
                                     placeholder="例如: comic,text,speech_bubble,english_text",
                                     lines=1,
                                 )
+                                cache_preview_delete_tags_btn = gr.Button("预览删除这些 Tag")
                                 cache_delete_tags_btn = gr.Button("删除包含这些 Tag", variant="stop")
+                            with gr.Row():
+                                cache_delete_range = gr.Textbox(
+                                    label="按序号/范围删除缓存",
+                                    placeholder="例如: 100-140, 150, 166",
+                                    lines=1,
+                                )
+                                cache_preview_delete_range_btn = gr.Button("预览删除这些序号")
+                                cache_delete_range_btn = gr.Button("删除这些序号", variant="stop")
+                            cache_delete_preview = gr.Textbox(label="删除预览", interactive=False, lines=8)
                             with gr.Row():
                                 cache_similar_threshold = gr.Number(
                                     label="相似去重阈值",
@@ -2094,6 +2311,20 @@ class Script(scripts.Script):
                                     precision=0,
                                 )
                                 cache_compact_similar_btn = gr.Button("清除相似 Tag (>=90%)", variant="secondary")
+                            with gr.Row():
+                                cache_export_format = gr.Dropdown(["json", "csv"], label="导出格式", value="json")
+                                cache_export_btn = gr.Button("导出缓存")
+                            with gr.Row():
+                                cache_import_path = gr.Textbox(
+                                    label="导入文件路径",
+                                    placeholder="例如: E:\\path\\tag_cache_export.json",
+                                    lines=1,
+                                )
+                                cache_import_append = gr.Checkbox(label="导入时追加", value=True)
+                                cache_import_dedupe = gr.Checkbox(label="导入时去重", value=True)
+                                cache_import_preflight_btn = gr.Button("预检导入")
+                                cache_import_btn = gr.Button("导入缓存", variant="primary")
+                            cache_import_export_result = gr.Textbox(label="导入/导出结果", interactive=False, lines=8)
                             cache_manage_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
 
                         # ─── 标签筛选池面板 ────────────────────────────────
@@ -2132,7 +2363,7 @@ class Script(scripts.Script):
                             filter_result_msg = gr.Textbox(label="筛选结果", interactive=False, lines=1)
                             
                             filter_results = gr.Dataframe(
-                                headers=["ID", "Booru", "Post ID", "Score", "Rating", "Tags"],
+                                headers=["序号", "Booru", "Post ID", "Score", "Rating", "Tags"],
                                 label="筛选预览",
                                 interactive=False,
                                 wrap=True
@@ -2142,12 +2373,20 @@ class Script(scripts.Script):
                             
                             with gr.Row():
                                 filter_selected_ids = gr.Textbox(
-                                    label="手动 ID（可选，逗号分隔）",
+                                    label="手动缓存序号（可选，逗号分隔）",
                                     placeholder="例如: 1,5,10,23",
                                     lines=1
                                 )
-                                filter_create_pool_btn = gr.Button("✅ 用手动 ID 创建筛选池")
+                                filter_create_pool_btn = gr.Button("✅ 用手动序号创建筛选池")
+                                filter_preview_delete_matches_btn = gr.Button("预览删除当前筛选")
                                 filter_delete_matches_btn = gr.Button("🗑️ 删除当前筛选命中", variant="stop")
+                            with gr.Row():
+                                filter_range_positions = gr.Textbox(
+                                    label="按序号/范围创建筛选池",
+                                    placeholder="例如: 110-180, 205",
+                                    lines=1,
+                                )
+                                filter_create_range_pool_btn = gr.Button("✅ 用范围创建筛选池")
                             
                             with gr.Row():
                                 filter_pool_status = gr.Textbox(
@@ -2238,21 +2477,57 @@ class Script(scripts.Script):
         )
 
         cache_lookup_id_btn.click(
-            fn=self._cache_fill_by_id,
+            fn=self._cache_fill_by_position,
             inputs=[cache_lookup_id],
             outputs=[cache_next_output, cache_status_display]
         )
 
         cache_lookup_id_set_btn.click(
-            fn=self._cache_fill_id_to_tag_prompt,
+            fn=self._cache_fill_position_to_tag_prompt,
             inputs=[cache_lookup_id, tag_prompt_input, cache_prompt_write_mode],
             outputs=[cache_next_output, cache_status_display, tag_prompt_input]
+        )
+
+        cache_jump_position_btn.click(
+            fn=self._cache_jump_to_position,
+            inputs=[cache_jump_position],
+            outputs=[cache_jump_result, cache_status_display]
+        )
+
+        cache_jump_take_btn.click(
+            fn=self._cache_jump_take,
+            inputs=[cache_jump_position, cache_loop_mode],
+            outputs=[cache_next_output, cache_status_display]
+        )
+
+        cache_preview_next_btn.click(
+            fn=self._cache_preview_next,
+            inputs=[],
+            outputs=[cache_preview_output]
         )
 
         cache_reset_btn.click(
             fn=self._cache_reset_index,
             inputs=[],
             outputs=[cache_manage_result, cache_status_display]
+        )
+
+        cache_backup_btn.click(
+            fn=self._cache_backup,
+            inputs=[],
+            outputs=[cache_import_export_result]
+        )
+
+        cache_restore_deleted_btn.click(
+            fn=self._cache_restore_last_deleted,
+            inputs=[cache_import_dedupe],
+            outputs=[cache_manage_result, cache_status_display]
+        )
+
+        cache_preview_delete_all_btn.click(
+            fn=self._cache_preview_delete_all,
+            inputs=[],
+            outputs=[cache_delete_preview]
         )
 
         cache_delete_btn.click(
@@ -2273,10 +2548,46 @@ class Script(scripts.Script):
             outputs=[cache_manage_result, cache_status_display]
         )
 
+        cache_preview_delete_tags_btn.click(
+            fn=self._cache_preview_delete_by_tags,
+            inputs=[cache_delete_tags],
+            outputs=[cache_delete_preview]
+        )
+
+        cache_preview_delete_range_btn.click(
+            fn=self._cache_preview_delete_by_position_range,
+            inputs=[cache_delete_range],
+            outputs=[cache_delete_preview]
+        )
+
+        cache_delete_range_btn.click(
+            fn=self._cache_delete_by_position_range,
+            inputs=[cache_delete_range],
+            outputs=[cache_manage_result, cache_status_display]
+        )
+
         cache_compact_similar_btn.click(
             fn=self._cache_compact_similar,
             inputs=[cache_similar_threshold, cache_similar_keep],
             outputs=[cache_manage_result, cache_status_display]
+        )
+
+        cache_export_btn.click(
+            fn=self._cache_export,
+            inputs=[cache_export_format],
+            outputs=[cache_import_export_result]
+        )
+
+        cache_import_preflight_btn.click(
+            fn=self._cache_import_preflight,
+            inputs=[cache_import_path, cache_import_append, cache_import_dedupe],
+            outputs=[cache_import_export_result]
+        )
+
+        cache_import_btn.click(
+            fn=self._cache_import,
+            inputs=[cache_import_path, cache_import_append, cache_import_dedupe],
+            outputs=[cache_import_export_result, cache_status_display]
         )
 
         cache_search_btn.click(
@@ -2286,15 +2597,21 @@ class Script(scripts.Script):
         )
 
         cache_fill_btn.click(
-            fn=self._cache_fill_by_id,
+            fn=self._cache_fill_by_position,
             inputs=[cache_select_id],
             outputs=[cache_next_output, cache_manage_result]
         )
 
         cache_delete_id_btn.click(
-            fn=self._cache_delete_by_id,
+            fn=self._cache_delete_by_position,
             inputs=[cache_select_id],
             outputs=[cache_manage_result, cache_status_display]
+        )
+
+        cache_preview_delete_id_btn.click(
+            fn=self._cache_preview_delete_by_position,
+            inputs=[cache_select_id],
+            outputs=[cache_delete_preview]
         )
 
         # ─── 筛选池事件绑定 ───────────────────────────────────────────
@@ -2322,6 +2639,12 @@ class Script(scripts.Script):
             outputs=[filter_pool_result, filter_pool_status]
         )
 
+        filter_create_range_pool_btn.click(
+            fn=self._create_filtered_pool_by_range,
+            inputs=[filter_range_positions],
+            outputs=[filter_pool_result, filter_pool_status]
+        )
+
         filter_switch_btn.click(
             fn=self._switch_to_filtered_pool,
             inputs=[filter_use_pool],
@@ -2344,6 +2667,12 @@ class Script(scripts.Script):
             fn=self._delete_filter_matches,
             inputs=[filter_query, filter_must_include, filter_must_exclude],
             outputs=[filter_pool_result, cache_status_display]
+        )
+
+        filter_preview_delete_matches_btn.click(
+            fn=self._preview_filter_matches,
+            inputs=[filter_query, filter_must_include, filter_must_exclude],
+            outputs=[cache_delete_preview]
         )
 
         filter_list_rules_btn.click(
@@ -2382,6 +2711,12 @@ class Script(scripts.Script):
                 inputs=[cache_loop_mode, tag_prompt_input, target_prompt_box, cache_prompt_write_mode],
                 outputs=[cache_next_output, cache_status_display, target_prompt_box]
             )
+
+            cache_jump_take_set_btn.click(
+                fn=self._cache_jump_take_and_set,
+                inputs=[cache_jump_position, cache_loop_mode, tag_prompt_input, target_prompt_box, cache_prompt_write_mode],
+                outputs=[cache_next_output, cache_status_display, target_prompt_box]
+            )
         else:
             generate_prompt_btn.click(
                 fn=self.generate_prompts_only,
@@ -2393,6 +2728,12 @@ class Script(scripts.Script):
             cache_next_set_btn.click(
                 fn=self._cache_get_next,
                 inputs=[cache_loop_mode],
+                outputs=[cache_next_output, cache_status_display]
+            )
+
+            cache_jump_take_set_btn.click(
+                fn=self._cache_jump_take,
+                inputs=[cache_jump_position, cache_loop_mode],
                 outputs=[cache_next_output, cache_status_display]
             )
 
