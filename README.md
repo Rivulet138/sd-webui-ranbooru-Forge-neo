@@ -1,23 +1,28 @@
 # Ranbooru Forge Neo
 
-Ranbooru Forge Neo 是一个面向 Stable Diffusion WebUI / Forge 的 Booru 标签扩展。它可以从多个 Booru 站点抓取图片标签，清理后写入 Prompt；也可以把标签批量保存到本地 SQLite 缓存，再按真实缓存序号顺序读取、跳转、筛选、导入导出和安全删除。
+面向 Stable Diffusion WebUI Forge / Forge Neo 的 Booru Prompt 与本地缓存扩展。
+
+它可以从多个 Booru 站点抓取图片标签、清理并写入 Prompt，也可以把结果保存到本地 SQLite 数据库，按可见序号筛选、批量管理和离线生成。缓存中的整条 Tag Prompt 还能提前通过 Ollama 或 OpenAI 兼容 LLM 转换为适合 Krea 2 的自然语言描述。
+
+![Ranbooru](pics/logo.png)
 
 ![Ranbooru 面板](pics/ranbooru.png)
 
-## 主要能力
+## 功能概览
 
-- 从 Safebooru、Danbooru、Gelbooru、Rule34、AIBooru、e621 等站点抓取标签。
-- 支持按搜索 tag、Post ID、评分、分级、标签分类和排序方式取图。
-- 支持坏 tag 清理、自定义移除、下划线转空格、随机打乱、数量限制。
-- 支持把生成结果追加、前置、替换到 Prompt，或只输出不写入。
-- 支持本地 SQLite 标签缓存，可离线顺序生成。
-- 缓存读取、跳转、搜索、删除和筛选池都使用用户可见的真实缓存序号 `1..总数`，不再暴露 SQLite 内部 ID。
-- 支持按序号、序号范围、Tag、搜索筛选批量删除缓存。
-- 删除前可预览，危险操作前自动备份，支持撤销上一次删除。
-- 支持 JSON / CSV 导出导入，并提供导入预检。
-- 支持临时筛选池、可复用规则池、规则排序和规则读取上限。
-- 支持完全一致 tag 去重和高相似度 tag 清理。
-- 保留 Img2Img、ControlNet、DeepBooru、LoRAnado、文件驱动 tag 池等辅助流程。
+- 支持 Safebooru、Danbooru、Gelbooru、Rule34、AIBooru、e621 等多个站点。
+- 按 Tag、Post ID、评分、分级、标签分类和排序方式获取内容。
+- 清理水印、文字、元数据等无用 Tag，并支持自定义排除规则。
+- 将结果追加、前置、替换到 WebUI Prompt，或只输出不写入。
+- 使用 SQLite 建立本地 Tag 缓存，支持离线顺序生成。
+- 按连续的可见序号 `1..总数` 跳转、读取、筛选、删除和批量转换。
+- 支持临时筛选池、可复用规则池、规则排序和读取上限。
+- 支持 JSON / CSV 导入导出、导入预检、自动备份和撤销上一次删除。
+- 支持完全一致去重和高相似度 Tag 清理。
+- 支持把几十或几百条完整缓存 Prompt 批量转换为自然语言。
+- 内置 Krea 2 紧凑自然语言预设。
+- 支持 Ollama、本地 OpenAI 兼容服务和远程 OpenAI 兼容 API。
+- 保留 Img2Img、ControlNet、DeepBooru、LoRAnado、Chaos 和文件驱动 Tag 池。
 
 ## 安装
 
@@ -27,186 +32,127 @@ Ranbooru Forge Neo 是一个面向 Stable Diffusion WebUI / Forge 的 Booru 标�
 git clone -b kemomimi --single-branch https://github.com/Rivulet138/sd-webui-ranbooru-Forge-neo.git sd-webui-ranbooru-reforge
 ```
 
-然后重启 WebUI / Forge。
+然后重启 WebUI。
 
-如果已经安装过旧版本，请进入扩展目录后拉取 `kemomimi` 分支并重启。
+已有安装可在扩展目录更新：
 
 ```bash
-git fetch
+git fetch origin
 git checkout kemomimi
-git pull
+git pull --ff-only origin kemomimi
 ```
 
-## 支持站点
-
-当前 Booru 下拉框包含：
-
-- `safebooru`
-- `rule34`
-- `danbooru`
-- `gelbooru`
-- `konachan`
-- `yande.re`
-- `aibooru`
-- `xbooru`
-- `e621`
-
-Post ID 查询支持 Gelbooru、Rule34、Safebooru、Danbooru、XBooru 和 e621。Konachan、yande.re、AIBooru 当前不支持 Post ID 查询。
-
-Gelbooru 和 Rule34 可以填写 API Key / User ID。部分站点可能限流，遇到 HTTP 429 时请降低频率、等待后重试，或切换站点。
+扩展会检查并安装兼容版本的 `requests-cache>=1.2,<2`。
 
 ## 快速开始
 
-1. 展开 `Ranbooru` 面板。
+1. 打开 txt2img 或 img2img 页面底部的 `Ranbooru` 面板。
 2. 勾选 `Enabled`。
-3. 选择 `Booru`。
-4. 在 `Tags to Search (Pre)` 输入搜索 tag，例如：
+3. 选择 Booru 站点。
+4. 在 `Tags to Search (Pre)` 输入搜索 Tag，例如：
 
    ```text
    kafuu_chino,1girl
    ```
 
-5. 按需要设置分级、排序、Tag Categories、移除规则和 tag 数量限制。
-6. 点击 `生成提示词`。
-7. 根据写入模式把结果追加、前置、替换到 Prompt，或只输出结果。
+5. 按需要设置分级、排序、Tag 分类和清理选项。
+6. 点击生成提示词按钮，或者直接开始 WebUI 图片生成。
+7. 选择 Prompt 写入方式：追加到后面、追加到前面、替换或只输出。
 
-写入模式：
+## 支持站点
 
-- `追加到后面`
-- `追加到前面`
-- `替换`
-- `只输出`
+| 站点 | 普通抓取 | Post ID | Tag 分类 | API 凭据 |
+| --- | --- | --- | --- | --- |
+| Safebooru | 支持 | 支持 | 支持 | 不需要 |
+| Danbooru | 支持 | 支持 | 支持 | 不需要 |
+| AIBooru | 支持 | 不支持 | 支持 | 不需要 |
+| Gelbooru | 支持 | 支持 | — | 可选 API Key / User ID |
+| Rule34 | 支持 | 支持 | — | 可选 API Key / User ID |
+| e621 | 支持 | 支持 | 支持 | 不需要 |
+| XBooru | 支持 | 支持 | — | 不需要 |
+| Konachan | 支持 | 不支持 | — | 不需要 |
+| yande.re | 支持 | 不支持 | — | 不需要 |
 
-## 常用搜索示例
+站点接口可能限流。在线抓取遇到超时、连接错误或 HTTP 429 时，插件会执行有限次数的退避重试。
 
-搜索一个角色：
+## 在线 Prompt 处理
 
-```text
-kafuu_chino +1girl
-```
+常用选项：
 
-排除文字和多人图：
+- `Remove bad tags`：移除水印、翻译、文字、评论气泡和其他内置坏 Tag。
+- `Tags to Remove (Post)`：从最终 Prompt 移除指定 Tag，支持 `*` 通配。
+- `Convert "_" to spaces`：将 `blue_eyes` 转为 `blue eyes`。
+- `Shuffle tags`：随机打乱 Tag 顺序。
+- `Limit tags`：按比例保留 Tag。
+- `Max tags`：限制 Tag 最大数量。
+- `Change Background / Color`：增加或清除背景、颜色相关 Tag。
+- `Chaos / Less Chaos / Negative`：把部分或全部抓取 Tag 移入负面 Prompt。
+- `Use same prompt`：整批图片使用同一条结果。
+- `Use same seed`：整批图片使用同一种子。
 
-```text
-kafuu_chino -text -comic -multiple_girls
-```
-
-指定 Post ID：
-
-```text
-Booru: danbooru
-Post ID: 123456
-```
-
-## Tag 清理
-
-常用清理选项：
-
-- `Remove bad tags`：移除内置坏 tag，例如水印、翻译、文字、评论气泡等。
-- `Tags to Remove (Post)`：从最终 prompt 中移除指定 tag。
-- `Convert "_" to spaces`：把 `blue_eyes` 转成 `blue eyes`。
-- `Shuffle tags`：打乱 tag 顺序。
-- `Limit tags`：保留 tag 比例。
-- `Max tags`：限制最终 tag 数量。
-
-`Tags to Remove (Post)` 只影响最终 prompt，不会把整条 post 排除出缓存。批量缓存时如果想整条跳过，请使用 `缓存排除 Tag（命中任意一个就不入库）`。
-
-## 标签分类
-
-Danbooru、Safebooru、AIBooru、e621 支持按标签分类取 tag。
-
-可选分类：
+Danbooru、Safebooru、AIBooru 和 e621 支持选择 Tag 分类：
 
 - `general`
 - `character`
 - `copyright`
 - `artist`
 - `meta`
-
-推荐新手保留默认的 `general`、`character`、`copyright`。如果不想把画师、元数据写入 prompt，不要勾选 `artist` 和 `meta`。
+- e621 的 `species`
 
 ## 本地 Tag 缓存
 
-本地缓存使用 SQLite，文件位置：
+主数据库位置：
 
 ```text
 user/cache/tag_cache.db
 ```
 
-缓存记录会保存：
+每条记录保存原始 Tag、清理后的 Prompt、站点、Post ID、评分、分级、来源地址、搜索条件和自然语言转换元数据。
 
-- booru
-- post_id
-- tags_raw
-- tags_prompt
-- score
-- rating
-- source_url
-- preview_url
-- search_query
-- duplicate_key
-- created_at
-
-生成时写入 Prompt 使用的是 `tags_prompt`。其他字段用于搜索、排序、去重、筛选和维护。
-
-## 真实缓存序号
-
-界面里的“序号”指当前用户可见的真实缓存顺序，从 `1` 到 `总数` 连续编号。
-
-它不是 SQLite 内部自增 ID。删除、去重或导入之后，SQLite 内部 ID 可能有空洞，但界面序号仍然按当前可见缓存重新排列。
-
-例如状态显示：
-
-```text
-下一条: 110 / 总数: 1832（已读 109）
-```
-
-表示下一次顺序读取会取第 110 条真实缓存。
-
-### 跳转到指定缓存
-
-在 `跳转到第几条` 输入 `110`，可以：
-
-- `跳转到该条`：把读取游标移动到第 110 条。
-- `跳转并取出`：移动后立即取出第 110 条。
-- `跳转并写入 Tag Prompt`：移动后立即写入 WebUI Prompt。
-
-如果当前启用了筛选池或规则池，跳转序号基于当前池；如果没有启用池，跳转序号基于主缓存。
-
-## 批量缓存
+### 批量建立缓存
 
 打开 `Tag 缓存管理`，设置：
 
-- `爬取页数`：要抓取多少页。
-- `从第几页开始缓存`：从用户视角的第几页开始，使用 1 基页码。
-- `追加模式（不覆盖已有缓存）`：开启时保留已有缓存并追加新记录；关闭时覆盖保存。
-- `强制入库去重（完全相同 Tag 必删）`：批量抓取时固定启用。
-- `启用最低分过滤`：只保存 score 达到阈值的 post。
-- `缓存必须全部包含`：这些 tag 必须全部命中。
-- `缓存必须任意包含`：这些 tag 至少命中一个。
-- `缓存排除 Tag（命中任意一个就不入库）`：命中任意一个就整条 post 不入库。
+- 抓取页数和起始页。
+- 追加或覆盖模式。
+- 最低评分。
+- 必须全部包含的 Tag。
+- 至少包含一个的 Tag。
+- 命中任意一个就不入库的排除 Tag。
 
-点击 `开始批量爬取` 后，插件会抓取、清理、过滤并写入本地缓存。
+覆盖模式只有在抓取完整成功后才会替换旧缓存；分页请求或 JSON 解析失败不会拿不完整结果覆盖数据库。
 
-### 推荐角色缓存配置
+### 可见序号
 
-只缓存 Kafuu Chino 的单人或双人图：
+界面中的“序号”是当前活动缓存池中的连续位置，而不是 SQLite 自增 ID。
+
+即使数据库内部 ID 因删除出现空洞，用户仍然按：
 
 ```text
-Tags to Search (Pre): kafuu_chino
-缓存必须全部包含: kafuu_chino
-缓存必须任意包含: 1girl,2girl
-缓存排除 Tag: comic,text,speech_bubble
+1, 2, 3 ... 总数
 ```
 
-说明：
+进行跳转、读取、范围删除和批量转换。
 
-- `1girls` 会规范化为 `1girl`。
-- `2girl` 会规范化为 `2girls`。
-- 搜索框里的正向 tag 会参与入库过滤，避免站点返回偏题结果。
-- 旧版本已经写入的错误缓存不会自动修复，需要删除或筛掉后重新缓存。
+范围语法示例：
 
-## 生成时使用本地缓存
+```text
+1-100,205-240,301
+```
+
+单次位置选择最多 10000 条。超大范围会先按照当前池总数收敛，避免无意义的内存占用。
+
+### 活动缓存池
+
+插件支持三种读取来源：
+
+1. 主缓存。
+2. 临时筛选池。
+3. 保存的规则池。
+
+启用筛选池或规则池后，跳转、顺序读取和范围选择都按当前池解释。批量读取与共享游标推进位于同一个数据库事务中，可以避免并发生成任务重复取得同一段缓存。
+
+### 生成时使用缓存
 
 勾选：
 
@@ -214,348 +160,300 @@ Tags to Search (Pre): kafuu_chino
 生成时使用此缓存
 ```
 
-生成时会从当前缓存来源读取 tag：
+可同时启用循环读取和“优先使用已预转换的自然语言 Prompt”。
 
-- 启用筛选池或规则池时，从当前池读取。
-- 未启用池时，从主缓存读取。
+本地缓存模式只有 Prompt，不保证存在源图片，因此 Img2Img、ControlNet 图片注入和 DeepBooru 图片分析会跳过。需要图片链路时请使用在线 Booru 模式。
 
-`生成时循环读取` 控制读到末尾后是否回到第 1 条。
+## 批量转换为自然语言
 
-插件会尽量避免同一个生成任务重复注入缓存，并跳过 Hires.fix 第二阶段重复注入。
-
-## 缓存管理操作
-
-`缓存管理操作` 面板包含：
-
-- `搜索`：按搜索语法查看缓存。
-- `按序号取出`：从指定真实缓存序号取出 tag。
-- `按序号写入 Tag Prompt`：把指定序号写入 Prompt。
-- `预览下一条`：查看顺序读取的下一条。
-- `跳转到该条` / `跳转并取出` / `跳转并写入 Tag Prompt`。
-- `预览此条` / `删除此条`。
-- `预览全部删除` / `删除全部缓存`。
-- `预览删除这些 Tag` / `删除包含这些 Tag`。
-- `预览删除这些序号` / `删除这些序号`。
-- `手动清除完全一致 Tag`。
-- `清除相似 Tag (>=90%)`。
-- `导出缓存`。
-- `预检导入` / `导入缓存`。
-- `备份缓存`。
-- `撤销上一次删除`。
-
-## 删除前预览
-
-删除前建议先点预览按钮。
-
-预览会显示：
-
-- 将删除多少条。
-- 请求了多少序号。
-- 被忽略的不存在或重复项。
-- 若干样本记录，包括真实序号、booru、post_id、score 和 tag 摘要。
-
-预览不会修改数据库。
-
-## 自动备份和撤销
-
-危险操作前会自动备份数据库：
+位置：
 
 ```text
-user/cache/backups/tag_cache_backup_时间_原因.db
+Tag 缓存管理
+└─ 生成设置
+   └─ 批量预转换缓存为自然语言
 ```
 
-会自动备份的操作：
+该功能会从当前活动缓存池挑选完整记录，把每条记录的整个 `tags_prompt` 一次性转换为自然语言，并保存到独立字段。它不会覆盖原始 Tag，也没有“每条只转换前 N 个 Tag”的逻辑。
 
-- 删除全部缓存。
-- 删除指定序号或序号范围。
-- 按 tag 批量删除。
-- 删除当前筛选命中。
-- 手动清除完全一致 tag。
-- 清除相似 tag。
-- 覆盖导入。
-- 覆盖批量缓存。
+### 支持后端
 
-删除前还会写入撤销快照：
+- `不转换`
+- `Ollama（本地）`
+- `OpenAI 兼容 LLM`
+
+Ollama 默认地址：
 
 ```text
-user/cache/last_deleted.json
+http://127.0.0.1:11434
 ```
 
-点击 `撤销上一次删除` 可以把上一次删除的记录恢复回来。恢复会把记录追加到当前缓存尾部，因此恢复后的真实序号会重新排列。
-
-## 导入和导出
-
-支持导出：
-
-- JSON
-- CSV
-
-默认导出到：
+OpenAI 兼容默认地址：
 
 ```text
-user/cache/tag_cache_export_时间.json
-user/cache/tag_cache_export_时间.csv
+https://api.openai.com/v1
 ```
 
-导入前建议点击 `预检导入`。预检会显示：
-
-- 文件记录数。
-- 预计写入数。
-- 空记录跳过数。
-- 重复跳过数。
-- 当前总数。
-- 导入后预计总数。
-- 可写入样本。
-
-`导入时追加` 开启时保留当前缓存并追加；关闭时覆盖当前缓存，覆盖前会自动备份。
-
-`导入时去重` 开启时跳过重复 tag；关闭时允许重复记录入库。
-
-## 去重和相似清理
-
-完全一致去重基于规范化后的完整 tag 集合，而不是只看 post_id。
-
-下面两条会被视为完全一致：
+本地兼容服务也可以使用：
 
 ```text
-kafuu_chino,2girls,blue_eyes
-blue eyes,kafuu_chino,2girl
+http://127.0.0.1:1234/v1
 ```
 
-规范化会处理：
+填写服务端真实存在的模型名称或模型 ID。
 
-- 大小写。
-- 空格和下划线。
-- 半角逗号、全角逗号、换行。
-- `1girl` / `1girls`、`2girl` / `2girls` 等人数 tag。
+### Krea 2 自然语言预设
 
-`手动清除完全一致 Tag` 会保留高分记录；分数相同时保留更早入库的记录。
+内置的 `Krea 2｜紧凑自然语言（推荐）` 会按以下顺序组织视觉信息：
 
-`清除相似 Tag (>=90%)` 用于清理父图、sibling 变体、高度相似图。默认相似阈值 `0.90`，默认每组最多保留 `2` 条。
+1. 媒介或渲染形式。
+2. 主体数量与身份。
+3. 外观与服装。
+4. 动作与姿势。
+5. 场景和重要物体。
+6. 画面取景与构图。
+7. 时间、天气与光线。
+8. 色彩、材质和一个明确的风格锚点。
 
-## 缓存搜索语法
+预设会保留原 Tag 中明确存在的角色、数量、颜色、关系和镜头信息，不虚构缺失内容；同时删除 `masterpiece`、`best quality`、`beautiful`、`stunning`、`8k`、score/source 等空泛质量词。
 
-缓存搜索、筛选池、规则池和按筛选删除支持：
+### 推荐操作流程
 
-```text
-+必须包含 -必须排除
-```
+1. 输入可见序号或范围，例如 `1-100`。
+2. 点击预览，确认选中记录。
+3. 保持“只转换尚未转换的记录”开启。
+4. 选择后端、模型和 Krea 2 预设。
+5. 根据需要保存 LLM 设置。
+6. 点击批量整条转换并保存。
+7. 生成时保持“优先使用已预转换的自然语言 Prompt”开启。
 
-示例：
+未转换或已经失效的记录会自动回退到原始 Tag。
 
-```text
-+kafuu_chino +1girl -3girls
-+blue_eyes -text -watermark
-```
+### 超时、重试与取消
 
-普通词等同于必须包含。
+- 默认请求超时为 120 秒。
+- 每条记录遇到超时、HTTP 408/425/429/500/502/503/504 或典型临时连接错误时自动重试 2 次。
+- 两次重试后仍失败，会跳过当前记录并继续处理下一条。
+- 连续 6 条记录都在重试后仍然超时，任务才会停止。
+- 配置错误、无效响应等永久错误会立即停止任务。
+- 已完成结果每 10 条分批落库，并在错误、取消或生成器关闭时保存剩余结果。
+- 点击取消会取消 Gradio 任务；已经处于阻塞状态的 HTTP 请求仍需等到当前请求返回或超时。
 
-多数输入框支持：
+完全相同的整条 `tags_prompt` 在同一次任务中只请求模型一次，后续相同记录复用结果。
 
-- 空格
-- 英文逗号
-- 中文逗号
-- 换行
+如果转换期间源记录被修改或删除，插件会通过 `ID + 原始 tags_prompt` 乐观检查拒绝写入陈旧结果。
 
-## 筛选池和规则池
+### 自然语言 Prompt 的生成行为
 
-打开 `缓存筛选 / 标签筛选池` 可以创建缓存子集。
+已转换的自然语言 Prompt 被视为完整文本，不会再执行以下 Tag 操作：
 
-常用操作：
+- 按逗号拆分。
+- 随机乱序。
+- 坏 Tag 或自定义 Tag 过滤。
+- 背景、颜色 Tag 改写。
+- Chaos 或 Negative 迁移。
+- Tag 比例和最大数量限制。
 
-- `筛选标签`：预览当前条件命中的缓存。
-- `直接启用当前筛选`：创建临时筛选池，不保存规则。
-- `保存并启用规则池`：保存成可复用规则。
-- `用手动序号创建筛选池`：从指定真实缓存序号创建临时池。
-- `用范围创建筛选池`：例如 `110-180, 205`。
-- `预览删除当前筛选`：预览当前筛选会删除哪些缓存。
-- `删除当前筛选命中`：删除当前条件命中的主缓存记录。
-- `启用规则`：按规则 ID 启用规则池。
-- `删除规则`：删除保存的规则。
+同一批中的原始 Tag 记录仍正常执行这些选项。
 
-规则排序：
+## LLM 设置和 API Key
 
-- `ID`
-- `Newest`
-- `Oldest`
-- `High Score`
-- `Low Score`
-- `Random`
-
-`规则读取上限` 为 `0` 表示不限制。
-
-注意：筛选池和规则池启用后，读取、跳转、预览和按序号删除都以当前池的可见序号为准。
-
-## HTTP 缓存和 Tag 缓存
-
-`Use cache` 是 HTTP 请求缓存，依赖 `requests-cache`，用于减少重复联网请求。
-
-SQLite Tag 缓存由这些功能控制：
-
-- `Tag 缓存管理`
-- `生成时使用此缓存`
-- `缓存管理操作`
-- `缓存筛选 / 标签筛选池`
-
-这两者不是同一个缓存。
-
-## Img2Img / ControlNet / DeepBooru
-
-启用 `Use img2img` 后，插件会下载 Booru 图片作为 img2img 输入图像。
-
-可选功能：
-
-- `Send to Controlnet`：发送到 ControlNet。
-- `Denoising`：重绘幅度。
-- `Use last image as img2img`：复用上一张图。
-- `Crop Center`：居中裁剪。
-- `Use Deepbooru`：使用 WebUI 的 DeepBooru 自动打标。
-- `Deepbooru Tags Position`：控制 DeepBooru 标签添加到前面、后面或替换。
-
-## LoRAnado
-
-LoRAnado 可以从指定 LoRA 文件夹随机选择 LoRA，并按随机或自定义权重写入 prompt。
-
-参数：
-
-- `LoRAs Subfolder`
-- `LoRAs Amount`
-- `Min LoRAs Weight`
-- `Max LoRAs Weight`
-- `LoRAs Custom Weights`
-- `Lock Previous LoRAs`
-
-## 文件驱动 Tag 池
-
-插件会读取：
-
-```text
-user/search/
-user/remove/
-```
-
-用法：
-
-1. 在对应目录创建 `.txt` 文件。
-2. 每行写一组 tag。
-3. 在 `File` 面板勾选 `Use tags_search.txt` 或 `Use tags_remove.txt`。
-4. 选择文件，必要时点击 `Refresh`。
-
-## 凭证
-
-Gelbooru 和 Rule34 可以填写：
-
-- API Key
-- User ID
-
-勾选 `Save credentials` 后会保存到：
+点击 `保存 LLM 设置（含 API Key）` 会把配置写入：
 
 ```text
 user/credentials/credentials.json
 ```
 
-不要把这个文件上传到公开仓库或发给别人。
+保存内容包括：
 
-## 常见问题
+- 预设。
+- 后端。
+- 端点兼容策略。
+- 服务地址。
+- 模型名称。
+- API Key。
+- 请求超时。
 
-### 为什么数据库 ID 范围很大，但缓存总数没那么多？
+API Key 不会写入缓存数据库，也不会在重新打开界面时回填到浏览器。输入框留空时，插件只会为相同后端和相同端点复用服务端保存的 Key；更换端点不会携带旧 Key。
 
-SQLite 内部 ID 是自增的，删除后不会自动补洞，所以可能出现数据库 ID 范围 `1-2113`，但真实缓存只有 `1832` 条。
+凭据文件采用临时文件替换写入，并在支持的平台上尽量限制为当前用户读写。不要提交或分享 `user/credentials/credentials.json`。
 
-当前界面不再以数据库 ID 作为用户操作依据。跳转、取出、搜索结果、删除范围都按真实缓存序号 `1..总数` 走。
+## 端点兼容策略
 
-### 我有 140 条缓存，怎么回到第 110 条？
+| 策略 | 行为 |
+| --- | --- |
+| `unrestricted` | 默认。兼容系统代理、Fake-IP、本地、LAN 和任意模型地址，不进行 DNS/IP 目标限制。 |
+| `allow_private` | 允许本机、LAN 和 Fake-IP，但仍执行地址校验。 |
+| `default` | 允许本机 Ollama 和公网服务；OpenAI 兼容接口不能访问私网或链路本地地址。 |
+| `public_only` | 只允许公网地址。 |
 
-在 `跳转到第几条` 输入 `110`，点击 `跳转到该条`。如果想马上取出，点击 `跳转并取出`。
+`unrestricted` 是面向个人本地插件环境的兼容性选择。共享或公网 WebUI 应限制此面板访问，或者改用更严格的策略。
 
-### 删除范围怎么写？
+无论选择哪种策略，模型服务地址都不能包含用户名、密码、query 或 fragment，插件也不会跟随 HTTP 重定向。
 
-支持：
+## 缓存管理和数据安全
+
+支持的主要操作：
+
+- 搜索和按序号读取。
+- 跳转并读取或写入 Prompt。
+- 按 ID、范围、筛选结果或任意 Tag 删除。
+- 清理完全一致记录。
+- 按 Jaccard 相似度清理高相似记录。
+- JSON / CSV 导出。
+- JSON / CSV 导入预检和导入。
+- 手动备份。
+- 撤销上一次删除。
+- 清除指定记录的自然语言结果。
+
+危险操作前会使用 SQLite Online Backup 创建一致性快照。覆盖、删除和压缩操作会先取得数据库写锁，再备份修改前状态。
+
+自动备份默认限制：
+
+- 最多 20 份。
+- 最长保留 30 天。
+- 总大小不超过 2 GiB。
+
+数据库事务提交和撤销日志发布会按照数据库真实路径在进程内串行，避免多个 Gradio 事件让撤销记录顺序倒置。
+
+导入限制：
+
+- 仅接受界面文件选择器提供的 `.json` / `.csv`。
+- 单文件最大 64 MiB。
+- 单次最多 100000 条记录。
+- 覆盖导入失败时完整回滚，旧缓存保持不变。
+
+## 其他功能
+
+### Img2Img 与图片处理
+
+- 将选中的 Booru 图片用于 Img2Img。
+- 使用最后一张图片。
+- 居中裁剪。
+- 调整 Denoising。
+- 发送到兼容的 ControlNet API。
+- 使用 DeepBooru 重新分析图片。
+
+数据抓取客户端和图片下载客户端使用独立 Session，并在正常、错误和提前返回路径关闭。
+
+### LoRAnado
+
+- 从指定目录随机选择 LoRA。
+- 设置数量、最小/最大权重和自定义权重。
+- 锁定上一次 LoRA 组合。
+
+### 文件驱动 Tag 池
+
+搜索文件：
 
 ```text
-100-140
-100-140, 150, 166
-140-100
+user/search/tags_search.txt
 ```
 
-建议先点 `预览删除这些序号`，确认样本后再删除。
+移除文件：
 
-### 撤销删除后，为什么序号变了？
+```text
+user/remove/tags_remove.txt
+```
 
-撤销会把上次删除的记录重新追加到缓存尾部。真实缓存序号会按当前顺序重新排列，所以恢复后的记录可能不在原来的序号位置。
+每行可以保存一组逗号分隔的 Tag。
 
-### 如何完全离线生成？
+## 故障排查
 
-先批量抓取到 SQLite Tag 缓存，然后勾选 `生成时使用此缓存`。如果只想使用某个子集，先启用筛选池或规则池。
+### `ModuleNotFoundError: natural_prompt_schema`
 
-### 缓存里混入不想要的 tag 怎么办？
+确认以下文件都存在：
 
-可以按层级处理：
+```text
+scripts/cache_db.py
+scripts/natural_language.py
+scripts/natural_prompt_schema.py
+```
 
-1. 未来缓存：设置 `缓存排除 Tag`，命中就不入库。
-2. 已有缓存：用 `按包含 Tag 删除缓存` 或搜索筛选后删除。
-3. 删除前：先使用预览。
-4. 误删后：使用 `撤销上一次删除` 或从 `user/cache/backups` 找备份。
+然后完整重启 Forge。当前版本已经兼容 Forge 把 `scripts/*.py` 作为独立模块加载的方式。
 
-### Gelbooru 抓不到或报 429？
+### 某条转换超时
 
-Gelbooru 可能限流。可以降低抓取页数，等待后重试，填写 API 凭证，或切换到 Safebooru / Danbooru / AIBooru。
+插件会自动重试 2 次并跳过该条。重新运行相同范围且保持“只转换尚未转换的记录”开启，即可继续处理剩余记录。
 
-### 旧缓存有大量重复或相似记录？
+### 点击取消后没有立即结束
 
-先点 `手动清除完全一致 Tag`。如果是父图、sibling 变体或高度相似图，再用 `清除相似 Tag (>=90%)`。
+取消会在请求边界生效。已经发出的 HTTP 请求不能由普通同步 Requests 调用强制中断，需要等当前请求返回或达到超时。
 
-## 目录结构
+### 生成时没有使用自然语言结果
+
+检查：
+
+1. “优先使用已预转换的自然语言 Prompt”是否开启。
+2. 该记录是否已经转换。
+3. 转换后原始 `tags_prompt` 是否被修改。源 Prompt 改变后旧转换会自动失效。
+
+### API Key 没有显示在输入框
+
+这是预期行为。保存的 Key 只在服务端为相同后端和端点复用，不会发送回浏览器。
+
+### 缓存序号和数据库 ID 不一致
+
+这是正常现象。界面操作使用当前活动池的连续可见序号；数据库 ID 只作为内部稳定标识。
+
+## 项目结构
 
 ```text
 sd-webui-ranbooru-reforge/
+├─ install.py
+├─ README.md
 ├─ scripts/
 │  ├─ ranbooru.py
-│  └─ cache_db.py
-├─ user/
-│  ├─ search/
-│  ├─ remove/
-│  ├─ credentials/
-│  └─ cache/
-│     ├─ tag_cache.db
-│     ├─ last_deleted.json
-│     └─ backups/
+│  ├─ cache_db.py
+│  ├─ natural_language.py
+│  └─ natural_prompt_schema.py
+├─ tests/
+│  ├─ test_cache_natural_prompts.py
+│  ├─ test_forge_standalone_loading.py
+│  ├─ test_natural_language.py
+│  └─ test_ranbooru_contract.py
 ├─ pics/
-├─ README.md
-├─ usage.md
-└─ install.py
+└─ user/
+   ├─ cache/
+   ├─ credentials/
+   ├─ search/
+   └─ remove/
 ```
 
-## 安全建议
+## 开发与验证
 
-- 删除前先预览。
-- 覆盖导入前先预检。
-- 长期使用后定期清理 `user/cache/backups` 中不需要的旧备份。
-- 不要公开 `user/credentials/credentials.json`。
-- 大规模批量抓取时尊重站点 API 限制，避免过快请求。
+在 Forge 虚拟环境中运行：
 
-## 验证记录
+```powershell
+E:\sd-webui-forge-neo\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
+```
 
-当前缓存链路已验证：
+当前版本包含 94 项自动化测试，覆盖：
 
-- `scripts/ranbooru.py` 和 `scripts/cache_db.py` Python 编译检查。
-- Markdown 本地链接和图片路径检查。
-- 临时 SQLite 端到端缓存回归：
-  - 真实缓存序号跳转。
-  - 按序号和范围删除。
-  - 删除预览不写库。
-  - 筛选池按真实序号读取和删除。
-  - 撤销上一次删除。
-  - 自动备份。
-  - 导入预检不写库。
-  - 覆盖导入备份。
-  - 删除全部可撤销。
-  - CSV 导出和导入预检。
-  - `dedupe=False` 允许重复。
-  - 完全一致去重可清理重复。
-- UI 按钮绑定覆盖检查。
-- 后端缓存方法覆盖检查。
+- Forge 独立脚本加载。
+- SQLite 迁移、备份、回滚和撤销顺序。
+- 并发去重、游标领取和多 Manager 破坏性操作串行。
+- 主缓存、临时筛选池和规则池。
+- 几百条完整 Prompt 的选择与更新。
+- Ollama 和 OpenAI 兼容请求。
+- Krea 2 自然语言预设。
+- 超时、429/5xx、连接错误重试和取消。
+- API Key 服务端持久化且不回填浏览器。
+- 自然语言 Prompt 与原始 Tag 管线隔离。
+- Booru Session 异常路径关闭。
+- 导入限制、稳定内部 ID 和 UI 回调契约。
 
-## 免责声明
+## 已知边界
 
-本插件仅用于学习、研究和个人创作辅助。从 Booru 站点获取的内容版权归原作者所有。请遵守各站点服务条款、API 限制和所在地法律法规。
+- 同步 HTTP 请求开始后，取消只能等待当前请求返回或超时。
+- 进程内支持多个 `TagCacheManager` 实例共享同一数据库；不建议多个独立 Forge 进程同时写同一个缓存目录。
+- `unrestricted` 适合个人本地环境，但共享部署应使用访问控制或更严格的端点策略。
+- 本地缓存模式不包含可靠的源图，无法替代在线模式的 Img2Img / ControlNet / DeepBooru 图片链路。
+
+## 致谢
+
+本项目基于原 Ranbooru 扩展继续维护和增强：
+
+- 上游项目：[liming123332/sd-webui-ranbooru-reforge](https://github.com/liming123332/sd-webui-ranbooru-reforge)
+
+请遵守各 Booru 站点的服务条款、内容规则和 API 频率限制。

@@ -4,13 +4,13 @@ import random
 import re
 import requests
 import modules.scripts as scripts
-from modules.scripts import OnComponent
 import gradio as gr
 import os
 from PIL import Image
 import numpy as np
 import importlib
 import json
+import threading
 try:
     import requests_cache
     HAS_REQUESTS_CACHE = True
@@ -108,12 +108,62 @@ try:
 except ImportError:
     import sys
     _ranbooru_scripts_dir = os.path.dirname(os.path.abspath(__file__))
-    if _ranbooru_scripts_dir not in sys.path:
+    _added_ranbooru_scripts_dir = _ranbooru_scripts_dir not in sys.path
+    if _added_ranbooru_scripts_dir:
         sys.path.insert(0, _ranbooru_scripts_dir)
-    from cache_db import TagCacheManager
+    try:
+        from cache_db import TagCacheManager
+    finally:
+        if _added_ranbooru_scripts_dir:
+            sys.path.remove(_ranbooru_scripts_dir)
+
+try:
+    from .natural_language import (
+        BACKEND_CHOICES as NATURAL_LANGUAGE_BACKENDS,
+        BACKEND_OFF as NATURAL_LANGUAGE_OFF,
+        ENDPOINT_POLICY_CHOICES as NATURAL_LANGUAGE_ENDPOINT_POLICIES,
+        ENDPOINT_POLICY_UNRESTRICTED as NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED,
+        CONVERTER_VERSION as NATURAL_LANGUAGE_CONVERTER_VERSION,
+        PRESET_CHOICES as NATURAL_LANGUAGE_PRESETS,
+        PRESET_KREA2,
+        CachedTagNaturalLanguageConverter,
+        NaturalLanguageBatchCancelled,
+        NaturalLanguageConfig,
+        is_retryable_conversion_error,
+        is_timeout_conversion_error,
+        iter_cached_tag_conversions,
+    )
+except ImportError:
+    import sys
+    _ranbooru_scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    _added_ranbooru_scripts_dir = _ranbooru_scripts_dir not in sys.path
+    if _added_ranbooru_scripts_dir:
+        sys.path.insert(0, _ranbooru_scripts_dir)
+    try:
+        from natural_language import (
+            BACKEND_CHOICES as NATURAL_LANGUAGE_BACKENDS,
+            BACKEND_OFF as NATURAL_LANGUAGE_OFF,
+            ENDPOINT_POLICY_CHOICES as NATURAL_LANGUAGE_ENDPOINT_POLICIES,
+            ENDPOINT_POLICY_UNRESTRICTED as NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED,
+            CONVERTER_VERSION as NATURAL_LANGUAGE_CONVERTER_VERSION,
+            PRESET_CHOICES as NATURAL_LANGUAGE_PRESETS,
+            PRESET_KREA2,
+            CachedTagNaturalLanguageConverter,
+            NaturalLanguageBatchCancelled,
+            NaturalLanguageConfig,
+            is_retryable_conversion_error,
+            is_timeout_conversion_error,
+            iter_cached_tag_conversions,
+        )
+    finally:
+        if _added_ranbooru_scripts_dir:
+            sys.path.remove(_ranbooru_scripts_dir)
 
 
 tag_cache_manager = TagCacheManager(user_cache_dir)
+_natural_batch_lock = threading.Lock()
+_natural_batch_cancel = threading.Event()
+_natural_endpoint_policy_choices = list(NATURAL_LANGUAGE_ENDPOINT_POLICIES)
 
 # Initialize credentials manager
 class CredentialsManager:
@@ -121,55 +171,133 @@ class CredentialsManager:
         self.extension_root = extension_root
         self.credentials_dir = os.path.join(extension_root, 'user', 'credentials')
         self.credentials_file = os.path.join(self.credentials_dir, 'credentials.json')
-        
+        self._lock = threading.RLock()
+
         # Create credentials directory if it doesn't exist
         os.makedirs(self.credentials_dir, exist_ok=True)
-        
+
         # Initialize credentials file if it doesn't exist
         if not os.path.exists(self.credentials_file):
             self._save_credentials({})
-    
+
     def _load_credentials(self):
         """Load credentials from the JSON file"""
-        try:
-            with open(self.credentials_file, 'r') as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-    
+        with self._lock:
+            try:
+                with open(self.credentials_file, 'r', encoding='utf-8') as f:
+                    payload = json.load(f)
+                return payload if isinstance(payload, dict) else {}
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                return {}
+
     def _save_credentials(self, credentials):
         """Save credentials to the JSON file"""
-        with open(self.credentials_file, 'w') as f:
-            json.dump(credentials, f, indent=2)
-    
+        with self._lock:
+            temp_file = f"{self.credentials_file}.tmp"
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(credentials, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(temp_file, 0o600)
+            except OSError:
+                pass
+            os.replace(temp_file, self.credentials_file)
+            try:
+                os.chmod(self.credentials_file, 0o600)
+            except OSError:
+                pass
+
     def save_booru_credentials(self, booru_name, api_key, user_id=None):
         """Save API credentials for a specific booru"""
-        credentials = self._load_credentials()
-        
-        if booru_name not in credentials:
-            credentials[booru_name] = {}
-        
-        credentials[booru_name]['api_key'] = api_key
-        if user_id is not None:
-            credentials[booru_name]['user_id'] = user_id
-        
-        self._save_credentials(credentials)
-    
+        with self._lock:
+            credentials = self._load_credentials()
+            if booru_name not in credentials:
+                credentials[booru_name] = {}
+            credentials[booru_name]['api_key'] = api_key
+            if user_id is not None:
+                credentials[booru_name]['user_id'] = user_id
+            self._save_credentials(credentials)
+
     def get_booru_credentials(self, booru_name):
         """Get API credentials for a specific booru"""
         credentials = self._load_credentials()
         return credentials.get(booru_name, {})
-    
+
     def has_credentials(self, booru_name):
         """Check if credentials exist for a specific booru"""
         credentials = self.get_booru_credentials(booru_name)
         return 'api_key' in credentials and credentials['api_key'].strip() != ''
-    
+
     def clear_booru_credentials(self, booru_name):
         """Clear credentials for a specific booru"""
-        credentials = self._load_credentials()
-        if booru_name in credentials:
-            del credentials[booru_name]
+        with self._lock:
+            credentials = self._load_credentials()
+            if booru_name in credentials:
+                del credentials[booru_name]
+                self._save_credentials(credentials)
+
+    def save_natural_language_settings(
+        self,
+        preset,
+        backend,
+        endpoint_policy,
+        endpoint,
+        model,
+        api_key,
+        timeout,
+    ):
+        """Persist the complete LLM conversion configuration, including API Key."""
+        try:
+            timeout_value = min(300.0, max(1.0, float(timeout or 120)))
+        except (TypeError, ValueError):
+            timeout_value = 120.0
+        backend_value = str(backend or NATURAL_LANGUAGE_OFF)
+        endpoint_value = str(endpoint or "").strip()
+        with self._lock:
+            credentials = self._load_credentials()
+            existing = credentials.get("natural_language", {})
+            same_service = (
+                isinstance(existing, dict)
+                and str(existing.get("backend") or NATURAL_LANGUAGE_OFF) == backend_value
+                and str(existing.get("endpoint") or "").strip() == endpoint_value
+            )
+            existing_key = str(existing.get("api_key") or "").strip() if same_service else ""
+            settings = {
+                "preset": str(preset or PRESET_KREA2),
+                "backend": backend_value,
+                "endpoint_policy": str(
+                    endpoint_policy or NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED
+                ),
+                "endpoint": endpoint_value,
+                "model": str(model or "").strip(),
+                "api_key": str(api_key or "").strip() or existing_key,
+                "timeout": timeout_value,
+            }
+            credentials["natural_language"] = settings
+            self._save_credentials(credentials)
+        return settings
+
+    def get_natural_language_settings(self):
+        settings = self._load_credentials().get("natural_language", {})
+        return dict(settings) if isinstance(settings, dict) else {}
+
+    def resolve_natural_language_api_key(self, api_key="", backend="", endpoint=""):
+        entered = str(api_key or "").strip()
+        if entered:
+            return entered
+        saved = self.get_natural_language_settings()
+        if (
+            str(saved.get("backend") or "") != str(backend or "")
+            or str(saved.get("endpoint") or "").strip() != str(endpoint or "").strip()
+        ):
+            return ""
+        return str(saved.get("api_key") or "").strip()
+
+    def clear_natural_language_settings(self):
+        with self._lock:
+            credentials = self._load_credentials()
+            credentials.pop("natural_language", None)
             self._save_credentials(credentials)
 
 credentials_manager = CredentialsManager(extension_root)
@@ -185,7 +313,6 @@ COLORED_BG = ['black_background', 'aqua_background', 'white_background', 'colore
 ADD_BG = ['outdoors', 'indoors']
 BW_BG = ['monochrome', 'greyscale', 'grayscale']
 POST_AMOUNT = 100
-COUNT = 100 #Number of images the search returned. Booru classes below were modified to update this value with the latest search result count.
 DEBUG = False
 RATING_TYPES = {
     "none": {
@@ -232,11 +359,27 @@ def show_fringe_benefits(booru):
 
 def check_exception(booru, parameters):
     post_id = parameters.get('post_id')
-    tags = parameters.get('tags')
     if booru == 'konachan' and post_id:
         raise Exception("Konachan does not support post IDs")
     if booru == 'yande.re' and post_id:
         raise Exception("Yande.re does not support post IDs")
+
+
+def _response_posts_or_raise(response, source, keys=("posts", "post")):
+    try:
+        payload = response.json()
+    except Exception as error:
+        raise RuntimeError(f"{source} 返回了无法解析的 JSON") from error
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in keys:
+            if key in payload:
+                posts = payload[key]
+                if isinstance(posts, list):
+                    return posts
+                raise RuntimeError(f"{source} 的 {key} 字段不是列表")
+    raise RuntimeError(f"{source} 返回了不支持的 JSON 结构")
 
 
 class Booru():
@@ -246,6 +389,33 @@ class Booru():
         self.base_url = booru_url
         self.booru_url = booru_url
         self.headers = {'user-agent': 'my-app/0.0.1'}
+        self.session = requests.Session()
+
+    def configure_http_cache(self, enabled=False):
+        """Use a client-local cache without patching process-wide requests."""
+        try:
+            self.session.close()
+        except Exception:
+            pass
+        if enabled and HAS_REQUESTS_CACHE:
+            cache_path = os.path.join(user_cache_dir, "ranbooru_http_cache")
+            self.session = requests_cache.CachedSession(
+                cache_name=cache_path,
+                backend='sqlite',
+                expire_after=3600,
+            )
+        else:
+            self.session = requests.Session()
+        return self
+
+    def close(self):
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    def __del__(self):
+        self.close()
 
     def fetch_with_retry(self, url, max_retries=3, timeout=10, **kwargs):
         """Fetch URL with retry logic for rate limiting and network errors."""
@@ -253,7 +423,7 @@ class Booru():
         safe_url = re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(url))
         for attempt in range(max_retries):
             try:
-                response = requests.get(url, timeout=timeout, **kwargs)
+                response = self.session.get(url, timeout=timeout, **kwargs)
                 if response.status_code == 429:
                     wait = 2 ** attempt
                     print(f"[{self.booru}] Rate limited (429), waiting {wait}s...")
@@ -288,7 +458,6 @@ class Gelbooru(Booru):
         self.user_id = user_id
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         max_pages = _normalize_max_pages(max_pages)
         loop_msg = True
         for _ in range(2):
@@ -300,18 +469,12 @@ class Gelbooru(Booru):
                 url += "&fringeBenefits=1"
             self.booru_url = url
             res = self.fetch_with_retry(url, timeout=10)
-            try:
-                data = res.json()
-            except Exception as e:
-                print(f"[Gelbooru] JSON parse error: {e}")
-                data = []
-            if not isinstance(data, list):
-                data = []
-            COUNT = len(data)
-            if COUNT == 0:
+            data = _response_posts_or_raise(res, "Gelbooru")
+            result_count = len(data)
+            if result_count == 0:
                 max_pages = 2
                 while loop_msg:
-                    print(f" Processing {COUNT} results.")
+                    print(f" Processing {result_count} results.")
                     loop_msg = False
                 continue
             break
@@ -321,7 +484,6 @@ class Gelbooru(Booru):
         return {'post': data}
 
     def get_data_page(self, add_tags, page=0, id=''):
-        global COUNT
         local_add_tags = '' if id else add_tags
         url = f"{self.base_url}&pid={page}{id}{local_add_tags}"
         if self.api_key and self.user_id:
@@ -330,14 +492,7 @@ class Gelbooru(Booru):
             url += "&fringeBenefits=1"
         self.booru_url = url
         res = self.fetch_with_retry(url, timeout=10)
-        try:
-            data = res.json()
-        except Exception as e:
-            print(f"[Gelbooru] JSON parse error (page): {e}")
-            data = []
-        if not isinstance(data, list):
-            data = []
-        COUNT = len(data)
+        data = _response_posts_or_raise(res, "Gelbooru page")
         for post in data:
             if isinstance(post, dict) and 'directory' in post and 'image' in post:
                 post['file_url'] = f"https://img3.gelbooru.com/images/{post['directory']}/{post['image']}"
@@ -353,7 +508,6 @@ class e621(Booru):
         super().__init__('e621', f'https://e621.net/posts.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
-        global COUNT
         max_pages = _normalize_max_pages(max_pages)
         loop_msg = True
         for loop in range(2):
@@ -363,37 +517,33 @@ class e621(Booru):
             url = f"{self.base_url}&page={random_page}{add_tags}"
             self.booru_url = url
             res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
-            data = res.json()
-            posts = data.get('posts', []) if isinstance(data, dict) else []
+            posts = _response_posts_or_raise(res, "e621", keys=("posts",))
             for post in posts:
                 if isinstance(post, dict):
                     post['tags'] = self._filter_tags_by_category(post, tag_categories)
-            COUNT = len(posts)
-            if COUNT == 0:
+            result_count = len(posts)
+            if result_count == 0:
                 max_pages = 2
                 while loop_msg:
-                    print(f" Processing {COUNT} results.")
+                    print(f" Processing {result_count} results.")
                     loop_msg = False
                 continue
             else:
-                print(f"Found enough results")
+                print("Found enough results")
             break
         return {'post': posts}
 
     def get_data_page(self, add_tags, page=0, id='', tag_categories=None):
-        global COUNT
         if id:
             add_tags = ''
         safe_page = max(1, int(page) + 1)
         url = f"{self.base_url}&page={safe_page}{add_tags}"
         self.booru_url = url
         res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
-        data = res.json()
-        posts = data.get('posts', []) if isinstance(data, dict) else []
+        posts = _response_posts_or_raise(res, "e621 page", keys=("posts",))
         for post in posts:
             if isinstance(post, dict):
                 post['tags'] = self._filter_tags_by_category(post, tag_categories)
-        COUNT = len(posts)
         return {'post': posts}
 
     def _filter_tags_by_category(self, post, categories):
@@ -436,7 +586,6 @@ class XBooru(Booru):
         super().__init__('xbooru', f'https://xbooru.com/index.php?page=dapi&s=post&q=index&json=1&limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         max_pages = _normalize_max_pages(max_pages)
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
@@ -446,38 +595,35 @@ class XBooru(Booru):
             self.booru_url = url
             print(re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(url)))
             res = self.fetch_with_retry(url, timeout=10)
-            data = res.json()
-            COUNT = 0
+            data = _response_posts_or_raise(res, "XBooru")
+            result_count = 0
             for post in data:
                 if isinstance(post, dict) and 'directory' in post and 'image' in post:
                     post['file_url'] = f"https://xbooru.com/images/{post['directory']}/{post['image']}"
-                    COUNT += 1
-            if COUNT <= max_pages*POST_AMOUNT:
-                max_pages = COUNT // POST_AMOUNT+1
-                # If max_pages is bigger than available pages, loop the function with updated max_pages based on the value of COUNT
+                    result_count += 1
+            if result_count <= max_pages*POST_AMOUNT:
+                max_pages = result_count // POST_AMOUNT+1
+                # If max_pages is bigger than available pages, loop the function with updated max_pages based on the result count.
                 while loop_msg:
-                    print(f" Processing {COUNT} results.")
+                    print(f" Processing {result_count} results.")
                     loop_msg = False
                     # avoid showing same msg twice
                 continue
             else:
-                print(f" Processing {max_pages*POST_AMOUNT} out of {COUNT} results.")
+                print(f" Processing {max_pages*POST_AMOUNT} out of {result_count} results.")
             break
         return {'post': data}
 
     def get_data_page(self, add_tags, page=0, id=''):
-        global COUNT
         if id:
             add_tags = ''
         url = f"{self.base_url}&pid={page}{id}{add_tags}"
         self.booru_url = url
         res = self.fetch_with_retry(url, timeout=10)
-        data = res.json()
-        COUNT = 0
+        data = _response_posts_or_raise(res, "XBooru page")
         for post in data:
             if isinstance(post, dict) and 'directory' in post and 'image' in post:
                 post['file_url'] = f"https://xbooru.com/images/{post['directory']}/{post['image']}"
-                COUNT += 1
         return {'post': data}
 
     def get_post(self, add_tags, max_pages=10, id=''):
@@ -492,7 +638,6 @@ class Rule34(Booru):
         self.user_id = user_id
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         max_pages = _normalize_max_pages(max_pages)
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
@@ -503,29 +648,22 @@ class Rule34(Booru):
                 url += f"&api_key={self.api_key}&user_id={self.user_id}"
             self.booru_url = url
             res = self.fetch_with_retry(url, timeout=10)
-            try:
-                data = res.json()
-            except Exception as e:
-                print(f"[Rule34] JSON parse error: {e}")
-                data = []
-            if not isinstance(data, list):
-                data = []
-            COUNT = len(data)
-            if COUNT == 0:
+            data = _response_posts_or_raise(res, "Rule34")
+            result_count = len(data)
+            if result_count == 0:
                 max_pages = 2
                 # Rule34 does not have a way to know the amount of results available in the search, so we need to run the function again with a fixed amount of pages
                 while loop_msg:
-                    print(f" Processing {COUNT} results.")
+                    print(f" Processing {result_count} results.")
                     loop_msg = False
                     # avoid showing same msg twice
                 continue
             else:
-                print(f"Found enough results")
+                print("Found enough results")
             break
         return {'post': data}
 
     def get_data_page(self, add_tags, page=0, id=''):
-        global COUNT
         if id:
             add_tags = ''
         url = f"{self.base_url}&pid={page}{id}{add_tags}"
@@ -533,14 +671,7 @@ class Rule34(Booru):
             url += f"&api_key={self.api_key}&user_id={self.user_id}"
         self.booru_url = url
         res = self.fetch_with_retry(url, timeout=10)
-        try:
-            data = res.json()
-        except Exception as e:
-            print(f"[Rule34] JSON parse error (page): {e}")
-            data = []
-        if not isinstance(data, list):
-            data = []
-        COUNT = len(data)
+        data = _response_posts_or_raise(res, "Rule34 page")
         return {'post': data}
 
     def get_post(self, add_tags, max_pages=10, id=''):
@@ -553,7 +684,6 @@ class Safebooru(Booru):
         super().__init__('safebooru', f'https://safebooru.donmai.us/posts.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
-        global COUNT
         max_pages = _normalize_max_pages(max_pages)
         loop_msg = True
         for loop in range(2):
@@ -563,51 +693,38 @@ class Safebooru(Booru):
             url = f"{self.base_url}&page={random_page}{add_tags}"
             self.booru_url = url
             res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
-            data = res.json()
-            if not isinstance(data, list):
-                try:
-                    data = data.get('posts', [])
-                except AttributeError:
-                    data = []
-            COUNT = 0
+            data = _response_posts_or_raise(res, "Safebooru")
+            result_count = 0
             for post in data:
                 if isinstance(post, dict):
                     post['tags'] = self._filter_tags_by_category(post, tag_categories)
                     if not post.get('file_url') and post.get('large_file_url'):
                         post['file_url'] = post.get('large_file_url')
-                    COUNT += 1
-            if COUNT == 0:
+                    result_count += 1
+            if result_count == 0:
                 max_pages = 2
                 while loop_msg:
-                    print(f" Processing {COUNT} results.")
+                    print(f" Processing {result_count} results.")
                     loop_msg = False
                 continue
             else:
-                print(f"Found enough results")
+                print("Found enough results")
             break
         return {'post': data}
 
     def get_data_page(self, add_tags, page=0, id='', tag_categories=None):
-        global COUNT
         if id:
             add_tags = ''
         safe_page = max(1, int(page) + 1)
         url = f"{self.base_url}&page={safe_page}{add_tags}"
         self.booru_url = url
         res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
-        data = res.json()
-        if not isinstance(data, list):
-            try:
-                data = data.get('posts', [])
-            except AttributeError:
-                data = []
-        COUNT = 0
+        data = _response_posts_or_raise(res, "Safebooru page")
         for post in data:
             if isinstance(post, dict):
                 post['tags'] = self._filter_tags_by_category(post, tag_categories)
                 if not post.get('file_url') and post.get('large_file_url'):
                     post['file_url'] = post.get('large_file_url')
-                COUNT += 1
         return {'post': data}
 
     def _filter_tags_by_category(self, post, categories):
@@ -641,7 +758,6 @@ class Konachan(Booru):
         super().__init__('konachan', f'https://konachan.com/post.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         max_pages = _normalize_max_pages(max_pages)
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
@@ -650,44 +766,28 @@ class Konachan(Booru):
             url = f"{self.base_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
             self.booru_url = url
             res = self.fetch_with_retry(url, timeout=10)
-            if res.status_code != 200:
-                data = []
-            else:
-                try:
-                    data = res.json()
-                except Exception as e:
-                    print(f"[Konachan] JSON parse error: {e}")
-                    data = []
-            COUNT = len(data)
-            if COUNT == 0:
+            data = _response_posts_or_raise(res, "Konachan")
+            result_count = len(data)
+            if result_count == 0:
                 max_pages = 2
                 # Konachan does not have a way to know the amount of results available in the search, so we need to run the function again with a fixed amount of pages
                 while loop_msg:
-                    print(f" Processing {COUNT} results.")
+                    print(f" Processing {result_count} results.")
                     loop_msg = False
                     # avoid showing same msg twice
                 continue
             else:
-                print(f"Found enough results")
+                print("Found enough results")
             break
         return {'post': data}
 
     def get_data_page(self, add_tags, page=0, id=''):
-        global COUNT
         if id:
             add_tags = ''
         url = f"{self.base_url}&page={page}{id}{add_tags}"
         self.booru_url = url
         res = self.fetch_with_retry(url, timeout=10)
-        if res.status_code != 200:
-            data = []
-        else:
-            try:
-                data = res.json()
-            except Exception as e:
-                print(f"[Konachan] JSON parse error (page): {e}")
-                data = []
-        COUNT = len(data)
+        data = _response_posts_or_raise(res, "Konachan page")
         return {'post': data}
 
     def get_post(self, add_tags, max_pages=10, id=''):
@@ -697,10 +797,9 @@ class Konachan(Booru):
 class Yandere(Booru):
 
     def __init__(self):
-        super().__init__('yande.re', f'https://yande.re/post.json?api_version=2')
+        super().__init__('yande.re', 'https://yande.re/post.json?api_version=2')
 
     def get_data(self, add_tags, max_pages=10, id=''):
-        global COUNT
         max_pages = _normalize_max_pages(max_pages)
         loop_msg = True # avoid showing same msg twice
         for loop in range(2): # run loop at most twice
@@ -711,50 +810,29 @@ class Yandere(Booru):
             url = f"{self.base_url}&limit={POST_AMOUNT}&page={page}{id}{add_tags}{extras}"
             self.booru_url = url
             res = self.fetch_with_retry(url, timeout=10)
-            posts = []
-            if res.status_code == 200:
-                try:
-                    data = res.json()
-                    if isinstance(data, dict):
-                        posts = data.get('posts', [])
-                    elif isinstance(data, list):
-                        posts = data
-                except Exception as e:
-                    print(f"[Yandere] JSON parse error: {e}")
-                    posts = []
-            COUNT = len(posts)
-            if COUNT == 0:
+            posts = _response_posts_or_raise(res, "Yandere", keys=("posts",))
+            result_count = len(posts)
+            if result_count == 0:
                 max_pages = 2
                 # Yandere does not have a way to know the amount of results available in the search, so we need to run the function again with a fixed amount of pages
                 while loop_msg:
-                    print(f" Processing {COUNT} results.")
+                    print(f" Processing {result_count} results.")
                     loop_msg = False
                     # avoid showing same msg twice
                 continue
             else:
-                print(f"Found enough results")
+                print("Found enough results")
             break
         return {'post': posts}
 
     def get_data_page(self, add_tags, page=0, id=''):
-        global COUNT
         if id:
             add_tags = ''
         extras = '&filter=1&include_tags=1&include_votes=1&include_pools=1'
         url = f"{self.base_url}&limit={POST_AMOUNT}&page={page}{id}{add_tags}{extras}"
         self.booru_url = url
         res = self.fetch_with_retry(url, timeout=10)
-        posts = []
-        if res.status_code == 200:
-            try:
-                data = res.json()
-                if isinstance(data, dict):
-                    posts = data.get('posts', [])
-                elif isinstance(data, list):
-                    posts = data
-            except Exception:
-                posts = []
-        COUNT = len(posts)
+        posts = _response_posts_or_raise(res, "Yandere page")
         return {'post': posts}
 
     def get_post(self, add_tags, max_pages=10, id=''):
@@ -767,7 +845,6 @@ class AIBooru(Booru):
         super().__init__('AIBooru', f'https://aibooru.online/posts.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
-        global COUNT
         max_pages = _normalize_max_pages(max_pages)
         loop_msg = True
         for loop in range(2):
@@ -776,38 +853,32 @@ class AIBooru(Booru):
             url = f"{self.base_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
             self.booru_url = url
             res = self.fetch_with_retry(url)
-            data = res.json()
-            if not isinstance(data, list):
-                data = data.get('posts', []) if isinstance(data, dict) else []
+            data = _response_posts_or_raise(res, "AIBooru")
             for post in data:
                 if isinstance(post, dict):
                     post['tags'] = self._filter_tags_by_category(post, tag_categories)
-            COUNT = len(data)
-            if COUNT == 0:
+            result_count = len(data)
+            if result_count == 0:
                 max_pages = 2
                 while loop_msg:
-                    print(f" Processing {COUNT} results.")
+                    print(f" Processing {result_count} results.")
                     loop_msg = False
                 continue
             else:
-                print(f"Found enough results")
+                print("Found enough results")
             break
         return {'post': data}
 
     def get_data_page(self, add_tags, page=0, id='', tag_categories=None):
-        global COUNT
         if id:
             add_tags = ''
         url = f"{self.base_url}&page={page}{id}{add_tags}"
         self.booru_url = url
         res = self.fetch_with_retry(url)
-        data = res.json()
-        if not isinstance(data, list):
-            data = data.get('posts', []) if isinstance(data, dict) else []
+        data = _response_posts_or_raise(res, "AIBooru page")
         for post in data:
             if isinstance(post, dict):
                 post['tags'] = self._filter_tags_by_category(post, tag_categories)
-        COUNT = len(data)
         return {'post': data}
 
     def _filter_tags_by_category(self, post, categories):
@@ -831,7 +902,6 @@ class Danbooru(Booru):
         super().__init__('danbooru', f'https://danbooru.donmai.us/posts.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
-        global COUNT
         max_pages = _normalize_max_pages(max_pages)
         loop_msg = True
         for loop in range(2):
@@ -841,45 +911,33 @@ class Danbooru(Booru):
             url = f"{self.base_url}&page={random_page}{add_tags}"
             self.booru_url = url
             res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
-            data = res.json()
-            if not isinstance(data, list):
-                try:
-                    data = data.get('posts', [])
-                except AttributeError:
-                    data = []
+            data = _response_posts_or_raise(res, "Danbooru")
             for post in data:
                 if isinstance(post, dict):
                     post['tags'] = self._filter_tags_by_category(post, tag_categories)
-            COUNT = len(data)
-            if COUNT == 0:
+            result_count = len(data)
+            if result_count == 0:
                 max_pages = 2
                 while loop_msg:
-                    print(f" Processing {COUNT} results.")
+                    print(f" Processing {result_count} results.")
                     loop_msg = False
                 continue
             else:
-                print(f"Found enough results")
+                print("Found enough results")
             break
         return {'post': data}
 
     def get_data_page(self, add_tags, page=0, id='', tag_categories=None):
-        global COUNT
         if id:
             add_tags = ''
         safe_page = max(1, int(page) + 1)
         url = f"{self.base_url}&page={safe_page}{add_tags}"
         self.booru_url = url
         res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
-        data = res.json()
-        if not isinstance(data, list):
-            try:
-                data = data.get('posts', [])
-            except AttributeError:
-                data = []
+        data = _response_posts_or_raise(res, "Danbooru page")
         for post in data:
             if isinstance(post, dict):
                 post['tags'] = self._filter_tags_by_category(post, tag_categories)
-        COUNT = len(data)
         return {'post': data}
 
     def _filter_tags_by_category(self, post, categories):
@@ -1241,6 +1299,57 @@ def _fetch_booru_data(api_url, booru, add_tags, max_pages, post_id='', tag_categ
     return api_url.get_data(add_tags, max_pages)
 
 
+def _fetch_booru_posts_with_fallback(
+    api_url,
+    booru,
+    add_tags,
+    max_pages,
+    post_id='',
+    tag_categories=None,
+    plain_tags='',
+    mature_rating='All',
+):
+    data = _fetch_booru_data(
+        api_url,
+        booru,
+        add_tags,
+        max_pages,
+        post_id,
+        tag_categories,
+    )
+    posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
+    if not posts and booru == 'rule34' and add_tags.startswith('&tags=-animated'):
+        fallback_add_tags = '&tags='
+        if plain_tags:
+            fallback_add_tags += str(plain_tags).replace(',', '+')
+        fallback_add_tags += _get_rating_tag(booru, mature_rating)
+        data = api_url.get_data(fallback_add_tags, max_pages)
+        posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
+    return posts
+
+
+def _create_booru_api(
+    booru,
+    fringe_benefits=True,
+    gelbooru_api_key=None,
+    gelbooru_user_id=None,
+    rule34_api_key=None,
+    rule34_user_id=None,
+):
+    factories = {
+        'gelbooru': lambda: Gelbooru(fringe_benefits, gelbooru_api_key, gelbooru_user_id),
+        'rule34': lambda: Rule34(rule34_api_key, rule34_user_id),
+        'safebooru': Safebooru,
+        'danbooru': Danbooru,
+        'konachan': Konachan,
+        'yande.re': Yandere,
+        'aibooru': AIBooru,
+        'xbooru': XBooru,
+        'e621': e621,
+    }
+    return factories.get(booru, factories['gelbooru'])()
+
+
 def _fetch_image(fetcher, url, headers=None):
     if not url:
         return None
@@ -1341,19 +1450,14 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
             rule34_api_key = saved.get('api_key', '')
             rule34_user_id = saved.get('user_id', '')
 
-    booru_apis = {
-        'gelbooru': Gelbooru(fringe_benefits, gelbooru_api_key, gelbooru_user_id),
-        'rule34': Rule34(rule34_api_key, rule34_user_id),
-        'safebooru': Safebooru(),
-        'danbooru': Danbooru(),
-        'konachan': Konachan(),
-        'yande.re': Yandere(),
-        'aibooru': AIBooru(),
-        'xbooru': XBooru(),
-        'e621': e621(),
-    }
-
-    api = booru_apis.get(booru_name, Gelbooru(fringe_benefits, gelbooru_api_key, gelbooru_user_id))
+    api = _create_booru_api(
+        booru_name,
+        fringe_benefits,
+        gelbooru_api_key,
+        gelbooru_user_id,
+        rule34_api_key,
+        rule34_user_id,
+    )
 
     add_tags = '&tags=-animated'
     if tags_search:
@@ -1385,6 +1489,10 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
 
     records = []
     stats = {
+        "complete": True,
+        "error": "",
+        "error_page": None,
+        "stop_reason": "requested_pages_completed",
         "pages_done": 0,
         "posts_seen": 0,
         "kept": 0,
@@ -1410,6 +1518,7 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                 raw_posts = []
             if len(raw_posts) == 0:
                 print(f"[TagCache] 第 {page+1} 页无数据，停止抓取")
+                stats["stop_reason"] = "empty_page"
                 break
             posts = _normalize_posts(raw_posts)
             stats["pages_done"] += 1
@@ -1468,26 +1577,28 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
             print(f"[TagCache] 第 {page+1}/{start_page_index + max_pages} 页完成，获取 {len(raw_posts)} 条，规范化 {len(posts)} 条")
         except Exception as ex:
             print(f"[TagCache] 第 {page+1} 页出错: {ex}")
+            stats["complete"] = False
+            stats["error"] = str(ex)
+            stats["error_page"] = page + 1
+            stats["stop_reason"] = "error"
             break
 
+    api.close()
     return records, stats
 
 
 def _is_hires_second_pass(p):
-    """
-    尽可能识别 Hires.fix 第二段。
-    """
-    # A1111 常见标记
-    if getattr(p, "is_hr_pass", False):
-        return True
-    # Forge/部分分支第二段常是 Img2Img + 有 init_images
-    init_images = getattr(p, "init_images", None)
-    if isinstance(p, StableDiffusionProcessingImg2Img) and init_images:
-        # 如果是普通 img2img（不是 hires）也可能有 init_images，所以再加一点条件
-        # 第二段通常还会有 denoising_strength / hr 相关字段
-        if hasattr(p, "denoising_strength") or getattr(p, "enable_hr", False):
-            return True
-    return False
+    return bool(getattr(p, "is_hr_pass", False))
+
+
+def _processing_job_id(p):
+    state_job_id = getattr(shared.state, "job_timestamp", None)
+    if state_job_id:
+        return str(state_job_id)
+    return (
+        f"{getattr(p, 'seed', '')}:{getattr(p, 'n_iter', '')}:"
+        f"{getattr(p, 'batch_size', '')}:{id(p)}"
+    )
 
 
 class Script(scripts.Script):
@@ -1503,7 +1614,12 @@ class Script(scripts.Script):
             ("txt2img_prompt", lambda x: self.set_prompt_area(0, x)),
             ("img2img_prompt", lambda x: self.set_prompt_area(1, x)),
         ]
-        self._local_cache_applied_jobs = set()   # 新增：记录已注入缓存的任务
+        self._local_cache_applied_jobs = {}   # Insertion-ordered bounded job dedupe map.
+        self._active_job_id = None
+        self.last_img = []
+        self.real_steps = 0
+        self.previous_loras = ''
+        self.original_prompt = ''
 
     def create_prompt_row(self, i2i, component):
         self.prompt_row[i2i] = gr.Row()
@@ -1547,30 +1663,26 @@ class Script(scripts.Script):
             return gr.update(visible=True)
         else:
             return gr.update(visible=False)
-    
+
     def load_gelbooru_credentials(self, booru):
         """Load saved credentials for selected booru"""
         if booru in ['gelbooru', 'rule34']:
-            credentials = credentials_manager.get_booru_credentials(booru)
-            api_key = credentials.get('api_key', '')
-            user_id = credentials.get('user_id', '')
             has_saved_creds = credentials_manager.has_credentials(booru)
-            
+
             if has_saved_creds:
                 # Hide input fields and show file path
-                credentials_file_path = credentials_manager.credentials_file
-                status_text = f"✓ Credentials loaded from: {credentials_file_path}"
+                status_text = "✓ Credentials are configured on the server"
                 return (
-                    gr.update(visible=False),  # api_key field
-                    gr.update(visible=False),  # user_id field  
+                    gr.update(visible=False, value=""),  # api_key field
+                    gr.update(visible=False, value=""),  # user_id field
                     gr.update(visible=True, value=status_text),  # credentials_status
                     gr.update(visible=True, value="Clear saved credentials")  # clear_credentials_btn
                 )
             else:
                 # Show input fields
                 return (
-                    gr.update(visible=True, value=api_key),  # api_key field
-                    gr.update(visible=True, value=user_id),  # user_id field
+                    gr.update(visible=True, value=""),  # api_key field
+                    gr.update(visible=True, value=""),  # user_id field
                     gr.update(visible=False, value=""),  # credentials_status
                     gr.update(visible=False)  # clear_credentials_btn
                 )
@@ -1581,7 +1693,7 @@ class Script(scripts.Script):
                 gr.update(visible=False, value=""),  # credentials_status
                 gr.update(visible=False)  # clear_credentials_btn
             )
-    
+
     def clear_gelbooru_credentials(self, booru="gelbooru"):
         credentials_manager.clear_booru_credentials(booru)
         return (
@@ -1627,11 +1739,23 @@ class Script(scripts.Script):
                 cache_start_page,
                 cache_keep_all_tags, cache_keep_any_tags, cache_exclude_tags,
             )
+            if not fetch_stats.get("complete", True) and not append_mode:
+                error_page = fetch_stats.get("error_page") or "?"
+                error = fetch_stats.get("error") or "未知错误"
+                return (
+                    f"覆盖保存已取消：抓取在第 {error_page} 页中断（{error}）。"
+                    "原缓存保持不变；如需保留已抓取部分，请改用追加模式。",
+                    tag_cache_manager.get_status(),
+                )
             if not records:
-                return "未抓取到符合缓存过滤条件的 tag 数据", tag_cache_manager.get_status()
+                error = fetch_stats.get("error")
+                suffix = f"；抓取错误：{error}" if error else ""
+                return f"未抓取到符合缓存过滤条件的 tag 数据{suffix}", tag_cache_manager.get_status()
             if append_mode:
                 save_stats = tag_cache_manager.append_records(records, dedupe=cache_dedupe)
                 action = "追加完成"
+                if not fetch_stats.get("complete", True):
+                    action = "部分抓取已追加"
             else:
                 save_stats = tag_cache_manager.save_records(records, dedupe=cache_dedupe)
                 tag_cache_manager.reset_index()
@@ -1644,22 +1768,33 @@ class Script(scripts.Script):
                 f"缓存过滤跳过 {fetch_stats['skipped_filter']} 条，"
                 f"排除 tag 跳过 {fetch_stats.get('skipped_exclude', 0)} 条，"
                 f"空 tag 跳过 {fetch_stats['skipped_empty']} 条，"
-                f"页段 {fetch_stats['start_page']}-{fetch_stats['end_page']}，"
+                f"页段 {fetch_stats['start_page']}-{fetch_stats['start_page'] + max(fetch_stats['pages_done'] - 1, 0)}，"
                 f"缓存总计 {save_stats['total']} 条{backup_note}"
             )
+            if not fetch_stats.get("complete", True):
+                msg += (
+                    f"；警告：第 {fetch_stats.get('error_page', '?')} 页抓取失败："
+                    f"{fetch_stats.get('error') or '未知错误'}"
+                )
             return msg, tag_cache_manager.get_status()
         except Exception as ex:
             return f"错误: {ex}", tag_cache_manager.get_status()
 
     @staticmethod
-    def _cache_get_next(loop_mode):
+    def _cache_get_next(loop_mode, prefer_natural=False):
         """从缓存顺序取出下一条"""
-        tags, idx, total = tag_cache_manager.get_next_tags_from_pool(loop=loop_mode)
+        tags, idx, total = tag_cache_manager.get_next_tags_from_pool(
+            loop=loop_mode,
+            prefer_natural=prefer_natural,
+        )
         if tags is None:
             if total == 0:
                 return "缓存为空，请先批量爬取", tag_cache_manager.get_status()
             else:
-                return f"已到达缓存末尾 (索引 {idx}/{total})", tag_cache_manager.get_status()
+                return (
+                    f"已到达缓存末尾 (索引 {idx}/{total})",
+                    tag_cache_manager.get_status(),
+                )
         return tags, tag_cache_manager.get_status()
 
     @staticmethod
@@ -1750,24 +1885,186 @@ class Script(scripts.Script):
             return f"{tags},{current_prompt}" if current_prompt else tags
         return f"{current_prompt},{tags}" if current_prompt else tags
 
+    def _apply_local_cache_prompt_pipeline(
+        self,
+        p,
+        cache_prompts,
+        natural_prompt_flags,
+        write_mode,
+        same_prompt,
+        shuffle_tags,
+        remove_bad_tags,
+        remove_tags,
+        change_background,
+        change_color,
+        chaos_mode,
+        negative_mode,
+        chaos_amount,
+        limit_tags,
+        max_tags,
+        use_same_seed,
+    ):
+        """Apply prompt-only options to a frozen local-cache batch."""
+        total_images = max(1, int(p.batch_size) * int(p.n_iter))
+        prompts = _repeat_to_length(cache_prompts, total_images)
+        natural_prompt_flags = [
+            bool(value)
+            for value in _repeat_to_length(natural_prompt_flags, total_images)
+        ]
+        if same_prompt and prompts:
+            prompts = [prompts[0] for _ in range(total_images)]
+            natural_prompt_flags = [natural_prompt_flags[0] for _ in range(total_images)]
+
+        bad_tags = list(DEFAULT_BAD_TAGS) if remove_bad_tags else []
+        if str(remove_tags or "").strip():
+            bad_tags.extend(_split_tag_tokens(remove_tags))
+        background_options = {
+            'Add Background': ('detailed_background,' + random.choice(["outdoors", "indoors"]), COLORED_BG),
+            'Remove Background': ('plain_background,simple_background,' + random.choice(COLORED_BG), ADD_BG),
+            'Remove All': ('', COLORED_BG + ADD_BG),
+        }
+        prompt_addition = ''
+        if change_background in background_options:
+            prompt_addition, background_bad_tags = background_options[change_background]
+            bad_tags.extend(background_bad_tags)
+        color_options = {
+            'Colored': BW_BG,
+            'Limited Palette': '(limited_palette:1.3)',
+            'Monochrome': ','.join(BW_BG),
+        }
+        if change_color in color_options:
+            color_value = color_options[change_color]
+            if isinstance(color_value, list):
+                bad_tags.extend(color_value)
+            else:
+                prompt_addition = _append_tags(prompt_addition, color_value)
+
+        exact_bad = {_normalize_tag_token(tag) for tag in bad_tags if '*' not in str(tag)}
+        wildcard_bad = [
+            _normalize_tag_token(str(tag).replace('*', ''))
+            for tag in bad_tags
+            if '*' in str(tag)
+        ]
+        cleaned_prompts = []
+        for cached_prompt, is_natural in zip(prompts, natural_prompt_flags):
+            cached_prompt = str(cached_prompt or '').strip()
+            if is_natural:
+                cleaned = cached_prompt
+                cleaned_prompts.append(cleaned)
+                continue
+            pieces = [piece.strip() for piece in str(cached_prompt or '').split(',') if piece.strip()]
+            filtered = []
+            for piece in pieces:
+                normalized = _normalize_tag_token(piece)
+                if normalized in exact_bad:
+                    continue
+                if any(token and token in normalized for token in wildcard_bad):
+                    continue
+                filtered.append(piece)
+            if shuffle_tags:
+                random.shuffle(filtered)
+            cleaned = ','.join(filtered)
+            cleaned_prompts.append(_append_tags(prompt_addition, cleaned))
+
+        base_prompts = _repeat_to_length(p.prompt, total_images)
+        negative_prompts = _repeat_to_length(p.negative_prompt, total_images)
+        combined_prompts = [
+            self._apply_write_mode(base_prompt, cached_prompt, write_mode)
+            for base_prompt, cached_prompt in zip(base_prompts, cleaned_prompts)
+        ]
+
+        positive_results = []
+        negative_results = []
+        for combined_prompt, base_prompt, negative_prompt, cached_prompt, is_natural in zip(
+            combined_prompts,
+            base_prompts,
+            negative_prompts,
+            cleaned_prompts,
+            natural_prompt_flags,
+        ):
+            if is_natural:
+                positive_results.append(combined_prompt)
+                negative_results.append(negative_prompt)
+            elif negative_mode == 'Negative':
+                positive_results.append(base_prompt)
+                negative_results.append(_append_tags(negative_prompt, cached_prompt))
+            elif chaos_mode in ['Chaos', 'Less Chaos']:
+                chaos_negative = '' if chaos_mode == 'Less Chaos' else negative_prompt
+                positive, generated_negative = generate_chaos(
+                    combined_prompt,
+                    chaos_negative,
+                    chaos_amount,
+                )
+                positive_results.append(positive)
+                negative_results.append(
+                    _append_tags(negative_prompt, generated_negative)
+                    if chaos_mode == 'Less Chaos'
+                    else generated_negative
+                )
+            else:
+                positive_results.append(combined_prompt)
+                negative_results.append(negative_prompt)
+        p.prompt = positive_results
+        p.negative_prompt = negative_results
+
+        if limit_tags < 1:
+            p.prompt = [
+                prompt if is_natural else limit_prompt_tags(prompt, limit_tags, 'Limit')
+                for prompt, is_natural in zip(p.prompt, natural_prompt_flags)
+            ]
+        if max_tags > 0:
+            p.prompt = [
+                prompt if is_natural else limit_prompt_tags(prompt, max_tags, 'Max')
+                for prompt, is_natural in zip(p.prompt, natural_prompt_flags)
+            ]
+        if use_same_seed:
+            seed = random.randint(0, 2 ** 32 - 1) if p.seed == -1 else p.seed
+            p.seed = [seed] * total_images
+        _sync_prompt_lists(p)
+        return p
+
     @staticmethod
-    def _cache_fill_by_position(position):
+    def _cache_fill_by_position(position, prefer_natural=False):
         """根据真实缓存序号填充标签"""
         cache_position = Script._parse_cache_id(position)
         if cache_position is None:
             return "", "请输入有效的缓存序号"
-        tags = tag_cache_manager.get_by_position(cache_position)
+        tags = tag_cache_manager.get_by_position(
+            cache_position,
+            prefer_natural=prefer_natural,
+        )
         if tags:
-            return tags, f"已取出第 {cache_position} 条"
+            prompt_kind = "自然语言 Prompt" if prefer_natural else "原始 Tag"
+            return tags, f"已取出第 {cache_position} 条（优先使用{prompt_kind}）"
         return "", f"未找到第 {cache_position} 条"
 
     @staticmethod
-    def _cache_fill_position_to_tag_prompt(position, tag_prompt_text, write_mode):
+    def _cache_fill_by_id(tag_id, prefer_natural=False):
+        stable_id = Script._parse_cache_id(tag_id)
+        if stable_id is None:
+            return "", "请输入搜索结果中的内部 ID"
+        tags = tag_cache_manager.get_by_id(stable_id, prefer_natural=prefer_natural)
+        if tags:
+            prompt_kind = "自然语言 Prompt" if prefer_natural else "原始 Tag"
+            return tags, f"已按内部 ID {stable_id} 取出（优先使用{prompt_kind}）"
+        return "", f"未找到内部 ID {stable_id}"
+
+    @staticmethod
+    def _cache_fill_position_to_tag_prompt(
+        position,
+        tag_prompt_text,
+        write_mode,
+        prefer_natural=False,
+    ):
         """Fill Tag Prompt with a cached tag row by visible cache position."""
-        tags, msg = Script._cache_fill_by_position(position)
+        tags, msg = Script._cache_fill_by_position(position, prefer_natural)
         if not tags:
             return "", msg, tag_prompt_text
-        return tags, msg, Script._apply_write_mode(tag_prompt_text, tags, write_mode)
+        return (
+            tags,
+            msg,
+            Script._apply_write_mode(tag_prompt_text, tags, write_mode),
+        )
 
     @staticmethod
     def _cache_jump_to_position(position):
@@ -1790,6 +2087,16 @@ class Script(scripts.Script):
         if success:
             return f"已删除第 {cache_position} 条", tag_cache_manager.get_status()
         return f"删除失败：未找到第 {cache_position} 条", tag_cache_manager.get_status()
+
+    @staticmethod
+    def _cache_delete_by_id(tag_id):
+        stable_id = Script._parse_cache_id(tag_id)
+        if stable_id is None:
+            return "请输入搜索结果中的内部 ID", tag_cache_manager.get_status()
+        deleted = tag_cache_manager.delete_by_ids([stable_id])
+        if deleted:
+            return f"已删除内部 ID {stable_id}", tag_cache_manager.get_status()
+        return f"删除失败：未找到内部 ID {stable_id}", tag_cache_manager.get_status()
 
     @staticmethod
     def _cache_delete_by_tags(tags):
@@ -1869,6 +2176,26 @@ class Script(scripts.Script):
         return Script._format_delete_preview(tag_cache_manager.preview_delete_by_positions(str(cache_position)))
 
     @staticmethod
+    def _cache_preview_delete_by_id(tag_id):
+        stable_id = Script._parse_cache_id(tag_id)
+        if stable_id is None:
+            return "请输入搜索结果中的内部 ID"
+        record = tag_cache_manager.get_record_by_id(stable_id)
+        if not record:
+            return f"未找到内部 ID {stable_id}"
+        record = dict(record)
+        record["position"] = f"ID {stable_id}"
+        return Script._format_delete_preview(
+            {
+                "ok": True,
+                "title": "按内部 ID 删除预览",
+                "count": 1,
+                "requested": 1,
+                "sample": [record],
+            }
+        )
+
+    @staticmethod
     def _cache_preview_delete_by_position_range(position_spec):
         if not str(position_spec or "").strip():
             return "请输入要预览删除的缓存序号或范围，例如 100-140, 150"
@@ -1881,31 +2208,453 @@ class Script(scripts.Script):
         return Script._format_delete_preview(tag_cache_manager.preview_delete_by_any_tags(tags))
 
     @staticmethod
-    def _cache_get_next_and_set(loop_mode, tag_prompt_text, current_prompt, write_mode):
+    def _cache_get_next_and_set(
+        loop_mode,
+        tag_prompt_text,
+        current_prompt,
+        write_mode,
+        prefer_natural=False,
+    ):
         """从缓存顺序取出下一条并设置到提示词"""
-        tags, idx, total = tag_cache_manager.get_next_tags_from_pool(loop=loop_mode)
+        tags, idx, total = tag_cache_manager.get_next_tags_from_pool(
+            loop=loop_mode,
+            prefer_natural=prefer_natural,
+        )
         if tags is None:
             if total == 0:
-                return "缓存为空，请先批量爬取", tag_cache_manager.get_status(), current_prompt
+                return (
+                    "缓存为空，请先批量爬取",
+                    tag_cache_manager.get_status(),
+                    current_prompt,
+                )
             else:
-                return f"已到达缓存末尾 (索引 {idx}/{total})", tag_cache_manager.get_status(), current_prompt
+                return (
+                    f"已到达缓存末尾 (索引 {idx}/{total})",
+                    tag_cache_manager.get_status(),
+                    current_prompt,
+                )
+        status = tag_cache_manager.get_status()
         tag_payload = Script._combine_prompt(tag_prompt_text, tags)
         combined = Script._apply_write_mode(current_prompt, tag_payload, write_mode)
-        return tags, tag_cache_manager.get_status(), combined
+        return tags, status, combined
 
     @staticmethod
-    def _cache_jump_take(position, loop_mode):
+    def _cache_jump_take(position, loop_mode, prefer_natural=False):
         result = tag_cache_manager.jump_to_position(position)
         if not result.get("ok"):
-            return result.get("message", "跳转失败"), Script._cache_refresh_status()
-        return Script._cache_get_next(loop_mode)
+            return (
+                result.get("message", "跳转失败"),
+                Script._cache_refresh_status(),
+            )
+        return Script._cache_get_next(loop_mode, prefer_natural)
 
     @staticmethod
-    def _cache_jump_take_and_set(position, loop_mode, tag_prompt_text, current_prompt, write_mode):
+    def _cache_jump_take_and_set(
+        position,
+        loop_mode,
+        tag_prompt_text,
+        current_prompt,
+        write_mode,
+        prefer_natural=False,
+    ):
         result = tag_cache_manager.jump_to_position(position)
         if not result.get("ok"):
-            return result.get("message", "跳转失败"), Script._cache_refresh_status(), current_prompt
-        return Script._cache_get_next_and_set(loop_mode, tag_prompt_text, current_prompt, write_mode)
+            return (
+                result.get("message", "跳转失败"),
+                Script._cache_refresh_status(),
+                current_prompt,
+            )
+        return Script._cache_get_next_and_set(
+            loop_mode,
+            tag_prompt_text,
+            current_prompt,
+            write_mode,
+            prefer_natural,
+        )
+
+    @staticmethod
+    def _natural_language_cache_status():
+        status = tag_cache_manager.get_natural_prompt_status()
+        return (
+            f"主缓存共 {status['total']} 条；已预转换 {status['converted']} 条；"
+            f"待转换 {status['missing']} 条"
+        )
+
+    @staticmethod
+    def _save_natural_language_settings(
+        preset,
+        backend,
+        endpoint_policy,
+        endpoint,
+        model,
+        api_key,
+        timeout,
+    ):
+        settings = credentials_manager.save_natural_language_settings(
+            preset,
+            backend,
+            endpoint_policy,
+            endpoint,
+            model,
+            api_key,
+            timeout,
+        )
+        key_status = "已保存 API Key" if settings["api_key"] else "API Key 为空"
+        return f"LLM 设置已保存；{key_status}。"
+
+    @staticmethod
+    def _clear_natural_language_settings():
+        credentials_manager.clear_natural_language_settings()
+        return (
+            PRESET_KREA2,
+            NATURAL_LANGUAGE_OFF,
+            NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED,
+            "",
+            "",
+            "",
+            120,
+            "已清除保存的 LLM 设置和 API Key。",
+        )
+
+    @staticmethod
+    def _format_natural_language_preview(result):
+        if not result.get("matched", result.get("count")):
+            return (
+                f"{result.get('title', '自然语言预转换预览')}：未匹配到记录。"
+                f"当前活动缓存共 {result.get('total', 0)} 条。"
+            )
+        if not result.get("selected", result.get("count")):
+            return (
+                f"{result.get('title', '自然语言预转换预览')}：输入命中 "
+                f"{result.get('matched', 0)} 条，但这些记录都已有自然语言结果；"
+                "关闭“只转换尚未转换的记录”可覆盖转换。"
+            )
+        lines = [
+            (
+                f"{result.get('title', '自然语言预转换预览')}："
+                f"输入命中 {result.get('matched', result.get('count', 0))} / "
+                f"{result.get('requested', 0)} 条；"
+                f"其中已有结果 {result.get('converted', 0)} 条，"
+                f"待转换 {result.get('missing', 0)} 条；"
+                f"本次将处理 {result.get('selected', result.get('count', 0))} 条。"
+            )
+        ]
+        for record in result.get("sample", []):
+            raw = str(record.get("tags_prompt") or "").replace("\n", " ")
+            natural = str(record.get("natural_prompt") or "").replace("\n", " ")
+            lines.append(
+                f"#{record.get('position')} [ID {record.get('id')}] "
+                f"原始：{raw[:180]}"
+            )
+            if natural:
+                lines.append(f"    已转换：{natural[:220]}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _cache_preview_natural_conversion(position_spec, only_missing=True):
+        if not str(position_spec or "").strip():
+            return "请输入当前活动缓存的可见序号或范围，例如 1-100,205-240。"
+        result = tag_cache_manager.preview_natural_conversion(
+            position_spec,
+            only_missing=only_missing,
+        )
+        return Script._format_natural_language_preview(result)
+
+    @staticmethod
+    def _cache_batch_convert_natural_unlocked(
+        position_spec,
+        only_missing,
+        preset,
+        backend,
+        endpoint_policy,
+        endpoint,
+        model,
+        api_key,
+        timeout,
+    ):
+        if not str(position_spec or "").strip():
+            yield (
+                "请输入当前活动缓存的可见序号或范围，例如 1-100,205-240。",
+                Script._natural_language_cache_status(),
+            )
+            return
+        if backend == NATURAL_LANGUAGE_OFF:
+            yield (
+                "请选择 Ollama（本地）或 OpenAI 兼容 LLM 后再开始批量转换。",
+                Script._natural_language_cache_status(),
+            )
+            return
+        if not str(model or "").strip():
+            yield (
+                "请填写模型名称。",
+                Script._natural_language_cache_status(),
+            )
+            return
+        records = tag_cache_manager.get_records_by_position_spec(
+            position_spec,
+            only_missing=only_missing,
+        )
+        if not records:
+            yield (
+                "所选范围没有待转换记录；可关闭“只转换尚未转换的记录”后覆盖已有结果。",
+                Script._natural_language_cache_status(),
+            )
+            return
+
+        try:
+            backup_path = tag_cache_manager.backup_db("natural_batch")
+        except Exception as error:
+            yield (
+                f"批量转换未开始：数据库备份失败：{error}",
+                Script._natural_language_cache_status(),
+            )
+            return
+        config = NaturalLanguageConfig(
+            backend=str(backend or NATURAL_LANGUAGE_OFF),
+            endpoint=str(endpoint or "").strip(),
+            model=str(model or "").strip(),
+            api_key=credentials_manager.resolve_natural_language_api_key(
+                api_key,
+                backend,
+                endpoint,
+            ),
+            timeout=timeout,
+            preset=str(preset or PRESET_KREA2),
+            endpoint_policy=str(endpoint_policy or NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED),
+        )
+        converter = CachedTagNaturalLanguageConverter()
+        pending_updates = []
+        processed = 0
+        saved = 0
+        stale = 0
+        reused = 0
+        timeout_skipped = 0
+        transient_skipped = 0
+        consecutive_timeouts = 0
+        max_consecutive_timeouts = 6
+        update_batch_size = 10
+
+        def flush_pending():
+            nonlocal saved, stale
+            if not pending_updates:
+                return
+            update_result = tag_cache_manager.update_natural_prompts(
+                pending_updates,
+                preset=config.preset,
+                model=config.model,
+                only_missing=only_missing,
+                converter_version=NATURAL_LANGUAGE_CONVERTER_VERSION,
+            )
+            saved += update_result["updated"]
+            stale += update_result["stale_or_missing"]
+            pending_updates.clear()
+
+        try:
+            yield (
+                f"已选择 {len(records)} 条整记录，数据库备份完成；开始调用模型。",
+                Script._natural_language_cache_status(),
+            )
+            for index, original, converted, error, was_reused in iter_cached_tag_conversions(
+                [record["tags_prompt"] for record in records],
+                config,
+                converter,
+                should_cancel=_natural_batch_cancel.is_set,
+            ):
+                processed = index + 1
+                if error:
+                    flush_pending()
+                    if is_timeout_conversion_error(error):
+                        timeout_skipped += 1
+                        consecutive_timeouts += 1
+                        if consecutive_timeouts >= max_consecutive_timeouts:
+                            yield (
+                                (
+                                    f"批量转换在第 {processed}/{len(records)} 条停止："
+                                    f"已连续 {consecutive_timeouts} 条记录在自动重试 2 次后仍超时。\n"
+                                    f"本次已保存 {saved} 条；超时跳过 {timeout_skipped} 条；"
+                                    f"源记录变化或已删除 {stale} 条。备份：{backup_path}"
+                                ),
+                                Script._natural_language_cache_status(),
+                            )
+                            return
+                        yield (
+                            (
+                                f"第 {processed}/{len(records)} 条在自动重试 2 次后仍超时，"
+                                f"已跳过并继续；连续超时 {consecutive_timeouts}/"
+                                f"{max_consecutive_timeouts}；已保存 {saved} 条。"
+                            ),
+                            Script._natural_language_cache_status(),
+                        )
+                        continue
+                    if is_retryable_conversion_error(error):
+                        transient_skipped += 1
+                        consecutive_timeouts = 0
+                        yield (
+                            (
+                                f"Record {processed}/{len(records)} still failed after 2 retries; "
+                                f"skipped and continuing. Saved {saved}.\n{error}"
+                            ),
+                            Script._natural_language_cache_status(),
+                        )
+                        continue
+                    yield (
+                        (
+                            f"批量转换在第 {processed}/{len(records)} 条停止：{error}\n"
+                            f"已保存 {saved} 条；源记录变化或已删除 {stale} 条；"
+                            f"已完成的结果仍保留。备份：{backup_path}"
+                        ),
+                        Script._natural_language_cache_status(),
+                    )
+                    return
+                consecutive_timeouts = 0
+                if not converted:
+                    continue
+                if was_reused:
+                    reused += 1
+                record = records[index]
+                pending_updates.append(
+                    {
+                        "id": record["id"],
+                        "source_tags_prompt": original,
+                        "natural_prompt": converted,
+                    }
+                )
+                if len(pending_updates) >= update_batch_size:
+                    flush_pending()
+                if _natural_batch_cancel.is_set():
+                    flush_pending()
+                    yield (
+                        (
+                            f"批量转换已取消：完成 {processed}/{len(records)} 条，"
+                            f"已保存 {saved} 条，源记录变化或删除 {stale} 条。"
+                            f"备份：{backup_path}"
+                        ),
+                        Script._natural_language_cache_status(),
+                    )
+                    return
+                if processed % 5 == 0:
+                    yield (
+                        (
+                            f"正在转换：{processed}/{len(records)}；已保存 {saved} 条；"
+                            f"复用相同整条 Tag 的结果 {reused} 条。"
+                        ),
+                        Script._natural_language_cache_status(),
+                    )
+
+            flush_pending()
+            yield (
+                (
+                    f"批量预转换完成：选择 {len(records)} 条，保存 {saved} 条，"
+                    f"复用相同整条 Tag 的结果 {reused} 条，"
+                    f"超时跳过 {timeout_skipped} 条，"
+                    f"源记录变化或已删除 {stale} 条。备份：{backup_path}"
+                ),
+                Script._natural_language_cache_status(),
+            )
+        except NaturalLanguageBatchCancelled:
+            flush_pending()
+            yield (
+                (
+                    f"Batch conversion cancelled at {processed}/{len(records)}; "
+                    f"saved {saved}, timed out {timeout_skipped}, "
+                    f"other transient failures {transient_skipped}. Backup: {backup_path}"
+                ),
+                Script._natural_language_cache_status(),
+            )
+        finally:
+            try:
+                flush_pending()
+            finally:
+                converter.close()
+
+    @staticmethod
+    def _cache_batch_convert_natural(
+        position_spec,
+        only_missing,
+        preset,
+        backend,
+        endpoint_policy,
+        endpoint,
+        model,
+        api_key,
+        timeout,
+    ):
+        if not _natural_batch_lock.acquire(blocking=False):
+            yield (
+                "已有自然语言批量任务正在运行，请等待其完成或停止后再试。",
+                Script._natural_language_cache_status(),
+            )
+            return
+        _natural_batch_cancel.clear()
+        try:
+            yield from Script._cache_batch_convert_natural_unlocked(
+                position_spec,
+                only_missing,
+                preset,
+                backend,
+                endpoint_policy,
+                endpoint,
+                model,
+                api_key,
+                timeout,
+            )
+        finally:
+            _natural_batch_lock.release()
+
+    @staticmethod
+    def _cancel_natural_batch():
+        if not _natural_batch_lock.locked():
+            return "当前没有正在运行的自然语言批量任务。"
+        _natural_batch_cancel.set()
+        return "已请求取消；当前模型请求返回后将保存已完成结果并停止。"
+
+    @staticmethod
+    def _cache_clear_natural_conversion(position_spec):
+        if not _natural_batch_lock.acquire(blocking=False):
+            return (
+                "A batch conversion is running; cancel or wait before clearing results.",
+                Script._natural_language_cache_status(),
+            )
+        try:
+            return Script._cache_clear_natural_conversion_unlocked(position_spec)
+        finally:
+            _natural_batch_lock.release()
+
+    @staticmethod
+    def _cache_clear_natural_conversion_unlocked(position_spec):
+        if not str(position_spec or "").strip():
+            return (
+                "请输入要清除自然语言结果的可见序号或范围。",
+                Script._natural_language_cache_status(),
+            )
+        records = tag_cache_manager.get_records_by_position_spec(
+            position_spec,
+            only_missing=False,
+        )
+        converted = [
+            record
+            for record in records
+            if str(record.get("natural_prompt") or "").strip()
+        ]
+        if not converted:
+            return (
+                "所选范围没有已保存的自然语言结果。",
+                Script._natural_language_cache_status(),
+            )
+        try:
+            backup_path = tag_cache_manager.backup_db("natural_clear")
+        except Exception as error:
+            return (
+                f"未清除任何结果：数据库备份失败：{error}",
+                Script._natural_language_cache_status(),
+            )
+        cleared = tag_cache_manager.clear_natural_prompts_by_ids(
+            record["id"] for record in converted
+        )
+        return (
+            f"已清除 {cleared} 条自然语言结果；原始 Tag 未修改。备份：{backup_path}",
+            Script._natural_language_cache_status(),
+        )
 
     @staticmethod
     def _filter_tags(query, must_include, must_exclude, sort_order, preview_limit):
@@ -1927,11 +2676,11 @@ class Script(scripts.Script):
         try:
             if not selected_ids_str or not selected_ids_str.strip():
                 return "请输入要添加的缓存序号（逗号分隔）", tag_cache_manager.get_filtered_pool_status()
-            
+
             id_list = list(dict.fromkeys(int(x) for x in re.findall(r"\d+", selected_ids_str)))
             if not id_list:
                 return "未找到有效的缓存序号", tag_cache_manager.get_filtered_pool_status()
-            
+
             count = tag_cache_manager.create_filtered_pool_by_positions(id_list)
             return f"✅ 筛选池已创建，包含 {count} 条标签", tag_cache_manager.get_filtered_pool_status()
         except Exception as e:
@@ -2080,15 +2829,34 @@ class Script(scripts.Script):
 
     def ui(self, is_img2img):
         default_booru = "safebooru"
+        saved_natural_settings = credentials_manager.get_natural_language_settings()
+        saved_natural_preset = saved_natural_settings.get("preset", PRESET_KREA2)
+        if saved_natural_preset not in NATURAL_LANGUAGE_PRESETS:
+            saved_natural_preset = PRESET_KREA2
+        saved_natural_backend = saved_natural_settings.get(
+            "backend", NATURAL_LANGUAGE_OFF
+        )
+        if saved_natural_backend not in NATURAL_LANGUAGE_BACKENDS:
+            saved_natural_backend = NATURAL_LANGUAGE_OFF
+        saved_natural_policy = saved_natural_settings.get(
+            "endpoint_policy", NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED
+        )
+        if saved_natural_policy not in _natural_endpoint_policy_choices:
+            saved_natural_policy = NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED
+        try:
+            saved_natural_timeout = min(
+                300.0,
+                max(1.0, float(saved_natural_settings.get("timeout", 120))),
+            )
+        except (TypeError, ValueError):
+            saved_natural_timeout = 120.0
         # Determine initial Gelbooru credential visibility based on saved credentials
         has_saved = credentials_manager.has_credentials('gelbooru')
-        saved_creds = credentials_manager.get_booru_credentials('gelbooru') if has_saved else {}
         initial_api_key_visible = not has_saved
         initial_user_id_visible = not has_saved
-        initial_status_visible = has_saved
-        initial_status_value = f"✓ Credentials loaded from: {credentials_manager.credentials_file}" if has_saved else ""
+        initial_status_value = "✓ Credentials are configured on the server" if has_saved else ""
         initial_clear_visible = has_saved
-        
+
         row_container = self.prompt_row[is_img2img] or gr.Row()
         input_row = self.input_row[is_img2img] or gr.Row()
         action_row = self.action_row[is_img2img] or gr.Row()
@@ -2132,11 +2900,11 @@ class Script(scripts.Script):
                                     gr.Markdown("### API Credentials")
                                     api_key = gr.Textbox(
                                         lines=1, label="API Key", placeholder="Enter your API key",
-                                        type="password", visible=initial_api_key_visible, value=saved_creds.get('api_key', '')
+                                        type="password", visible=initial_api_key_visible, value=""
                                     )
                                     user_id = gr.Textbox(
                                         lines=1, label="User ID", placeholder="Enter your user ID",
-                                        visible=initial_user_id_visible, value=saved_creds.get('user_id', '')
+                                        visible=initial_user_id_visible, value=""
                                     )
                                     save_credentials = gr.Checkbox(label="Save credentials", value=False, visible=True)
                                     credentials_status = gr.Textbox(
@@ -2150,7 +2918,7 @@ class Script(scripts.Script):
                                 max_tags = gr.Slider(value=100, label="Max tags", minimum=1, maximum=100, step=1)
                                 change_background = gr.Radio(["Don't Change", "Add Background", "Remove Background", "Remove All"], label="Change Background", value="Don't Change")
                                 change_color = gr.Radio(["Don't Change", "Colored", "Limited Palette", "Monochrome"], label="Change Color", value="Don't Change")
-                            sorting_order = gr.Radio(["Random", "High Score", "Low Score"], label="Sorting Order", value="Random")            
+                            sorting_order = gr.Radio(["Random", "High Score", "Low Score"], label="Sorting Order", value="Random")
                         booru.change(get_available_ratings, booru, mature_rating)
                         booru.change(show_fringe_benefits, booru, fringe_benefits)
                         booru.change(self.show_gelbooru_api_fields, booru, gelbooru_credentials_group)
@@ -2246,12 +3014,140 @@ class Script(scripts.Script):
                             with gr.Row():
                                 cache_preview_next_btn = gr.Button("预览下一条")
                             cache_preview_output = gr.Textbox(label="下一条预览", interactive=False, lines=3)
-                            cache_next_output = gr.Textbox(label="当前取出的 Tag", interactive=False, lines=3)
-                            
+                            cache_next_output = gr.Textbox(
+                                label="当前取出的 Tag / 转换后 Prompt",
+                                interactive=False,
+                                lines=3,
+                            )
+
                             gr.Markdown("#### ⚙️ 生成设置")
                             with gr.Row():
                                 use_local_cache_gen = gr.Checkbox(label="生成时使用此缓存", value=False)
                                 use_local_cache_loop = gr.Checkbox(label="生成时循环读取 (到末尾自动重头)", value=True)
+                                use_preconverted_cache_prompt = gr.Checkbox(
+                                    label="优先使用已预转换的自然语言 Prompt",
+                                    value=True,
+                                )
+                            with gr.Accordion("批量预转换缓存为自然语言", open=False):
+                                gr.Markdown(
+                                    "按当前活动缓存（主缓存、临时筛选池或规则池）的**可见序号**选择几十或"
+                                    "几百条记录；每条记录的整个 `tags_prompt` 会一次性转换并保存到数据库的"
+                                    "独立自然语言字段，原始 Tag 不会被覆盖。生成和手动写入时只读取已保存"
+                                    "结果，未转换的记录自动回退为原始 Tag，不会临时调用模型。\n\n"
+                                    "Krea 2 预设采用紧凑自然语言：优先描述媒介、主体、动作、场景、构图、"
+                                    "时间/光线与单一风格锚点，并去掉 masterpiece、8k 等空泛质量词。\n\n"
+                                    "仅使用你信任的模型服务：OpenAI 兼容模式会把选中的缓存 Tag "
+                                    "发送到所填地址；共享或公网 WebUI 应限制此面板的访问。"
+                                )
+                                cache_natural_language_status = gr.Textbox(
+                                    label="预转换状态",
+                                    value=self._natural_language_cache_status(),
+                                    interactive=False,
+                                    lines=1,
+                                )
+                                with gr.Row():
+                                    cache_natural_language_positions = gr.Textbox(
+                                        label="选择可见序号 / 范围",
+                                        placeholder="例如：1-100,205-240,301",
+                                        lines=1,
+                                    )
+                                    cache_natural_language_only_missing = gr.Checkbox(
+                                        label="只转换尚未转换的记录",
+                                        value=True,
+                                    )
+                                cache_natural_language_preset = gr.Dropdown(
+                                    NATURAL_LANGUAGE_PRESETS,
+                                    label="自然语言预设",
+                                    value=saved_natural_preset,
+                                )
+                                with gr.Row():
+                                    cache_natural_language_backend = gr.Dropdown(
+                                        NATURAL_LANGUAGE_BACKENDS,
+                                        label="转换方式",
+                                        value=saved_natural_backend,
+                                    )
+                                    cache_natural_language_endpoint_policy = gr.Dropdown(
+                                        _natural_endpoint_policy_choices,
+                                        label="服务地址兼容策略",
+                                        value=saved_natural_policy,
+                                        info=(
+                                            "unrestricted：普通 HTTP 客户端模式，兼容系统代理、Fake-IP 和任意地址（推荐）；"
+                                            "allow_private：允许本机、LAN 和 Fake-IP，但仍校验 DNS/IP；"
+                                            "default：仅允许本机 Ollama 和公网服务；"
+                                            "public_only：仅公网。"
+                                        ),
+                                    )
+                                    cache_natural_language_timeout = gr.Number(
+                                        label="请求超时（秒）",
+                                        minimum=1,
+                                        maximum=300,
+                                        value=saved_natural_timeout,
+                                        step=1,
+                                        precision=0,
+                                    )
+                                cache_natural_language_endpoint = gr.Textbox(
+                                    label="模型服务地址（留空使用后端默认地址）",
+                                    value=str(saved_natural_settings.get("endpoint", "")),
+                                    placeholder=(
+                                        "Ollama: http://127.0.0.1:11434；"
+                                        "OpenAI 兼容: https://api.openai.com/v1"
+                                    ),
+                                    lines=1,
+                                )
+                                with gr.Row():
+                                    cache_natural_language_model = gr.Textbox(
+                                        label="模型名称",
+                                        value=str(saved_natural_settings.get("model", "")),
+                                        placeholder="例如 qwen3:8b 或服务端提供的模型 ID",
+                                        lines=1,
+                                    )
+                                    cache_natural_language_api_key = gr.Textbox(
+                                        label="API Key（Ollama 可留空）",
+                                        type="password",
+                                        value="",
+                                        placeholder="Saved API key stays on the server; leave blank to keep it.",
+                                        lines=1,
+                                    )
+                                with gr.Row():
+                                    cache_natural_language_save_settings_btn = gr.Button(
+                                        "保存 LLM 设置（含 API Key）"
+                                    )
+                                    cache_natural_language_clear_settings_btn = gr.Button(
+                                        "清除保存的 LLM 设置"
+                                    )
+                                cache_natural_language_settings_status = gr.Textbox(
+                                    label="LLM 设置",
+                                    value=(
+                                        "已加载保存的 LLM 设置。"
+                                        if saved_natural_settings
+                                        else "尚未保存 LLM 设置。"
+                                    ),
+                                    interactive=False,
+                                    lines=1,
+                                )
+                                with gr.Row():
+                                    cache_natural_language_preview_btn = gr.Button(
+                                        "预览所选缓存"
+                                    )
+                                    cache_natural_language_convert_btn = gr.Button(
+                                        "批量整条转换并保存",
+                                        variant="primary",
+                                    )
+                                    cache_natural_language_cancel_btn = gr.Button(
+                                        "取消批量转换",
+                                        variant="stop",
+                                    )
+                                    cache_natural_language_clear_btn = gr.Button(
+                                        "清除所选已转换结果"
+                                    )
+                                    cache_natural_language_refresh_btn = gr.Button(
+                                        "刷新状态"
+                                    )
+                                cache_natural_language_preview = gr.Textbox(
+                                    label="预览 / 执行结果",
+                                    interactive=False,
+                                    lines=8,
+                                )
 
                         # ─── 管理操作面板 ────────────────────────
                         with gr.Accordion("缓存管理操作", open=False):
@@ -2260,13 +3156,18 @@ class Script(scripts.Script):
                                 cache_search_keyword = gr.Textbox(label="搜索语法", placeholder="例如: +1girl +blue_eyes -2girls -text", lines=1)
                                 cache_search_btn = gr.Button("🔍 搜索")
                             cache_search_results = gr.Dataframe(
-                                headers=["序号", "Booru", "Post ID", "Score", "Rating", "Tags"],
+                                headers=["主缓存序号", "Booru", "Post ID", "Score", "Rating", "Tags", "内部 ID"],
                                 label="搜索结果",
                                 interactive=False,
                                 wrap=True
                             )
                             with gr.Row():
-                                cache_select_id = gr.Number(label="选择序号", minimum=1, step=1, precision=0)
+                                cache_select_id = gr.Number(
+                                    label="搜索结果内部 ID",
+                                    minimum=1,
+                                    step=1,
+                                    precision=0,
+                                )
                                 cache_fill_btn = gr.Button("📝 填充到输出")
                                 cache_preview_delete_id_btn = gr.Button("预览此条")
                                 cache_delete_id_btn = gr.Button("🗑️ 删除此条", variant="stop")
@@ -2315,10 +3216,11 @@ class Script(scripts.Script):
                                 cache_export_format = gr.Dropdown(["json", "csv"], label="导出格式", value="json")
                                 cache_export_btn = gr.Button("导出缓存")
                             with gr.Row():
-                                cache_import_path = gr.Textbox(
-                                    label="导入文件路径",
-                                    placeholder="例如: E:\\path\\tag_cache_export.json",
-                                    lines=1,
+                                cache_import_path = gr.File(
+                                    label="上传要导入的 JSON / CSV",
+                                    file_count="single",
+                                    file_types=[".json", ".csv"],
+                                    type="filepath",
                                 )
                                 cache_import_append = gr.Checkbox(label="导入时追加", value=True)
                                 cache_import_dedupe = gr.Checkbox(label="导入时去重", value=True)
@@ -2335,15 +3237,15 @@ class Script(scripts.Script):
                                 placeholder="例如: +1girl +blue_eyes -2girls -text",
                                 lines=1
                             )
-                            
+
                             with gr.Row():
                                 filter_must_include = gr.Textbox(
-                                    label="必须包含（逗号分隔）", 
+                                    label="必须包含（逗号分隔）",
                                     placeholder="例如: 1girl,blue_eyes",
                                     lines=1
                                 )
                                 filter_must_exclude = gr.Textbox(
-                                    label="必须排除（逗号分隔）", 
+                                    label="必须排除（逗号分隔）",
                                     placeholder="例如: 2girls,multiple_girls",
                                     lines=1
                                 )
@@ -2355,22 +3257,22 @@ class Script(scripts.Script):
                                 )
                                 filter_preview_limit = gr.Number(label="预览数量", minimum=1, maximum=2000, value=200, step=1, precision=0)
                                 filter_rule_limit = gr.Number(label="规则读取上限（0=不限）", minimum=0, maximum=100000, value=0, step=1, precision=0)
-                            
+
                             with gr.Row():
                                 filter_search_btn = gr.Button("🔍 筛选标签", variant="primary")
                                 filter_quick_use_btn = gr.Button("⚡ 直接启用当前筛选", variant="secondary")
                                 filter_create_rule_pool_btn = gr.Button("✅ 保存并启用规则池", variant="primary")
                             filter_result_msg = gr.Textbox(label="筛选结果", interactive=False, lines=1)
-                            
+
                             filter_results = gr.Dataframe(
-                                headers=["序号", "Booru", "Post ID", "Score", "Rating", "Tags"],
+                                headers=["序号", "Booru", "Post ID", "Score", "Rating", "Tags", "内部 ID"],
                                 label="筛选预览",
                                 interactive=False,
                                 wrap=True
                             )
 
                             filter_rule_name = gr.Textbox(label="规则名称", placeholder="可留空自动生成", lines=1)
-                            
+
                             with gr.Row():
                                 filter_selected_ids = gr.Textbox(
                                     label="手动缓存序号（可选，逗号分隔）",
@@ -2387,7 +3289,7 @@ class Script(scripts.Script):
                                     lines=1,
                                 )
                                 filter_create_range_pool_btn = gr.Button("✅ 用范围创建筛选池")
-                            
+
                             with gr.Row():
                                 filter_pool_status = gr.Textbox(
                                     label="筛选池状态",
@@ -2396,14 +3298,14 @@ class Script(scripts.Script):
                                     lines=1
                                 )
                                 filter_refresh_status_btn = gr.Button("🔄 刷新")
-                            
+
                             with gr.Row():
                                 filter_use_pool = gr.Checkbox(label="使用筛选池（而非主缓存）", value=tag_cache_manager.is_using_filtered_pool())
                                 filter_switch_btn = gr.Button("🔄 切换")
                                 filter_rule_id = gr.Textbox(label="规则 ID", placeholder="例如: 3", lines=1)
                                 filter_activate_rule_btn = gr.Button("启用规则")
                                 filter_delete_rule_btn = gr.Button("删除规则", variant="stop")
-                            
+
                             filter_pool_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
                             with gr.Row():
                                 filter_list_rules_btn = gr.Button("刷新规则列表")
@@ -2472,20 +3374,29 @@ class Script(scripts.Script):
 
         cache_next_btn.click(
             fn=self._cache_get_next,
-            inputs=[cache_loop_mode],
+            inputs=[cache_loop_mode, use_preconverted_cache_prompt],
             outputs=[cache_next_output, cache_status_display]
         )
 
         cache_lookup_id_btn.click(
             fn=self._cache_fill_by_position,
-            inputs=[cache_lookup_id],
+            inputs=[cache_lookup_id, use_preconverted_cache_prompt],
             outputs=[cache_next_output, cache_status_display]
         )
 
         cache_lookup_id_set_btn.click(
             fn=self._cache_fill_position_to_tag_prompt,
-            inputs=[cache_lookup_id, tag_prompt_input, cache_prompt_write_mode],
-            outputs=[cache_next_output, cache_status_display, tag_prompt_input]
+            inputs=[
+                cache_lookup_id,
+                tag_prompt_input,
+                cache_prompt_write_mode,
+                use_preconverted_cache_prompt,
+            ],
+            outputs=[
+                cache_next_output,
+                cache_status_display,
+                tag_prompt_input,
+            ]
         )
 
         cache_jump_position_btn.click(
@@ -2496,7 +3407,11 @@ class Script(scripts.Script):
 
         cache_jump_take_btn.click(
             fn=self._cache_jump_take,
-            inputs=[cache_jump_position, cache_loop_mode],
+            inputs=[
+                cache_jump_position,
+                cache_loop_mode,
+                use_preconverted_cache_prompt,
+            ],
             outputs=[cache_next_output, cache_status_display]
         )
 
@@ -2504,6 +3419,81 @@ class Script(scripts.Script):
             fn=self._cache_preview_next,
             inputs=[],
             outputs=[cache_preview_output]
+        )
+
+        cache_natural_language_save_settings_btn.click(
+            fn=self._save_natural_language_settings,
+            inputs=[
+                cache_natural_language_preset,
+                cache_natural_language_backend,
+                cache_natural_language_endpoint_policy,
+                cache_natural_language_endpoint,
+                cache_natural_language_model,
+                cache_natural_language_api_key,
+                cache_natural_language_timeout,
+            ],
+            outputs=[cache_natural_language_settings_status],
+        )
+        cache_natural_language_clear_settings_btn.click(
+            fn=self._clear_natural_language_settings,
+            inputs=[],
+            outputs=[
+                cache_natural_language_preset,
+                cache_natural_language_backend,
+                cache_natural_language_endpoint_policy,
+                cache_natural_language_endpoint,
+                cache_natural_language_model,
+                cache_natural_language_api_key,
+                cache_natural_language_timeout,
+                cache_natural_language_settings_status,
+            ],
+        )
+
+        cache_natural_language_preview_btn.click(
+            fn=self._cache_preview_natural_conversion,
+            inputs=[
+                cache_natural_language_positions,
+                cache_natural_language_only_missing,
+            ],
+            outputs=[cache_natural_language_preview],
+        )
+        natural_conversion_event = cache_natural_language_convert_btn.click(
+            fn=self._cache_batch_convert_natural,
+            inputs=[
+                cache_natural_language_positions,
+                cache_natural_language_only_missing,
+                cache_natural_language_preset,
+                cache_natural_language_backend,
+                cache_natural_language_endpoint_policy,
+                cache_natural_language_endpoint,
+                cache_natural_language_model,
+                cache_natural_language_api_key,
+                cache_natural_language_timeout,
+            ],
+            outputs=[
+                cache_natural_language_preview,
+                cache_natural_language_status,
+            ],
+        )
+        cache_natural_language_cancel_btn.click(
+            fn=self._cancel_natural_batch,
+            inputs=[],
+            outputs=[cache_natural_language_preview],
+            cancels=[natural_conversion_event],
+            queue=False,
+        )
+        cache_natural_language_clear_btn.click(
+            fn=self._cache_clear_natural_conversion,
+            inputs=[cache_natural_language_positions],
+            outputs=[
+                cache_natural_language_preview,
+                cache_natural_language_status,
+            ],
+        )
+        cache_natural_language_refresh_btn.click(
+            fn=self._natural_language_cache_status,
+            inputs=[],
+            outputs=[cache_natural_language_status],
         )
 
         cache_reset_btn.click(
@@ -2597,19 +3587,19 @@ class Script(scripts.Script):
         )
 
         cache_fill_btn.click(
-            fn=self._cache_fill_by_position,
-            inputs=[cache_select_id],
+            fn=self._cache_fill_by_id,
+            inputs=[cache_select_id, use_preconverted_cache_prompt],
             outputs=[cache_next_output, cache_manage_result]
         )
 
         cache_delete_id_btn.click(
-            fn=self._cache_delete_by_position,
+            fn=self._cache_delete_by_id,
             inputs=[cache_select_id],
             outputs=[cache_manage_result, cache_status_display]
         )
 
         cache_preview_delete_id_btn.click(
-            fn=self._cache_preview_delete_by_position,
+            fn=self._cache_preview_delete_by_id,
             inputs=[cache_select_id],
             outputs=[cache_delete_preview]
         )
@@ -2708,14 +3698,35 @@ class Script(scripts.Script):
             # Tag Cache: 取出并设置到提示词
             cache_next_set_btn.click(
                 fn=self._cache_get_next_and_set,
-                inputs=[cache_loop_mode, tag_prompt_input, target_prompt_box, cache_prompt_write_mode],
-                outputs=[cache_next_output, cache_status_display, target_prompt_box]
+                inputs=[
+                    cache_loop_mode,
+                    tag_prompt_input,
+                    target_prompt_box,
+                    cache_prompt_write_mode,
+                    use_preconverted_cache_prompt,
+                ],
+                outputs=[
+                    cache_next_output,
+                    cache_status_display,
+                    target_prompt_box,
+                ]
             )
 
             cache_jump_take_set_btn.click(
                 fn=self._cache_jump_take_and_set,
-                inputs=[cache_jump_position, cache_loop_mode, tag_prompt_input, target_prompt_box, cache_prompt_write_mode],
-                outputs=[cache_next_output, cache_status_display, target_prompt_box]
+                inputs=[
+                    cache_jump_position,
+                    cache_loop_mode,
+                    tag_prompt_input,
+                    target_prompt_box,
+                    cache_prompt_write_mode,
+                    use_preconverted_cache_prompt,
+                ],
+                outputs=[
+                    cache_next_output,
+                    cache_status_display,
+                    target_prompt_box,
+                ]
             )
         else:
             generate_prompt_btn.click(
@@ -2727,17 +3738,21 @@ class Script(scripts.Script):
             # Tag Cache: 取出到输出框（无法设置到主提示词框）
             cache_next_set_btn.click(
                 fn=self._cache_get_next,
-                inputs=[cache_loop_mode],
+                inputs=[cache_loop_mode, use_preconverted_cache_prompt],
                 outputs=[cache_next_output, cache_status_display]
             )
 
             cache_jump_take_set_btn.click(
                 fn=self._cache_jump_take,
-                inputs=[cache_jump_position, cache_loop_mode],
+                inputs=[
+                    cache_jump_position,
+                    cache_loop_mode,
+                    use_preconverted_cache_prompt,
+                ],
                 outputs=[cache_next_output, cache_status_display]
             )
 
-        return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, cache_prompt_write_mode]
+        return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, cache_prompt_write_mode, use_preconverted_cache_prompt]
 
     def check_orientation(self, img):
         """Check if image is portrait, landscape or square"""
@@ -2768,11 +3783,11 @@ class Script(scripts.Script):
                 custom_weights = []
                 if lora_custom_weights != '':
                     custom_weights = [value.strip() for value in lora_custom_weights.split(',')]
-                for l in range(0, lora_amount):
+                for lora_index in range(0, lora_amount):
                     lora_weight = 0
-                    if l < len(custom_weights):
+                    if lora_index < len(custom_weights):
                         try:
-                            lora_weight = float(custom_weights[l])
+                            lora_weight = float(custom_weights[lora_index])
                         except Exception:
                             lora_weight = 0
                     if float(lora_min) == 0 and float(lora_max) == 0:
@@ -2792,22 +3807,19 @@ class Script(scripts.Script):
     def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
         max_pages = _normalize_max_pages(max_pages)
         cache_prompt_write_mode = args[0] if args else "追加到后面"
-        if use_cache:
-            if HAS_REQUESTS_CACHE and not requests_cache.patcher.is_installed():
-                requests_cache.install_cache('ranbooru_cache', backend='sqlite', expire_after=3600)
-            elif not HAS_REQUESTS_CACHE:
-                print('requests-cache not installed; running without cache')
-        else:
-            if HAS_REQUESTS_CACHE and requests_cache.patcher.is_installed():
-                requests_cache.uninstall_cache()
-        
+        use_preconverted_cache_prompt = bool(args[1]) if len(args) > 1 else True
+        job_id = _processing_job_id(p)
+        if self._active_job_id != job_id and not _is_hires_second_pass(p):
+            self._active_job_id = job_id
+            self.last_img = []
+            self.real_steps = 0
+            self.original_prompt = p.prompt if isinstance(p.prompt, list) else str(p.prompt or '')
+        if use_cache and not HAS_REQUESTS_CACHE:
+            print('requests-cache not installed; running without cache')
+
         if enabled:
             if use_local_cache_gen:
                 # 任务ID（A1111 通常有 job_timestamp）
-                job_id = getattr(shared.state, "job_timestamp", None)
-                if job_id is None:
-                    # 兜底，避免没有 job_timestamp 时无法去重
-                    job_id = f"{getattr(p, 'seed', '')}:{getattr(p, 'n_iter', '')}:{getattr(p, 'batch_size', '')}:{id(p)}"
                 # 1) 先拦截 Hires.fix 第二段
                 if _is_hires_second_pass(p):
                     print("[Ranbooru] 🟡 Hires.fix 第二段，跳过本地缓存取Tag（不推进索引）")
@@ -2816,63 +3828,76 @@ class Script(scripts.Script):
                 if job_id in self._local_cache_applied_jobs:
                     print(f"[Ranbooru] 🟡 任务 {job_id} 已注入过缓存，跳过重复注入（不推进索引）")
                     return
-                self._local_cache_applied_jobs.add(job_id)
-                # 可选：防止 set 无限增长
-                if len(self._local_cache_applied_jobs) > 200:
-                    self._local_cache_applied_jobs.clear()
+                # Keep the current job in the dedupe set while bounding memory.
+                # Clearing the whole set here used to remove the just-added job
+                # at the 201st entry, allowing a second hook call to advance the
+                # shared cache cursor twice.
+                if len(self._local_cache_applied_jobs) >= 200:
+                    oldest_job_id = next(iter(self._local_cache_applied_jobs))
+                    self._local_cache_applied_jobs.pop(oldest_job_id, None)
+                self._local_cache_applied_jobs[job_id] = None
                 print("[Ranbooru] 🟢 已启用本地缓存模式，执行一次缓存注入。")
                 # 下面保持你原来的取缓存逻辑不变...
-                
+
                 # 计算本次批量生成的总数量 (Batch count * Batch size)
                 total_images = p.batch_size * p.n_iter
-                cache_prompts = []
-                # 为每一张图按顺序取出一个 Tag 串
-                for i in range(total_images):
-                    # 从缓存管理器获取下一条（自动判断使用主缓存还是筛选池）
-                    tags_str, idx, total = tag_cache_manager.get_next_tags_from_pool(loop=use_local_cache_loop)
-                    
-                    if tags_str is None:
-                        print(f"[Ranbooru] ⚠️ 缓存已耗尽 (Index: {idx}/{total})，停止注入。")
-                        tags_str = ""
-                    else:
-                        print(f"[Ranbooru] 📝 正在使用第 {idx} / {total} 条 Tag 数据")
-                    
-                    # 处理下划线
-                    if change_dash:
-                        tags_str = tags_str.replace("_", " ")
-                    
-                    cache_prompts.append(tags_str)
+                cache_entries, idx, total = tag_cache_manager.get_next_tags_batch_from_pool(
+                    total_images,
+                    loop=use_local_cache_loop,
+                    prefer_natural=use_preconverted_cache_prompt,
+                    include_prompt_metadata=True,
+                )
+                cache_prompts = [entry["prompt"] for entry in cache_entries]
+                natural_prompt_flags = [bool(entry["is_natural"]) for entry in cache_entries]
+                if len(cache_prompts) < total_images:
+                    print(
+                        f"[Ranbooru] ⚠️ 缓存已耗尽 "
+                        f"(Index: {idx}/{total})，缺少 {total_images - len(cache_prompts)} 条。"
+                    )
+                    cache_prompts.extend([""] * (total_images - len(cache_prompts)))
+                    natural_prompt_flags.extend(
+                        [False] * (total_images - len(natural_prompt_flags))
+                    )
+                else:
+                    print(
+                        f"[Ranbooru] 📝 已原子读取 {len(cache_prompts)} 条缓存 "
+                        f"(Index: {idx}/{total})"
+                    )
+                if change_dash:
+                    cache_prompts = [
+                        prompt if natural_prompt_flags[index] else prompt.replace("_", " ")
+                        for index, prompt in enumerate(cache_prompts)
+                    ]
                 # 将缓存的 Tag 追加到用户输入的 Prompt 后面
                 # 如果 p.prompt 是字符串（单张），转为列表处理；如果是列表（多张），则一一对应
-                if isinstance(p.prompt, list):
-                    # 如果原 prompt 列表比我们生成的少，就扩展它
-                    if len(p.prompt) < total_images:
-                        p.prompt = p.prompt * (total_images // len(p.prompt) + 1)
-                    
-                    # 组合
-                    new_prompts = []
-                    for j in range(total_images):
-                        original = p.prompt[j] if j < len(p.prompt) else ""
-                        addition = cache_prompts[j]
-                        combined = Script._apply_write_mode(original, addition, cache_prompt_write_mode)
-                        new_prompts.append(combined)
-                    p.prompt = new_prompts
-                    _sync_prompt_lists(p)
-                else:
-                    # 单字符串情况
-                    new_prompts = []
-                    for j in range(total_images):
-                        original = p.prompt
-                        addition = cache_prompts[j]
-                        combined = Script._apply_write_mode(original, addition, cache_prompt_write_mode)
-                        new_prompts.append(combined)
-                    p.prompt = new_prompts
-                    _sync_prompt_lists(p)
+                p = self._apply_local_cache_prompt_pipeline(
+                    p,
+                    cache_prompts,
+                    natural_prompt_flags,
+                    cache_prompt_write_mode,
+                    same_prompt,
+                    shuffle_tags,
+                    remove_bad_tags,
+                    remove_tags,
+                    change_background,
+                    change_color,
+                    chaos_mode,
+                    negative_mode,
+                    chaos_amount,
+                    limit_tags,
+                    max_tags,
+                    use_same_seed,
+                )
                 # 处理 Lora (保留原有的 Lora 逻辑)
                 if lora_enabled:
                     p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev)
                     _sync_prompt_lists(p)
-                
+                if use_img2img or use_ip or use_deepbooru:
+                    print(
+                        "[Ranbooru] Local cache prompt mode has no guaranteed source image; "
+                        "Img2Img, ControlNet image injection and DeepBooru were skipped for this task."
+                    )
+
                 # 直接结束 before_process，跳过后续所有联网代码
                 return
             gelbooru_api_key = None
@@ -2884,7 +3909,7 @@ class Script(scripts.Script):
                 if api_key.strip() and user_id.strip():
                     gelbooru_api_key = api_key.strip()
                     gelbooru_user_id = user_id.strip()
-                    
+
                     # Save credentials if checkbox is checked
                     if save_credentials:
                         credentials_manager.save_booru_credentials('gelbooru', gelbooru_api_key, gelbooru_user_id)
@@ -2903,19 +3928,7 @@ class Script(scripts.Script):
                     saved_credentials = credentials_manager.get_booru_credentials('rule34')
                     rule34_api_key = saved_credentials.get('api_key', '')
                     rule34_user_id = saved_credentials.get('user_id', '')
-            
-            # Initialize APIs
-            booru_apis = {
-                'gelbooru': Gelbooru(fringe_benefits, gelbooru_api_key, gelbooru_user_id),
-                'rule34': Rule34(rule34_api_key, rule34_user_id),
-                'safebooru': Safebooru(),
-                'danbooru': Danbooru(),
-                'konachan': Konachan(),
-                'yande.re': Yandere(),
-                'aibooru': AIBooru(),
-                'xbooru': XBooru(),
-                'e621': e621(),
-            }
+
             self.original_prompt = p.prompt if isinstance(p.prompt, list) else str(p.prompt or '')
             # Check if compatible
             try:
@@ -2991,34 +4004,38 @@ class Script(scripts.Script):
             prompts = []
             last_img = []
             preview_urls = []
-            api_url = booru_apis.get(booru, Gelbooru(fringe_benefits))
+            api_url = _create_booru_api(
+                booru,
+                fringe_benefits,
+                gelbooru_api_key,
+                gelbooru_user_id,
+                rule34_api_key,
+                rule34_user_id,
+            )
+            api_url.configure_http_cache(use_cache)
             print(f'Using {booru}')
 
             # Manage Post ID
             try:
-                data = _fetch_booru_data(api_url, booru, add_tags, max_pages, post_id, tag_categories)
+                posts = _fetch_booru_posts_with_fallback(
+                    api_url,
+                    booru,
+                    add_tags,
+                    max_pages,
+                    post_id,
+                    tag_categories,
+                    tags,
+                    mature_rating,
+                )
+                print(re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(api_url.booru_url)))
             except Exception as error:
                 print(_format_ranbooru_error(booru, error))
                 return p
-
-            print(re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(api_url.booru_url)))
-            posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
+            finally:
+                api_url.close()
             if len(posts) == 0:
-                if booru == 'rule34' and add_tags.startswith('&tags=-animated'):
-                    fallback_add_tags = '&tags='
-                    if tags:
-                        fallback_add_tags += tags.replace(',', '+')
-                    fallback_add_tags += _get_rating_tag(booru, mature_rating)
-                    try:
-                        data = api_url.get_data(fallback_add_tags, max_pages)
-                    except Exception as error:
-                        print(_format_ranbooru_error(booru, error))
-                        return p
-                    posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
-                if len(posts) == 0:
-                    print('No posts found; skipping Ranbooru prompt injection.')
-                    return p
-            COUNT = len(posts)
+                print('No posts found; skipping Ranbooru prompt injection.')
+                return p
             data = {'post': posts}
             # Replace null scores with 0s
             for post in posts:
@@ -3070,11 +4087,26 @@ class Script(scripts.Script):
             # Get Images
             if use_img2img or use_deepbooru:
                 image_urls = [_get_post_file_url(random_post)] if use_last_img else preview_urls
-
-                for img in image_urls:
-                    image = _fetch_image(api_url.fetch_with_retry, img, headers=api_url.headers)
-                    if image is not None:
-                        last_img.append(image)
+                image_api_url = _create_booru_api(
+                    booru,
+                    fringe_benefits,
+                    gelbooru_api_key,
+                    gelbooru_user_id,
+                    rule34_api_key,
+                    rule34_user_id,
+                )
+                image_api_url.configure_http_cache(use_cache)
+                try:
+                    for img in image_urls:
+                        image = _fetch_image(
+                            image_api_url.fetch_with_retry,
+                            img,
+                            headers=image_api_url.headers,
+                        )
+                        if image is not None:
+                            last_img.append(image)
+                finally:
+                    image_api_url.close()
                 if not last_img:
                     print('[Ranbooru] Could not fetch any images; disabling img2img/DeepBooru for this run.')
                     use_img2img = False
@@ -3195,7 +4227,10 @@ class Script(scripts.Script):
                             choices = [tag for tag in str(p.negative_prompt[num] or '').split(',') if tag]
                             if not choices:
                                 break
-                            p.negative_prompt[num] += random.choice(choices)
+                            p.negative_prompt[num] = _append_tags(
+                                p.negative_prompt[num],
+                                random.choice(choices),
+                            )
                             # p.negative_prompt[num] += '_'
                             neg = get_prompt_lengths(p.negative_prompt[num])[1]
 
@@ -3293,19 +4328,21 @@ class Script(scripts.Script):
             processed.infotexts = proc.infotexts
             if use_last_img:
                 processed.images.append(self.last_img[0])
-        else:
-            if hasattr(self, 'last_img') and self.last_img:
-                for img in self.last_img:
-                    processed.images.append(img)
+            self.last_img = []
+            self.real_steps = 0
+        elif (
+            enabled
+            and use_last_img
+            and self._active_job_id == _processing_job_id(p)
+            and self.last_img
+        ):
+            processed.images.extend(self.last_img)
+            self.last_img = []
 
     def generate_prompts_only(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_categories):
         max_pages = _normalize_max_pages(max_pages)
-        if use_cache:
-            if HAS_REQUESTS_CACHE and not requests_cache.patcher.is_installed():
-                requests_cache.install_cache('ranbooru_cache', backend='sqlite', expire_after=3600)
-        else:
-            if HAS_REQUESTS_CACHE and requests_cache.patcher.is_installed():
-                requests_cache.uninstall_cache()
+        if use_cache and not HAS_REQUESTS_CACHE:
+            print('requests-cache not installed; running without cache')
 
         gelbooru_api_key = None
         gelbooru_user_id = None
@@ -3331,18 +4368,6 @@ class Script(scripts.Script):
                 saved_credentials = credentials_manager.get_booru_credentials('rule34')
                 rule34_api_key = saved_credentials.get('api_key', '')
                 rule34_user_id = saved_credentials.get('user_id', '')
-
-        booru_apis = {
-            'gelbooru': Gelbooru(fringe_benefits, gelbooru_api_key, gelbooru_user_id),
-            'rule34': Rule34(rule34_api_key, rule34_user_id),
-            'safebooru': Safebooru(),
-            'danbooru': Danbooru(),
-            'konachan': Konachan(),
-            'yande.re': Yandere(),
-            'aibooru': AIBooru(),
-            'xbooru': XBooru(),
-            'e621': e621(),
-        }
 
         # Use global DEFAULT_BAD_TAGS
         bad_tags = []
@@ -3393,22 +4418,33 @@ class Script(scripts.Script):
             add_tags += '+' + tags.replace(',', '+')
         add_tags += _get_rating_tag(booru, mature_rating)
 
-        api_url = booru_apis.get(booru, Gelbooru(fringe_benefits, gelbooru_api_key, gelbooru_user_id))
+        api_url = _create_booru_api(
+            booru,
+            fringe_benefits,
+            gelbooru_api_key,
+            gelbooru_user_id,
+            rule34_api_key,
+            rule34_user_id,
+        )
+        api_url.configure_http_cache(use_cache)
         try:
-            data = _fetch_booru_data(api_url, booru, add_tags, max_pages, post_id, tag_categories)
-        except Exception as error:
-            return _format_ranbooru_error(booru, error)
-        posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
-        if len(posts) == 0 and booru == 'rule34' and add_tags.startswith('&tags=-animated'):
-            ft = '&tags='
-            if tags:
-                ft += tags.replace(',', '+')
-            ft += _get_rating_tag(booru, mature_rating)
             try:
-                data = api_url.get_data(ft, max_pages)
+                data = _fetch_booru_data(api_url, booru, add_tags, max_pages, post_id, tag_categories)
             except Exception as error:
                 return _format_ranbooru_error(booru, error)
             posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
+            if len(posts) == 0 and booru == 'rule34' and add_tags.startswith('&tags=-animated'):
+                ft = '&tags='
+                if tags:
+                    ft += tags.replace(',', '+')
+                ft += _get_rating_tag(booru, mature_rating)
+                try:
+                    data = api_url.get_data(ft, max_pages)
+                except Exception as error:
+                    return _format_ranbooru_error(booru, error)
+                posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
+        finally:
+            api_url.close()
         if len(posts) == 0:
             return NO_POSTS_MESSAGE
 
