@@ -181,6 +181,36 @@ class RanbooruStaticContractTests(unittest.TestCase):
         self.assertNotIn("cache_next_raw_state", self.source)
         self.assertNotIn("_cache_get_next_with_state", self.source)
 
+    def test_cache_filter_panel_and_callbacks_are_gone(self):
+        ui_source = ast.unparse(self.methods["ui"])
+        self.assertNotIn("缓存筛选 / 标签筛选池", ui_source)
+        self.assertNotIn("filter_search_btn", ui_source)
+        self.assertNotIn("filter_create_rule_pool_btn", ui_source)
+        self.assertNotIn("filter_switch_btn", ui_source)
+        for method_name in (
+            "_filter_tags",
+            "_create_filtered_pool",
+            "_create_filtered_pool_by_range",
+            "_create_filtered_pool_from_filter",
+            "_use_filter_once",
+            "_list_rules",
+            "_activate_rule",
+            "_delete_rule",
+            "_delete_filter_matches",
+            "_preview_filter_matches",
+            "_switch_to_filtered_pool",
+            "_get_filtered_pool_status",
+        ):
+            self.assertNotIn(method_name, self.methods)
+
+    def test_legacy_filtered_pool_is_disabled_on_module_load(self):
+        self.assertIn(
+            "tag_cache_manager = TagCacheManager(user_cache_dir)\n"
+            "if tag_cache_manager.is_using_filtered_pool():\n"
+            "    tag_cache_manager.use_filtered_pool(False)",
+            self.source,
+        )
+
     def test_hires_detection_only_uses_explicit_host_phase(self):
         function = next(
             node

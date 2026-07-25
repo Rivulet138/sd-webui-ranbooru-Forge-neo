@@ -161,6 +161,8 @@ except ImportError:
 
 
 tag_cache_manager = TagCacheManager(user_cache_dir)
+if tag_cache_manager.is_using_filtered_pool():
+    tag_cache_manager.use_filtered_pool(False)
 _natural_batch_lock = threading.Lock()
 _natural_batch_cancel = threading.Event()
 _natural_endpoint_policy_choices = list(NATURAL_LANGUAGE_ENDPOINT_POLICIES)
@@ -2107,12 +2109,7 @@ class Script(scripts.Script):
 
     @staticmethod
     def _cache_refresh_status():
-        pool_status = tag_cache_manager.get_filtered_pool_status()
-        using_pool = tag_cache_manager.is_using_filtered_pool()
-        status_msg = f"{tag_cache_manager.get_status()} | {pool_status}"
-        if using_pool:
-            status_msg += " [当前使用筛选池]"
-        return status_msg
+        return tag_cache_manager.get_status()
 
     @staticmethod
     def _format_cache_preview(record):
@@ -2657,49 +2654,11 @@ class Script(scripts.Script):
         )
 
     @staticmethod
-    def _filter_tags(query, must_include, must_exclude, sort_order, preview_limit):
-        """筛选标签"""
-        try:
-            results = tag_cache_manager.filter_tags_by_keywords(
-                must_include, must_exclude, query, sort_order=sort_order, limit=int(preview_limit or 200)
-            )
-            if not results:
-                return [], "未找到匹配的标签"
-            return results, f"找到 {len(results)} 条匹配标签"
-        except Exception as e:
-            print(f"[Filter] Error: {e}")
-            return [], f"筛选出错: {e}"
-
-    @staticmethod
-    def _create_filtered_pool(selected_ids_str):
-        """创建筛选池"""
-        try:
-            if not selected_ids_str or not selected_ids_str.strip():
-                return "请输入要添加的缓存序号（逗号分隔）", tag_cache_manager.get_filtered_pool_status()
-
-            id_list = list(dict.fromkeys(int(x) for x in re.findall(r"\d+", selected_ids_str)))
-            if not id_list:
-                return "未找到有效的缓存序号", tag_cache_manager.get_filtered_pool_status()
-
-            count = tag_cache_manager.create_filtered_pool_by_positions(id_list)
-            return f"✅ 筛选池已创建，包含 {count} 条标签", tag_cache_manager.get_filtered_pool_status()
-        except Exception as e:
-            print(f"[FilterPool] Error: {e}")
-            return f"创建失败: {e}", tag_cache_manager.get_filtered_pool_status()
-
-    @staticmethod
     def _cache_delete_by_position_range(position_spec):
         if not str(position_spec or "").strip():
             return "请输入要删除的缓存序号或范围，例如 100-140, 150", tag_cache_manager.get_status()
         deleted, requested = tag_cache_manager.delete_by_position_spec(position_spec)
         return f"已请求 {requested} 个序号，删除 {deleted} 条缓存", tag_cache_manager.get_status()
-
-    @staticmethod
-    def _create_filtered_pool_by_range(position_spec):
-        if not str(position_spec or "").strip():
-            return "请输入要加入筛选池的缓存序号或范围，例如 110-180, 205", tag_cache_manager.get_filtered_pool_status()
-        count, requested = tag_cache_manager.create_filtered_pool_by_position_spec(position_spec)
-        return f"已请求 {requested} 个序号，筛选池包含 {count} 条", tag_cache_manager.get_filtered_pool_status()
 
     @staticmethod
     def _cache_export(file_format):
@@ -2751,81 +2710,6 @@ class Script(scripts.Script):
     @staticmethod
     def _cache_import_preflight(file_path, append_mode, dedupe):
         return Script._format_import_preview(tag_cache_manager.preview_import_records(file_path, append=append_mode, dedupe=dedupe))
-
-    @staticmethod
-    def _create_filtered_pool_from_filter(rule_name, query, must_include, must_exclude, sort_order, limit_count):
-        """Create and activate a saved rule pool from include/exclude rules."""
-        try:
-            rule_id, count = tag_cache_manager.create_rule(
-                rule_name, query, must_include, must_exclude, sort_order, int(limit_count or 0)
-            )
-            if count <= 0:
-                return f"规则 #{rule_id} 已创建，但当前没有匹配条目", tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
-            return f"规则池已创建并启用：#{rule_id}，当前匹配 {count} 条", tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
-        except Exception as e:
-            print(f"[FilterPool] Error: {e}")
-            return f"创建失败: {e}", tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
-
-    @staticmethod
-    def _use_filter_once(query, must_include, must_exclude, sort_order, limit_count):
-        try:
-            count = tag_cache_manager.create_filtered_pool_by_keywords(
-                must_include, must_exclude, query, sort_order=sort_order, limit=int(limit_count or 0)
-            )
-            if count <= 0:
-                return "当前筛选没有命中缓存条目", tag_cache_manager.get_filtered_pool_status()
-            msg = tag_cache_manager.use_filtered_pool(True)
-            return f"{msg}: {count} 条", tag_cache_manager.get_filtered_pool_status()
-        except Exception as e:
-            print(f"[FilterPool] Error: {e}")
-            return f"筛选失败: {e}", tag_cache_manager.get_filtered_pool_status()
-
-    @staticmethod
-    def _list_rules():
-        return tag_cache_manager.list_rules()
-
-    @staticmethod
-    def _activate_rule(rule_id):
-        cache_id = Script._parse_cache_id(rule_id)
-        if cache_id is None:
-            return "请输入有效的规则 ID", tag_cache_manager.get_filtered_pool_status()
-        return tag_cache_manager.activate_rule(cache_id), tag_cache_manager.get_filtered_pool_status()
-
-    @staticmethod
-    def _delete_rule(rule_id):
-        cache_id = Script._parse_cache_id(rule_id)
-        if cache_id is None:
-            return "请输入有效的规则 ID", tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
-        ok = tag_cache_manager.delete_rule(cache_id)
-        msg = f"已删除规则 #{cache_id}" if ok else f"未找到规则 #{cache_id}"
-        return msg, tag_cache_manager.get_filtered_pool_status(), tag_cache_manager.list_rules()
-
-    @staticmethod
-    def _delete_filter_matches(query, must_include, must_exclude):
-        try:
-            if not any(str(value or "").strip() for value in (query, must_include, must_exclude)):
-                return "请先输入搜索语法、包含或排除条件，避免误删全部缓存", tag_cache_manager.get_status()
-            count = tag_cache_manager.delete_by_filter(must_include, must_exclude, query)
-            return f"已删除当前筛选命中的 {count} 条缓存", tag_cache_manager.get_status()
-        except Exception as e:
-            return f"删除失败: {e}", tag_cache_manager.get_status()
-
-    @staticmethod
-    def _preview_filter_matches(query, must_include, must_exclude):
-        if not any(str(value or "").strip() for value in (query, must_include, must_exclude)):
-            return "请先输入搜索语法、包含或排除条件，避免预览全部缓存"
-        return Script._format_delete_preview(tag_cache_manager.preview_delete_by_filter(must_include, must_exclude, query))
-
-    @staticmethod
-    def _switch_to_filtered_pool(use_pool):
-        """切换到筛选池"""
-        msg = tag_cache_manager.use_filtered_pool(use_pool)
-        return msg, tag_cache_manager.get_filtered_pool_status()
-
-    @staticmethod
-    def _get_filtered_pool_status():
-        """获取筛选池状态"""
-        return tag_cache_manager.get_filtered_pool_status()
 
     def ui(self, is_img2img):
         default_booru = "safebooru"
@@ -3030,7 +2914,7 @@ class Script(scripts.Script):
                                 )
                             with gr.Accordion("批量预转换缓存为自然语言", open=False):
                                 gr.Markdown(
-                                    "按当前活动缓存（主缓存、临时筛选池或规则池）的**可见序号**选择几十或"
+                                    "按主缓存的**可见序号**选择几十或"
                                     "几百条记录；每条记录的整个 `tags_prompt` 会一次性转换并保存到数据库的"
                                     "独立自然语言字段，原始 Tag 不会被覆盖。生成和手动写入时只读取已保存"
                                     "结果，未转换的记录自动回退为原始 Tag，不会临时调用模型。\n\n"
@@ -3228,94 +3112,6 @@ class Script(scripts.Script):
                                 cache_import_btn = gr.Button("导入缓存", variant="primary")
                             cache_import_export_result = gr.Textbox(label="导入/导出结果", interactive=False, lines=8)
                             cache_manage_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
-
-                        # ─── 标签筛选池面板 ────────────────────────────────
-                        with gr.Accordion("缓存筛选 / 标签筛选池", open=False):
-                            gr.Markdown("### 🎯 直接筛选缓存，必要时再保存为规则池")
-                            filter_query = gr.Textbox(
-                                label="搜索语法",
-                                placeholder="例如: +1girl +blue_eyes -2girls -text",
-                                lines=1
-                            )
-
-                            with gr.Row():
-                                filter_must_include = gr.Textbox(
-                                    label="必须包含（逗号分隔）",
-                                    placeholder="例如: 1girl,blue_eyes",
-                                    lines=1
-                                )
-                                filter_must_exclude = gr.Textbox(
-                                    label="必须排除（逗号分隔）",
-                                    placeholder="例如: 2girls,multiple_girls",
-                                    lines=1
-                                )
-                            with gr.Row():
-                                filter_sort_order = gr.Dropdown(
-                                    ["ID", "Newest", "Oldest", "High Score", "Low Score", "Random"],
-                                    label="规则排序",
-                                    value="ID"
-                                )
-                                filter_preview_limit = gr.Number(label="预览数量", minimum=1, maximum=2000, value=200, step=1, precision=0)
-                                filter_rule_limit = gr.Number(label="规则读取上限（0=不限）", minimum=0, maximum=100000, value=0, step=1, precision=0)
-
-                            with gr.Row():
-                                filter_search_btn = gr.Button("🔍 筛选标签", variant="primary")
-                                filter_quick_use_btn = gr.Button("⚡ 直接启用当前筛选", variant="secondary")
-                                filter_create_rule_pool_btn = gr.Button("✅ 保存并启用规则池", variant="primary")
-                            filter_result_msg = gr.Textbox(label="筛选结果", interactive=False, lines=1)
-
-                            filter_results = gr.Dataframe(
-                                headers=["序号", "Booru", "Post ID", "Score", "Rating", "Tags", "内部 ID"],
-                                label="筛选预览",
-                                interactive=False,
-                                wrap=True
-                            )
-
-                            filter_rule_name = gr.Textbox(label="规则名称", placeholder="可留空自动生成", lines=1)
-
-                            with gr.Row():
-                                filter_selected_ids = gr.Textbox(
-                                    label="手动缓存序号（可选，逗号分隔）",
-                                    placeholder="例如: 1,5,10,23",
-                                    lines=1
-                                )
-                                filter_create_pool_btn = gr.Button("✅ 用手动序号创建筛选池")
-                                filter_preview_delete_matches_btn = gr.Button("预览删除当前筛选")
-                                filter_delete_matches_btn = gr.Button("🗑️ 删除当前筛选命中", variant="stop")
-                            with gr.Row():
-                                filter_range_positions = gr.Textbox(
-                                    label="按序号/范围创建筛选池",
-                                    placeholder="例如: 110-180, 205",
-                                    lines=1,
-                                )
-                                filter_create_range_pool_btn = gr.Button("✅ 用范围创建筛选池")
-
-                            with gr.Row():
-                                filter_pool_status = gr.Textbox(
-                                    label="筛选池状态",
-                                    value=tag_cache_manager.get_filtered_pool_status(),
-                                    interactive=False,
-                                    lines=1
-                                )
-                                filter_refresh_status_btn = gr.Button("🔄 刷新")
-
-                            with gr.Row():
-                                filter_use_pool = gr.Checkbox(label="使用筛选池（而非主缓存）", value=tag_cache_manager.is_using_filtered_pool())
-                                filter_switch_btn = gr.Button("🔄 切换")
-                                filter_rule_id = gr.Textbox(label="规则 ID", placeholder="例如: 3", lines=1)
-                                filter_activate_rule_btn = gr.Button("启用规则")
-                                filter_delete_rule_btn = gr.Button("删除规则", variant="stop")
-
-                            filter_pool_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
-                            with gr.Row():
-                                filter_list_rules_btn = gr.Button("刷新规则列表")
-                            filter_rules = gr.Dataframe(
-                                headers=["ID", "Name", "Query", "Include", "Exclude", "Sort", "Limit", "Matches"],
-                                label="规则列表",
-                                value=tag_cache_manager.list_rules(),
-                                interactive=False,
-                                wrap=True
-                            )
 
         with InputAccordion(False, label="LoRAnado", elem_id=self.elem_id("lo_enable")) as lora_enabled:
             with gr.Group():
@@ -3602,79 +3398,6 @@ class Script(scripts.Script):
             fn=self._cache_preview_delete_by_id,
             inputs=[cache_select_id],
             outputs=[cache_delete_preview]
-        )
-
-        # ─── 筛选池事件绑定 ───────────────────────────────────────────
-        filter_search_btn.click(
-            fn=self._filter_tags,
-            inputs=[filter_query, filter_must_include, filter_must_exclude, filter_sort_order, filter_preview_limit],
-            outputs=[filter_results, filter_result_msg]
-        )
-
-        filter_create_rule_pool_btn.click(
-            fn=self._create_filtered_pool_from_filter,
-            inputs=[filter_rule_name, filter_query, filter_must_include, filter_must_exclude, filter_sort_order, filter_rule_limit],
-            outputs=[filter_pool_result, filter_pool_status, filter_rules]
-        )
-
-        filter_quick_use_btn.click(
-            fn=self._use_filter_once,
-            inputs=[filter_query, filter_must_include, filter_must_exclude, filter_sort_order, filter_rule_limit],
-            outputs=[filter_pool_result, filter_pool_status]
-        )
-
-        filter_create_pool_btn.click(
-            fn=self._create_filtered_pool,
-            inputs=[filter_selected_ids],
-            outputs=[filter_pool_result, filter_pool_status]
-        )
-
-        filter_create_range_pool_btn.click(
-            fn=self._create_filtered_pool_by_range,
-            inputs=[filter_range_positions],
-            outputs=[filter_pool_result, filter_pool_status]
-        )
-
-        filter_switch_btn.click(
-            fn=self._switch_to_filtered_pool,
-            inputs=[filter_use_pool],
-            outputs=[filter_pool_result, filter_pool_status]
-        )
-
-        filter_activate_rule_btn.click(
-            fn=self._activate_rule,
-            inputs=[filter_rule_id],
-            outputs=[filter_pool_result, filter_pool_status]
-        )
-
-        filter_delete_rule_btn.click(
-            fn=self._delete_rule,
-            inputs=[filter_rule_id],
-            outputs=[filter_pool_result, filter_pool_status, filter_rules]
-        )
-
-        filter_delete_matches_btn.click(
-            fn=self._delete_filter_matches,
-            inputs=[filter_query, filter_must_include, filter_must_exclude],
-            outputs=[filter_pool_result, cache_status_display]
-        )
-
-        filter_preview_delete_matches_btn.click(
-            fn=self._preview_filter_matches,
-            inputs=[filter_query, filter_must_include, filter_must_exclude],
-            outputs=[cache_delete_preview]
-        )
-
-        filter_list_rules_btn.click(
-            fn=self._list_rules,
-            inputs=[],
-            outputs=[filter_rules]
-        )
-
-        filter_refresh_status_btn.click(
-            fn=self._get_filtered_pool_status,
-            inputs=[],
-            outputs=[filter_pool_status]
         )
 
         target_prompt_box = self.prompt_area[1 if is_img2img else 0]
