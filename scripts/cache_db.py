@@ -1904,6 +1904,26 @@ class TagCacheManager:
         records = self.get_records_by_ids([tag_id])
         return records[0] if records else None
 
+    def find_record_by_prompt(self, prompt):
+        value = str(prompt or "").strip()
+        if not value:
+            return None
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT id
+                FROM tags
+                WHERE tags_prompt = ? OR tags = ? OR natural_prompt = ?
+                ORDER BY CASE WHEN natural_prompt = ? THEN 0 ELSE 1 END, id ASC
+                LIMIT 1
+                """,
+                (value, value, value, value),
+            ).fetchone()
+        finally:
+            conn.close()
+        return self.get_record_by_id(int(row["id"])) if row else None
+
     def get_records_by_ids(self, tag_ids):
         conn = self._connect()
         try:

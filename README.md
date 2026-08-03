@@ -22,6 +22,7 @@
 - 支持 JSON / CSV 导入导出、导入预检、自动备份和撤销上一次删除。
 - 支持完全一致去重和高相似度 Tag 清理。
 - 支持把几十或几百条完整缓存 Prompt 批量转换为自然语言。
+- 可把当前缓存记录实时发送到 LLM 提示词工作室，或直接调用其已保存的 LLM 设置处理、评分并缓存。
 - 内置 Krea 2 紧凑自然语言预设。
 - 支持 Ollama、本地 OpenAI 兼容服务和远程 OpenAI 兼容 API。
 - 保留 Img2Img、ControlNet、DeepBooru、LoRAnado、Chaos 和文件驱动 Tag 池。
@@ -157,6 +158,19 @@ user/cache/tag_cache.db
 缓存读取游标只在当前 Forge 运行期间共享；重启 Forge 或重新加载插件后会从第 1 条开始，不会沿用上次运行保存的“已读”状态。
 
 本地缓存模式只有 Prompt，不保证存在源图片，因此 Img2Img、ControlNet 图片注入和 DeepBooru 图片分析会跳过。需要图片链路时请使用在线 Booru 模式。
+
+### 与 LLM 提示词工作室实时联动
+
+同时安装 [`sd-webui-llm-prompt-studio`](https://github.com/Rivulet138/sd-webui-llm-prompt-studio) 后，`Tag 缓存管理` 的“当前取出的 Tag / 转换后 Prompt”下方提供：
+
+- `发送到 LLM 提示词工作室`：将当前记录写入提示词工作室的实时交接箱，便于继续编辑模型预设、用户要求和 SFW / NSFW 模式。
+- `使用 LLM 处理并缓存`：直接使用提示词工作室已保存的 Provider、URL、模型、API Key 和工作参数生成 Prompt，并写入其本地缓存；启用自动评分时会继续执行 LLM 质量评价。
+
+联动不是只传当前文本。Ranbooru 会反查并发送完整缓存记录，包括内部 ID、原 Tag Prompt、有效自然语言 Prompt、分级、站点源评分、Booru、Post ID 和来源地址。重复发送同一源记录会更新同一交接项。
+
+直接处理沿用提示词工作室保存的失败重试次数。重试耗尽后，错误会保留在提示词工作室的 `Ranbooru 实时交接箱`，可以统一查看并手动重试；也可以将暂不处理的记录标记为跳过。Ranbooru 的站点 Score 只是来源元数据，不会直接成为高分 RAG 评分。
+
+该功能是可选联动。未安装提示词工作室时，Ranbooru 的抓取、缓存、自然语言转换和生成流程仍可独立使用，点击联动按钮会显示明确的未安装提示。
 
 ## 批量转换为自然语言
 

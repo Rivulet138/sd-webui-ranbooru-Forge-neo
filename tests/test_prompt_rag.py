@@ -107,6 +107,16 @@ class PromptRagCacheTests(unittest.TestCase):
         self.assertNotIn(4, [item["id"] for item in examples])
         self.assertTrue(all(item["overlap"] > 0 for item in examples))
 
+    def test_current_tag_or_natural_prompt_resolves_full_cache_record(self):
+        by_tags = self.manager.find_record_by_prompt("1girl, blue_hair, outdoors")
+        by_natural = self.manager.find_record_by_prompt("Converted post 1.")
+
+        self.assertEqual(by_tags["id"], 1)
+        self.assertEqual(by_natural["id"], 1)
+        self.assertEqual(by_natural["tags_prompt"], "1girl, blue_hair, outdoors")
+        self.assertEqual(by_natural["natural_prompt"], "Converted post 1.")
+        self.assertIsNone(self.manager.find_record_by_prompt("not cached"))
+
     def test_candidate_snapshot_excludes_low_score_and_stale_conversions(self):
         conn = self.manager._connect()
         conn.execute(
@@ -366,6 +376,15 @@ class PromptRagUiContractTests(unittest.TestCase):
             click_outputs["cache_natural_language_clear_settings_btn"],
             len(clear_return.value.elts),
         )
+
+        module_functions = {
+            node.name for node in source.body if isinstance(node, ast.FunctionDef)
+        }
+        self.assertIn("_cache_send_to_prompt_studio", module_functions)
+        self.assertIn("_cache_process_with_prompt_studio", module_functions)
+        self.assertEqual(click_inputs["cache_send_prompt_studio_btn"], 2)
+        self.assertEqual(click_inputs["cache_process_prompt_studio_btn"], 2)
+        self.assertEqual(click_outputs["cache_process_prompt_studio_btn"], 2)
 
 
 if __name__ == "__main__":

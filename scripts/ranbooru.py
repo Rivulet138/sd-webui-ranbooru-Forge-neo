@@ -1,4 +1,5 @@
 from io import BytesIO
+import hashlib
 import html
 import random
 import re
@@ -11,6 +12,7 @@ import numpy as np
 import importlib
 import json
 import threading
+import sys
 try:
     import requests_cache
     HAS_REQUESTS_CACHE = True
@@ -199,6 +201,103 @@ tag_cache_manager = TagCacheManager(user_cache_dir)
 _natural_batch_lock = threading.Lock()
 _natural_batch_cancel = threading.Event()
 _natural_endpoint_policy_choices = list(NATURAL_LANGUAGE_ENDPOINT_POLICIES)
+_prompt_studio_module = None
+_prompt_studio_lock = threading.RLock()
+
+
+def _load_prompt_studio_module():
+    global _prompt_studio_module
+    with _prompt_studio_lock:
+        if _prompt_studio_module is not None:
+            return _prompt_studio_module
+        loaded = sys.modules.get("prompt_studio_ui")
+        if loaded is not None and hasattr(loaded, "receive_ranbooru_handoff"):
+            _prompt_studio_module = loaded
+            return loaded
+        studio_scripts = os.path.join(
+            os.path.dirname(extension_root),
+            "sd-webui-llm-prompt-studio",
+            "scripts",
+        )
+        studio_ui = os.path.join(studio_scripts, "prompt_studio_ui.py")
+        if not os.path.isfile(studio_ui):
+            raise RuntimeError("未安装 sd-webui-llm-prompt-studio，无法进行实时联动")
+        added_path = studio_scripts not in sys.path
+        if added_path:
+            sys.path.insert(0, studio_scripts)
+        try:
+            spec = importlib.util.spec_from_file_location("ranbooru_prompt_studio_bridge", studio_ui)
+            if spec is None or spec.loader is None:
+                raise RuntimeError("无法加载 LLM 提示词工作室联动模块")
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            try:
+                spec.loader.exec_module(module)
+            except Exception:
+                sys.modules.pop(spec.name, None)
+                raise
+            _prompt_studio_module = module
+            return module
+        finally:
+            if added_path:
+                sys.path.remove(studio_scripts)
+
+
+def _prompt_studio_payload(current_prompt, record_id=""):
+    prompt = str(current_prompt or "").strip()
+    if not prompt:
+        raise ValueError("请先从 Ranbooru 缓存取出一条 Prompt")
+    try:
+        stable_id = int(float(record_id)) if str(record_id or "").strip() else None
+    except (TypeError, ValueError, OverflowError):
+        stable_id = None
+    record = tag_cache_manager.get_record_by_id(stable_id) if stable_id is not None else None
+    if record is None:
+        record = tag_cache_manager.find_record_by_prompt(prompt)
+    database_path = os.path.normcase(os.path.abspath(tag_cache_manager.db_path))
+    database_key = hashlib.sha256(database_path.encode("utf-8")).hexdigest()[:16]
+    if record is None:
+        return {
+            "database_key": database_key,
+            "selected_prompt": prompt,
+            "selected_is_natural": False,
+            "tags_prompt": prompt,
+        }
+    natural_prompt = str(record.get("natural_prompt") or "").strip()
+    return {
+        "ranbooru_id": record.get("id", ""),
+        "database_key": database_key,
+        "tags_prompt": str(record.get("tags_prompt") or "").strip(),
+        "natural_prompt": natural_prompt,
+        "selected_prompt": prompt,
+        "selected_is_natural": bool(natural_prompt and prompt == natural_prompt),
+        "rating": record.get("rating", ""),
+        "source_score": record.get("score", 0),
+        "booru": record.get("booru", ""),
+        "post_id": record.get("post_id", ""),
+        "source_url": record.get("source_url", ""),
+    }
+
+
+def _cache_send_to_prompt_studio(current_prompt, record_id=""):
+    try:
+        result = _load_prompt_studio_module().receive_ranbooru_handoff(
+            _prompt_studio_payload(current_prompt, record_id),
+            "send",
+        )
+        return result["status"]
+    except Exception as error:
+        return f"发送失败：{error}"
+
+
+def _cache_process_with_prompt_studio(current_prompt, record_id=""):
+    try:
+        result = _load_prompt_studio_module().process_ranbooru_handoff(
+            _prompt_studio_payload(current_prompt, record_id)
+        )
+        return result["prompt"], result["status"]
+    except Exception as error:
+        return "", f"处理失败：{error}"
 
 
 class CredentialReadError(RuntimeError):
@@ -1873,13 +1972,14 @@ class Script(scripts.Script):
         )
         if tags is None:
             if total == 0:
-                return "缓存为空，请先批量爬取", tag_cache_manager.get_status()
+                return "缓存为空，请先批量爬取", tag_cache_manager.get_status(), ""
             else:
                 return (
                     f"已到达缓存末尾 (索引 {idx}/{total})",
                     tag_cache_manager.get_status(),
+                    "",
                 )
-        return tags, tag_cache_manager.get_status()
+        return tags, tag_cache_manager.get_status(), str(tag_cache_manager.tag_id_at_position(idx) or "")
 
     @staticmethod
     def _cache_reset_index():
@@ -2112,26 +2212,26 @@ class Script(scripts.Script):
         """根据真实缓存序号填充标签"""
         cache_position = Script._parse_cache_id(position)
         if cache_position is None:
-            return "", "请输入有效的缓存序号"
+            return "", "请输入有效的缓存序号", ""
         tags = tag_cache_manager.get_by_position(
             cache_position,
             prefer_natural=prefer_natural,
         )
         if tags:
             prompt_kind = "自然语言 Prompt" if prefer_natural else "原始 Tag"
-            return tags, f"已取出第 {cache_position} 条（优先使用{prompt_kind}）"
-        return "", f"未找到第 {cache_position} 条"
+            return tags, f"已取出第 {cache_position} 条（优先使用{prompt_kind}）", str(tag_cache_manager.tag_id_at_position(cache_position) or "")
+        return "", f"未找到第 {cache_position} 条", ""
 
     @staticmethod
     def _cache_fill_by_id(tag_id, prefer_natural=False):
         stable_id = Script._parse_cache_id(tag_id)
         if stable_id is None:
-            return "", "请输入搜索结果中的内部 ID"
+            return "", "请输入搜索结果中的内部 ID", ""
         tags = tag_cache_manager.get_by_id(stable_id, prefer_natural=prefer_natural)
         if tags:
             prompt_kind = "自然语言 Prompt" if prefer_natural else "原始 Tag"
-            return tags, f"已按内部 ID {stable_id} 取出（优先使用{prompt_kind}）"
-        return "", f"未找到内部 ID {stable_id}"
+            return tags, f"已按内部 ID {stable_id} 取出（优先使用{prompt_kind}）", str(stable_id)
+        return "", f"未找到内部 ID {stable_id}", ""
 
     @staticmethod
     def _cache_fill_position_to_tag_prompt(
@@ -2141,13 +2241,14 @@ class Script(scripts.Script):
         prefer_natural=False,
     ):
         """Fill Tag Prompt with a cached tag row by visible cache position."""
-        tags, msg = Script._cache_fill_by_position(position, prefer_natural)
+        tags, msg, record_id = Script._cache_fill_by_position(position, prefer_natural)
         if not tags:
-            return "", msg, tag_prompt_text
+            return "", msg, tag_prompt_text, ""
         return (
             tags,
             msg,
             Script._apply_write_mode(tag_prompt_text, tags, write_mode),
+            record_id,
         )
 
     @staticmethod
@@ -2287,17 +2388,19 @@ class Script(scripts.Script):
                     "缓存为空，请先批量爬取",
                     tag_cache_manager.get_status(),
                     current_prompt,
+                    "",
                 )
             else:
                 return (
                     f"已到达缓存末尾 (索引 {idx}/{total})",
                     tag_cache_manager.get_status(),
                     current_prompt,
+                    "",
                 )
         status = tag_cache_manager.get_status()
         tag_payload = Script._combine_prompt(tag_prompt_text, tags)
         combined = Script._apply_write_mode(current_prompt, tag_payload, write_mode)
-        return tags, status, combined
+        return tags, status, combined, str(tag_cache_manager.tag_id_at_position(idx) or "")
 
     @staticmethod
     def _cache_jump_take(position, loop_mode, prefer_natural=False):
@@ -2306,6 +2409,7 @@ class Script(scripts.Script):
             return (
                 result.get("message", "跳转失败"),
                 Script._cache_refresh_status(),
+                "",
             )
         return Script._cache_get_next(loop_mode, prefer_natural)
 
@@ -2324,6 +2428,7 @@ class Script(scripts.Script):
                 result.get("message", "跳转失败"),
                 Script._cache_refresh_status(),
                 current_prompt,
+                "",
             )
         return Script._cache_get_next_and_set(
             loop_mode,
@@ -3089,6 +3194,23 @@ class Script(scripts.Script):
                                 interactive=False,
                                 lines=3,
                             )
+                            cache_current_record_id = gr.State("")
+                            with gr.Row():
+                                cache_send_prompt_studio_btn = gr.Button("发送到 LLM 提示词工作室")
+                                cache_process_prompt_studio_btn = gr.Button(
+                                    "使用 LLM 处理并缓存",
+                                    variant="primary",
+                                )
+                            cache_prompt_studio_result = gr.Textbox(
+                                label="LLM 提示词工作室处理结果",
+                                interactive=False,
+                                lines=4,
+                            )
+                            cache_prompt_studio_status = gr.Textbox(
+                                label="LLM 提示词工作室联动状态",
+                                interactive=False,
+                                lines=2,
+                            )
 
                             gr.Markdown("#### ⚙️ 生成设置")
                             with gr.Row():
@@ -3398,13 +3520,25 @@ class Script(scripts.Script):
         cache_next_btn.click(
             fn=self._cache_get_next,
             inputs=[cache_loop_mode, use_preconverted_cache_prompt],
-            outputs=[cache_next_output, cache_status_display]
+            outputs=[cache_next_output, cache_status_display, cache_current_record_id]
+        )
+
+        cache_send_prompt_studio_btn.click(
+            fn=_cache_send_to_prompt_studio,
+            inputs=[cache_next_output, cache_current_record_id],
+            outputs=[cache_prompt_studio_status],
+        )
+
+        cache_process_prompt_studio_btn.click(
+            fn=_cache_process_with_prompt_studio,
+            inputs=[cache_next_output, cache_current_record_id],
+            outputs=[cache_prompt_studio_result, cache_prompt_studio_status],
         )
 
         cache_lookup_id_btn.click(
             fn=self._cache_fill_by_position,
             inputs=[cache_lookup_id, use_preconverted_cache_prompt],
-            outputs=[cache_next_output, cache_status_display]
+            outputs=[cache_next_output, cache_status_display, cache_current_record_id]
         )
 
         cache_lookup_id_set_btn.click(
@@ -3419,6 +3553,7 @@ class Script(scripts.Script):
                 cache_next_output,
                 cache_status_display,
                 tag_prompt_input,
+                cache_current_record_id,
             ]
         )
 
@@ -3435,7 +3570,7 @@ class Script(scripts.Script):
                 cache_loop_mode,
                 use_preconverted_cache_prompt,
             ],
-            outputs=[cache_next_output, cache_status_display]
+            outputs=[cache_next_output, cache_status_display, cache_current_record_id]
         )
 
         cache_preview_next_btn.click(
@@ -3624,7 +3759,7 @@ class Script(scripts.Script):
         cache_fill_btn.click(
             fn=self._cache_fill_by_id,
             inputs=[cache_select_id, use_preconverted_cache_prompt],
-            outputs=[cache_next_output, cache_manage_result]
+            outputs=[cache_next_output, cache_manage_result, cache_current_record_id]
         )
 
         cache_delete_id_btn.click(
@@ -3671,6 +3806,7 @@ class Script(scripts.Script):
                     cache_next_output,
                     cache_status_display,
                     target_prompt_box,
+                    cache_current_record_id,
                 ]
             )
 
@@ -3688,6 +3824,7 @@ class Script(scripts.Script):
                     cache_next_output,
                     cache_status_display,
                     target_prompt_box,
+                    cache_current_record_id,
                 ]
             )
         else:
@@ -3701,7 +3838,7 @@ class Script(scripts.Script):
             cache_next_set_btn.click(
                 fn=self._cache_get_next,
                 inputs=[cache_loop_mode, use_preconverted_cache_prompt],
-                outputs=[cache_next_output, cache_status_display]
+                outputs=[cache_next_output, cache_status_display, cache_current_record_id]
             )
 
             cache_jump_take_set_btn.click(
@@ -3711,7 +3848,7 @@ class Script(scripts.Script):
                     cache_loop_mode,
                     use_preconverted_cache_prompt,
                 ],
-                outputs=[cache_next_output, cache_status_display]
+                outputs=[cache_next_output, cache_status_display, cache_current_record_id]
             )
 
         return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, use_local_cache_gen, use_local_cache_loop, tag_categories, cache_prompt_write_mode, use_preconverted_cache_prompt]
