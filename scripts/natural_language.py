@@ -13,17 +13,22 @@ from urllib.parse import urlparse
 import requests
 
 try:
-    from .natural_prompt_schema import NATURAL_PROMPT_CONVERTER_VERSION
+    from .ranbooru_logging import get_logger, redact_sensitive
+    from .version import NATURAL_PROMPT_CONVERTER_VERSION
 except ImportError:
     _scripts_dir = os.path.dirname(os.path.abspath(__file__))
     _added_scripts_dir = _scripts_dir not in sys.path
     if _added_scripts_dir:
         sys.path.insert(0, _scripts_dir)
     try:
-        from natural_prompt_schema import NATURAL_PROMPT_CONVERTER_VERSION
+        from ranbooru_logging import get_logger, redact_sensitive
+        from version import NATURAL_PROMPT_CONVERTER_VERSION
     finally:
         if _added_scripts_dir:
             sys.path.remove(_scripts_dir)
+
+
+logger = get_logger("natural_language")
 
 
 BACKEND_OFF = "不转换"
@@ -35,6 +40,9 @@ DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434"
 DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1"
 MAX_OUTPUT_CHARS = 4000
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_FEW_SHOT_EXAMPLES = 5
+MAX_FEW_SHOT_CHARS = 12000
+DEFAULT_FEW_SHOT_CHARS = 3000
 ENDPOINT_POLICY_DEFAULT = "default"
 ENDPOINT_POLICY_PUBLIC_ONLY = "public_only"
 ENDPOINT_POLICY_ALLOW_PRIVATE = "allow_private"
@@ -83,6 +91,7 @@ class NaturalLanguageConfig:
     preset: str = PRESET_KREA2
     system_prompt: str = ""
     endpoint_policy: str = ENDPOINT_POLICY_DEFAULT
+    few_shot_max_chars: int = DEFAULT_FEW_SHOT_CHARS
 
 
 def split_cached_tags(tags):
@@ -248,22 +257,6 @@ def _validate_endpoint_details(
     )
 
 
-def _validate_endpoint(
-    endpoint,
-    default,
-    backend,
-    policy=ENDPOINT_POLICY_DEFAULT,
-    resolver=socket.getaddrinfo,
-):
-    return _validate_endpoint_details(
-        endpoint,
-        default,
-        backend,
-        policy,
-        resolver,
-    )[0]
-
-
 class _PinnedAddressAdapter(requests.adapters.HTTPAdapter):
     """Connect to one validated DNS result while preserving Host/SNI validation."""
 
@@ -360,7 +353,7 @@ def _reject_redirect_response(response):
         )
 
 
-def convert_cached_tags_safely(tags, config, converter=None):
+def convert_cached_tags_safely(tags, config, converter=None, examples=None):
     """Convert one cached prompt and fall back to its original tags on failure."""
     original = str(tags or "").strip()
     if not original or config.backend == BACKEND_OFF:
@@ -368,10 +361,14 @@ def convert_cached_tags_safely(tags, config, converter=None):
     owns_converter = converter is None
     converter = converter or CachedTagNaturalLanguageConverter()
     try:
+        if examples:
+            return converter.convert(original, config, examples=examples), ""
         return converter.convert(original, config), ""
     except NaturalLanguageConversionError as error:
         return original, str(error)
     except Exception as error:
+        # Injected converter implementations are an external compatibility boundary.
+        logger.error("Unexpected conversion failure: %s", redact_sensitive(error))
         return original, f"未预期的转换错误: {error}"
     finally:
         if owns_converter:
@@ -415,6 +412,7 @@ def iter_cached_tag_conversions(
     should_cancel=None,
     retry_backoff_seconds=0.5,
     sleep_fn=time.sleep,
+    example_provider=None,
 ):
     """Yield whole-record conversions, retrying transient failures per record."""
     originals = [str(tags or "").strip() for tags in tags_list]
@@ -438,12 +436,23 @@ def iter_cached_tag_conversions(
                 yield index, original, converted_by_original[original], "", True
                 continue
 
+            examples = ()
+            if example_provider is not None:
+                try:
+                    examples = tuple(example_provider(original) or ())
+                except Exception as error:
+                    logger.warning(
+                        "Prompt RAG retrieval failed; continuing without examples: %s",
+                        redact_sensitive(error),
+                    )
+
             for attempt in range(timeout_retries + 1):
                 raise_if_cancelled()
                 prepared, error = convert_cached_tags_safely(
                     original,
                     config,
                     converter,
+                    examples,
                 )
                 if not error or not is_retryable_conversion_error(error):
                     break
@@ -524,7 +533,7 @@ class CachedTagNaturalLanguageConverter:
         self.session.mount(f"{parsed.scheme}://{parsed.netloc}/", adapter)
         return base_url, host_header
 
-    def convert(self, tags, config):
+    def convert(self, tags, config, examples=None):
         if config.backend == BACKEND_OFF:
             return str(tags or "").strip()
 
@@ -532,30 +541,80 @@ class CachedTagNaturalLanguageConverter:
         if not tokens:
             return ""
 
-        return self._request_description(tokens, config)
+        return self._request_description(tokens, config, examples=examples)
 
-    def _request_description(self, tags, config):
+    @staticmethod
+    def _few_shot_messages(examples, max_chars=DEFAULT_FEW_SHOT_CHARS):
+        try:
+            max_chars = int(float(max_chars))
+        except (TypeError, ValueError, OverflowError):
+            max_chars = DEFAULT_FEW_SHOT_CHARS
+        max_chars = max(0, min(MAX_FEW_SHOT_CHARS, max_chars))
+        messages = []
+        used_chars = 0
+        for example in list(examples or ())[:MAX_FEW_SHOT_EXAMPLES]:
+            if not isinstance(example, dict):
+                continue
+            example_tags = split_cached_tags(
+                example.get("tags_prompt") or example.get("tags")
+            )
+            natural_prompt = re.sub(
+                r"\s+",
+                " ",
+                str(example.get("natural_prompt") or "").strip(),
+            )[:MAX_OUTPUT_CHARS].rstrip()
+            if not example_tags or not natural_prompt:
+                continue
+            user_content = "Tags:\n" + ", ".join(
+                tag.replace("_", " ") for tag in example_tags
+            )
+            example_chars = len(user_content) + len(natural_prompt)
+            if used_chars + example_chars > max_chars:
+                continue
+            messages.extend(
+                [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": natural_prompt},
+                ]
+            )
+            used_chars += example_chars
+        return messages
+
+    def _request_description(self, tags, config, examples=None):
         model = str(config.model or "").strip()
         if not model:
             raise NaturalLanguageConversionError("请填写要使用的模型名称")
 
+        few_shot_messages = self._few_shot_messages(
+            examples,
+            max_chars=config.few_shot_max_chars,
+        )
+        system_prompt = str(
+            config.system_prompt
+            or (
+                KREA2_SYSTEM_PROMPT
+                if config.preset == PRESET_KREA2
+                else DEFAULT_SYSTEM_PROMPT
+            )
+        ).strip()
+        if few_shot_messages:
+            system_prompt += (
+                " Use the following retrieved conversions only as formatting examples. "
+                "Do not copy any visual fact that is absent from the final Tags message."
+            )
         messages = [
             {
                 "role": "system",
-                "content": str(
-                    config.system_prompt
-                    or (
-                        KREA2_SYSTEM_PROMPT
-                        if config.preset == PRESET_KREA2
-                        else DEFAULT_SYSTEM_PROMPT
-                    )
-                ).strip(),
+                "content": system_prompt,
             },
+        ]
+        messages.extend(few_shot_messages)
+        messages.append(
             {
                 "role": "user",
                 "content": "Tags:\n" + ", ".join(tag.replace("_", " ") for tag in tags),
-            },
-        ]
+            }
+        )
         timeout = _normalize_timeout(config.timeout)
 
         try:

@@ -37,6 +37,41 @@ try:
 except Exception:
     InputAccordion = gr.Accordion
 
+try:
+    from .ranbooru_logging import get_logger, log_event, redact_sensitive
+    from .version import USER_AGENT, __version__
+    from .booru_pipeline import (
+        BooruRequestConfig,
+        CredentialInput,
+        PromptTransformConfig,
+        RetryExhaustedError,
+        generate_online_prompt,
+        resolve_credentials,
+    )
+except ImportError:
+    import sys
+    _ranbooru_scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    _added_ranbooru_scripts_dir = _ranbooru_scripts_dir not in sys.path
+    if _added_ranbooru_scripts_dir:
+        sys.path.insert(0, _ranbooru_scripts_dir)
+    try:
+        from ranbooru_logging import get_logger, log_event, redact_sensitive
+        from version import USER_AGENT, __version__
+        from booru_pipeline import (
+            BooruRequestConfig,
+            CredentialInput,
+            PromptTransformConfig,
+            RetryExhaustedError,
+            generate_online_prompt,
+            resolve_credentials,
+        )
+    finally:
+        if _added_ranbooru_scripts_dir:
+            sys.path.remove(_ranbooru_scripts_dir)
+
+
+logger = get_logger()
+
 
 def get_prompt_lengths(prompt):
     if model_hijack is not None and hasattr(model_hijack, "get_prompt_lengths"):
@@ -161,11 +196,14 @@ except ImportError:
 
 
 tag_cache_manager = TagCacheManager(user_cache_dir)
-if tag_cache_manager.is_using_filtered_pool():
-    tag_cache_manager.use_filtered_pool(False)
 _natural_batch_lock = threading.Lock()
 _natural_batch_cancel = threading.Event()
 _natural_endpoint_policy_choices = list(NATURAL_LANGUAGE_ENDPOINT_POLICIES)
+
+
+class CredentialReadError(RuntimeError):
+    """Raised when an existing credential store cannot be read safely."""
+
 
 # Initialize credentials manager
 class CredentialsManager:
@@ -182,14 +220,28 @@ class CredentialsManager:
         if not os.path.exists(self.credentials_file):
             self._save_credentials({})
 
-    def _load_credentials(self):
+    def _load_credentials(self, for_write=False):
         """Load credentials from the JSON file"""
         with self._lock:
             try:
                 with open(self.credentials_file, 'r', encoding='utf-8') as f:
                     payload = json.load(f)
-                return payload if isinstance(payload, dict) else {}
-            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                if not isinstance(payload, dict):
+                    raise CredentialReadError("Credential store must contain a JSON object")
+                return payload
+            except FileNotFoundError:
+                return {}
+            except (json.JSONDecodeError, OSError, CredentialReadError) as error:
+                log_event(
+                    logger,
+                    "credential_read_failure",
+                    "Could not read credential store: %s",
+                    error,
+                )
+                if for_write:
+                    raise CredentialReadError(
+                        "Existing credential store could not be read; refusing to overwrite it"
+                    ) from error
                 return {}
 
     def _save_credentials(self, credentials):
@@ -213,7 +265,7 @@ class CredentialsManager:
     def save_booru_credentials(self, booru_name, api_key, user_id=None):
         """Save API credentials for a specific booru"""
         with self._lock:
-            credentials = self._load_credentials()
+            credentials = self._load_credentials(for_write=True)
             if booru_name not in credentials:
                 credentials[booru_name] = {}
             credentials[booru_name]['api_key'] = api_key
@@ -234,7 +286,7 @@ class CredentialsManager:
     def clear_booru_credentials(self, booru_name):
         """Clear credentials for a specific booru"""
         with self._lock:
-            credentials = self._load_credentials()
+            credentials = self._load_credentials(for_write=True)
             if booru_name in credentials:
                 del credentials[booru_name]
                 self._save_credentials(credentials)
@@ -248,16 +300,44 @@ class CredentialsManager:
         model,
         api_key,
         timeout,
+        rag_enabled=False,
+        rag_top_k=3,
+        rag_min_percentile=75,
+        rag_context_chars=3000,
     ):
         """Persist the complete LLM conversion configuration, including API Key."""
         try:
             timeout_value = min(300.0, max(1.0, float(timeout or 120)))
         except (TypeError, ValueError):
             timeout_value = 120.0
+        try:
+            rag_top_k_value = max(1, min(5, int(float(rag_top_k or 3))))
+        except (TypeError, ValueError, OverflowError):
+            rag_top_k_value = 3
+        try:
+            rag_min_percentile_value = max(
+                0.0,
+                min(100.0, float(rag_min_percentile)),
+            )
+        except (TypeError, ValueError, OverflowError):
+            rag_min_percentile_value = 75.0
+        try:
+            rag_context_chars_value = max(
+                0,
+                min(12000, int(float(rag_context_chars or 0))),
+            )
+        except (TypeError, ValueError, OverflowError):
+            rag_context_chars_value = 3000
+        if isinstance(rag_enabled, str):
+            rag_enabled_value = rag_enabled.strip().lower() not in {
+                "0", "false", "no", "off"
+            }
+        else:
+            rag_enabled_value = bool(rag_enabled)
         backend_value = str(backend or NATURAL_LANGUAGE_OFF)
         endpoint_value = str(endpoint or "").strip()
         with self._lock:
-            credentials = self._load_credentials()
+            credentials = self._load_credentials(for_write=True)
             existing = credentials.get("natural_language", {})
             same_service = (
                 isinstance(existing, dict)
@@ -275,6 +355,10 @@ class CredentialsManager:
                 "model": str(model or "").strip(),
                 "api_key": str(api_key or "").strip() or existing_key,
                 "timeout": timeout_value,
+                "rag_enabled": rag_enabled_value,
+                "rag_top_k": rag_top_k_value,
+                "rag_min_percentile": rag_min_percentile_value,
+                "rag_context_chars": rag_context_chars_value,
             }
             credentials["natural_language"] = settings
             self._save_credentials(credentials)
@@ -284,21 +368,9 @@ class CredentialsManager:
         settings = self._load_credentials().get("natural_language", {})
         return dict(settings) if isinstance(settings, dict) else {}
 
-    def resolve_natural_language_api_key(self, api_key="", backend="", endpoint=""):
-        entered = str(api_key or "").strip()
-        if entered:
-            return entered
-        saved = self.get_natural_language_settings()
-        if (
-            str(saved.get("backend") or "") != str(backend or "")
-            or str(saved.get("endpoint") or "").strip() != str(endpoint or "").strip()
-        ):
-            return ""
-        return str(saved.get("api_key") or "").strip()
-
     def clear_natural_language_settings(self):
         with self._lock:
-            credentials = self._load_credentials()
+            credentials = self._load_credentials(for_write=True)
             credentials.pop("natural_language", None)
             self._save_credentials(credentials)
 
@@ -362,15 +434,15 @@ def show_fringe_benefits(booru):
 def check_exception(booru, parameters):
     post_id = parameters.get('post_id')
     if booru == 'konachan' and post_id:
-        raise Exception("Konachan does not support post IDs")
+        raise ValueError("Konachan does not support post IDs")
     if booru == 'yande.re' and post_id:
-        raise Exception("Yande.re does not support post IDs")
+        raise ValueError("Yande.re does not support post IDs")
 
 
 def _response_posts_or_raise(response, source, keys=("posts", "post")):
     try:
         payload = response.json()
-    except Exception as error:
+    except ValueError as error:
         raise RuntimeError(f"{source} 返回了无法解析的 JSON") from error
     if isinstance(payload, list):
         return payload
@@ -390,15 +462,16 @@ class Booru():
         self.booru = booru
         self.base_url = booru_url
         self.booru_url = booru_url
-        self.headers = {'user-agent': 'my-app/0.0.1'}
+        self.headers = {'user-agent': USER_AGENT}
         self.session = requests.Session()
 
     def configure_http_cache(self, enabled=False):
         """Use a client-local cache without patching process-wide requests."""
         try:
             self.session.close()
-        except Exception:
-            pass
+        except Exception as error:
+            # requests and requests-cache expose third-party session implementations.
+            logger.debug("Previous HTTP session close failed: %s", error)
         if enabled and HAS_REQUESTS_CACHE:
             cache_path = os.path.join(user_cache_dir, "ranbooru_http_cache")
             self.session = requests_cache.CachedSession(
@@ -413,8 +486,9 @@ class Booru():
     def close(self):
         try:
             self.session.close()
-        except Exception:
-            pass
+        except Exception as error:
+            # Object finalization must tolerate partially initialized host sessions.
+            logger.debug("HTTP session close failed: %s", error)
 
     def __del__(self):
         self.close()
@@ -428,19 +502,34 @@ class Booru():
                 response = self.session.get(url, timeout=timeout, **kwargs)
                 if response.status_code == 429:
                     wait = 2 ** attempt
-                    print(f"[{self.booru}] Rate limited (429), waiting {wait}s...")
+                    log_event(logger, "network_retry", "%s rate limited; retrying in %ss", self.booru, wait)
                     time.sleep(wait)
                     continue
                 response.raise_for_status()
                 return response
             except requests.exceptions.Timeout:
                 if attempt < max_retries - 1:
-                    print(f"[{self.booru}] Timeout, retry {attempt + 1}/{max_retries}")
+                    log_event(
+                        logger,
+                        "network_timeout",
+                        "%s request timed out; retry %s/%s",
+                        self.booru,
+                        attempt + 1,
+                        max_retries,
+                    )
                     time.sleep(2 ** attempt)
             except requests.exceptions.RequestException as e:
+                safe_error = redact_sensitive(e)
                 if attempt < max_retries - 1:
-                    safe_error = re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(e))
-                    print(f"[{self.booru}] Request error: {safe_error}, retry {attempt + 1}/{max_retries}")
+                    log_event(
+                        logger,
+                        "network_retry",
+                        "%s request failed: %s; retry %s/%s",
+                        self.booru,
+                        safe_error,
+                        attempt + 1,
+                        max_retries,
+                    )
                     time.sleep(2 ** attempt)
         raise Exception(f"[{self.booru}] All {max_retries} attempts failed for {safe_url}")
 
@@ -449,6 +538,16 @@ class Booru():
 
     def get_post(self, add_tags, max_pages=10, id=''):
         return self.get_data(add_tags, max_pages, "&id=" + id)
+
+    def _filter_tags_by_category(self, post, categories):
+        if not categories or not isinstance(categories, list):
+            return post.get('tag_string', '')
+        parts = []
+        for category in categories:
+            field = f'tag_string_{category}'
+            if field in post:
+                parts.append(post[field])
+        return ' '.join(parts) if parts else post.get('tag_string', '')
 
 
 class Gelbooru(Booru):
@@ -461,8 +560,7 @@ class Gelbooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         max_pages = _normalize_max_pages(max_pages)
-        loop_msg = True
-        for _ in range(2):
+        for attempt in range(2):
             local_add_tags = '' if id else add_tags
             url = f"{self.base_url}&pid={random.randint(0, max_pages-1)}{id}{local_add_tags}"
             if self.api_key and self.user_id:
@@ -475,9 +573,8 @@ class Gelbooru(Booru):
             result_count = len(data)
             if result_count == 0:
                 max_pages = 2
-                while loop_msg:
-                    print(f" Processing {result_count} results.")
-                    loop_msg = False
+                if attempt == 0:
+                    logger.debug("Processing %s results", result_count)
                 continue
             break
         for post in data:
@@ -500,10 +597,6 @@ class Gelbooru(Booru):
                 post['file_url'] = f"https://img3.gelbooru.com/images/{post['directory']}/{post['image']}"
         return {'post': data}
 
-    def get_post(self, add_tags, max_pages=10, id=''):
-        return self.get_data(add_tags, max_pages, "&id=" + id)
-
-
 class e621(Booru):
 
     def __init__(self):
@@ -511,8 +604,7 @@ class e621(Booru):
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         max_pages = _normalize_max_pages(max_pages)
-        loop_msg = True
-        for loop in range(2):
+        for attempt in range(2):
             if id:
                 add_tags = ''
             random_page = random.randint(1, max(1, int(max_pages)))
@@ -526,12 +618,11 @@ class e621(Booru):
             result_count = len(posts)
             if result_count == 0:
                 max_pages = 2
-                while loop_msg:
-                    print(f" Processing {result_count} results.")
-                    loop_msg = False
+                if attempt == 0:
+                    logger.debug("Processing %s results", result_count)
                 continue
             else:
-                print("Found enough results")
+                logger.debug("Found enough results")
             break
         return {'post': posts}
 
@@ -589,13 +680,12 @@ class XBooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         max_pages = _normalize_max_pages(max_pages)
-        loop_msg = True # avoid showing same msg twice
-        for loop in range(2): # run loop at most twice
+        for attempt in range(2):
             if id:
                 add_tags = ''
             url = f"{self.base_url}&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
             self.booru_url = url
-            print(re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(url)))
+            logger.debug("Requesting booru URL: %s", redact_sensitive(str(url)))
             res = self.fetch_with_retry(url, timeout=10)
             data = _response_posts_or_raise(res, "XBooru")
             result_count = 0
@@ -606,13 +696,15 @@ class XBooru(Booru):
             if result_count <= max_pages*POST_AMOUNT:
                 max_pages = result_count // POST_AMOUNT+1
                 # If max_pages is bigger than available pages, loop the function with updated max_pages based on the result count.
-                while loop_msg:
-                    print(f" Processing {result_count} results.")
-                    loop_msg = False
-                    # avoid showing same msg twice
+                if attempt == 0:
+                    logger.debug("Processing %s results", result_count)
                 continue
             else:
-                print(f" Processing {max_pages*POST_AMOUNT} out of {result_count} results.")
+                logger.debug(
+                    "Processing %s out of %s results",
+                    max_pages * POST_AMOUNT,
+                    result_count,
+                )
             break
         return {'post': data}
 
@@ -628,10 +720,6 @@ class XBooru(Booru):
                 post['file_url'] = f"https://xbooru.com/images/{post['directory']}/{post['image']}"
         return {'post': data}
 
-    def get_post(self, add_tags, max_pages=10, id=''):
-        return self.get_data(add_tags, max_pages, "&id=" + id)
-
-
 class Rule34(Booru):
 
     def __init__(self, api_key=None, user_id=None):
@@ -641,8 +729,7 @@ class Rule34(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         max_pages = _normalize_max_pages(max_pages)
-        loop_msg = True # avoid showing same msg twice
-        for loop in range(2): # run loop at most twice
+        for attempt in range(2):
             if id:
                 add_tags = ''
             url = f"{self.base_url}&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
@@ -655,13 +742,11 @@ class Rule34(Booru):
             if result_count == 0:
                 max_pages = 2
                 # Rule34 does not have a way to know the amount of results available in the search, so we need to run the function again with a fixed amount of pages
-                while loop_msg:
-                    print(f" Processing {result_count} results.")
-                    loop_msg = False
-                    # avoid showing same msg twice
+                if attempt == 0:
+                    logger.debug("Processing %s results", result_count)
                 continue
             else:
-                print("Found enough results")
+                logger.debug("Found enough results")
             break
         return {'post': data}
 
@@ -676,10 +761,6 @@ class Rule34(Booru):
         data = _response_posts_or_raise(res, "Rule34 page")
         return {'post': data}
 
-    def get_post(self, add_tags, max_pages=10, id=''):
-        return self.get_data(add_tags, max_pages, "&id=" + id)
-
-
 class Safebooru(Booru):
 
     def __init__(self):
@@ -687,8 +768,7 @@ class Safebooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         max_pages = _normalize_max_pages(max_pages)
-        loop_msg = True
-        for loop in range(2):
+        for attempt in range(2):
             if id:
                 add_tags = ''
             random_page = random.randint(1, max(1, int(max_pages)))
@@ -705,12 +785,11 @@ class Safebooru(Booru):
                     result_count += 1
             if result_count == 0:
                 max_pages = 2
-                while loop_msg:
-                    print(f" Processing {result_count} results.")
-                    loop_msg = False
+                if attempt == 0:
+                    logger.debug("Processing %s results", result_count)
                 continue
             else:
-                print("Found enough results")
+                logger.debug("Found enough results")
             break
         return {'post': data}
 
@@ -728,17 +807,6 @@ class Safebooru(Booru):
                 if not post.get('file_url') and post.get('large_file_url'):
                     post['file_url'] = post.get('large_file_url')
         return {'post': data}
-
-    def _filter_tags_by_category(self, post, categories):
-        """Filter tags by selected categories."""
-        if not categories or not isinstance(categories, list):
-            return post.get('tag_string', '')
-        parts = []
-        for cat in categories:
-            field = f'tag_string_{cat}'
-            if field in post:
-                parts.append(post[field])
-        return ' '.join(parts) if parts else post.get('tag_string', '')
 
     def get_post(self, add_tags, max_pages=10, id=''):
         if not id:
@@ -761,8 +829,7 @@ class Konachan(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         max_pages = _normalize_max_pages(max_pages)
-        loop_msg = True # avoid showing same msg twice
-        for loop in range(2): # run loop at most twice
+        for attempt in range(2):
             if id:
                 add_tags = ''
             url = f"{self.base_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
@@ -773,13 +840,11 @@ class Konachan(Booru):
             if result_count == 0:
                 max_pages = 2
                 # Konachan does not have a way to know the amount of results available in the search, so we need to run the function again with a fixed amount of pages
-                while loop_msg:
-                    print(f" Processing {result_count} results.")
-                    loop_msg = False
-                    # avoid showing same msg twice
+                if attempt == 0:
+                    logger.debug("Processing %s results", result_count)
                 continue
             else:
-                print("Found enough results")
+                logger.debug("Found enough results")
             break
         return {'post': data}
 
@@ -803,8 +868,7 @@ class Yandere(Booru):
 
     def get_data(self, add_tags, max_pages=10, id=''):
         max_pages = _normalize_max_pages(max_pages)
-        loop_msg = True # avoid showing same msg twice
-        for loop in range(2): # run loop at most twice
+        for attempt in range(2):
             if id:
                 add_tags = ''
             page = random.randint(0, max_pages-1)
@@ -817,13 +881,11 @@ class Yandere(Booru):
             if result_count == 0:
                 max_pages = 2
                 # Yandere does not have a way to know the amount of results available in the search, so we need to run the function again with a fixed amount of pages
-                while loop_msg:
-                    print(f" Processing {result_count} results.")
-                    loop_msg = False
-                    # avoid showing same msg twice
+                if attempt == 0:
+                    logger.debug("Processing %s results", result_count)
                 continue
             else:
-                print("Found enough results")
+                logger.debug("Found enough results")
             break
         return {'post': posts}
 
@@ -848,8 +910,7 @@ class AIBooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         max_pages = _normalize_max_pages(max_pages)
-        loop_msg = True
-        for loop in range(2):
+        for attempt in range(2):
             if id:
                 add_tags = ''
             url = f"{self.base_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
@@ -862,12 +923,11 @@ class AIBooru(Booru):
             result_count = len(data)
             if result_count == 0:
                 max_pages = 2
-                while loop_msg:
-                    print(f" Processing {result_count} results.")
-                    loop_msg = False
+                if attempt == 0:
+                    logger.debug("Processing %s results", result_count)
                 continue
             else:
-                print("Found enough results")
+                logger.debug("Found enough results")
             break
         return {'post': data}
 
@@ -883,17 +943,6 @@ class AIBooru(Booru):
                 post['tags'] = self._filter_tags_by_category(post, tag_categories)
         return {'post': data}
 
-    def _filter_tags_by_category(self, post, categories):
-        """Filter tags by selected categories."""
-        if not categories or not isinstance(categories, list):
-            return post.get('tag_string', '')
-        parts = []
-        for cat in categories:
-            field = f'tag_string_{cat}'
-            if field in post:
-                parts.append(post[field])
-        return ' '.join(parts) if parts else post.get('tag_string', '')
-
     def get_post(self, add_tags, max_pages=10, id=''):
         raise Exception("AIBooru does not support post IDs")
 
@@ -905,8 +954,7 @@ class Danbooru(Booru):
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
         max_pages = _normalize_max_pages(max_pages)
-        loop_msg = True
-        for loop in range(2):
+        for attempt in range(2):
             if id:
                 add_tags = ''
             random_page = random.randint(1, max(1, int(max_pages)))
@@ -920,12 +968,11 @@ class Danbooru(Booru):
             result_count = len(data)
             if result_count == 0:
                 max_pages = 2
-                while loop_msg:
-                    print(f" Processing {result_count} results.")
-                    loop_msg = False
+                if attempt == 0:
+                    logger.debug("Processing %s results", result_count)
                 continue
             else:
-                print("Found enough results")
+                logger.debug("Found enough results")
             break
         return {'post': data}
 
@@ -941,17 +988,6 @@ class Danbooru(Booru):
             if isinstance(post, dict):
                 post['tags'] = self._filter_tags_by_category(post, tag_categories)
         return {'post': data}
-
-    def _filter_tags_by_category(self, post, categories):
-        """Filter tags by selected categories."""
-        if not categories or not isinstance(categories, list):
-            return post.get('tag_string', '')
-        parts = []
-        for cat in categories:
-            field = f'tag_string_{cat}'
-            if field in post:
-                parts.append(post[field])
-        return ' '.join(parts) if parts else post.get('tag_string', '')
 
     def get_post(self, add_tags, max_pages=10, id=''):
         if not id:
@@ -1114,7 +1150,7 @@ NO_POSTS_MESSAGE = 'Ranbooru: no posts found for these filters.'
 
 
 def _format_ranbooru_error(booru, error):
-    error_text = re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(error))
+    error_text = redact_sensitive(error)
     return (
         f'Ranbooru: [{booru}] request failed: {error_text}. '
         'Check proxy/TUN, lower Max Pages, or try another booru.'
@@ -1124,7 +1160,7 @@ def _format_ranbooru_error(booru, error):
 def _normalize_max_pages(value):
     try:
         return max(1, int(value))
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         return 1
 
 
@@ -1146,7 +1182,7 @@ def _safe_read_text_file(base_dir, filename):
         with open(path, 'r', encoding='utf-8', errors='ignore') as file:
             return file.read()
     except Exception as error:
-        print(f'[Ranbooru] Could not read {path}: {error}')
+        logger.warning("Could not read %s: %s", path, error)
         return ''
 
 
@@ -1269,27 +1305,21 @@ def _get_post_file_url(post):
     return ''
 
 
-def _normalize_post(post):
-    if not isinstance(post, dict):
-        return None
-    tags = _get_post_tags(post)
-    if not tags:
-        return None
-    post['tags'] = tags
-    file_url = _get_post_file_url(post)
-    if file_url:
-        post['file_url'] = file_url
-    return post
-
-
 def _normalize_posts(posts):
     normalized = []
     if not isinstance(posts, list):
         return normalized
     for post in posts:
-        normalized_post = _normalize_post(post)
-        if normalized_post is not None:
-            normalized.append(normalized_post)
+        if not isinstance(post, dict):
+            continue
+        tags = _get_post_tags(post)
+        if not tags:
+            continue
+        post['tags'] = tags
+        file_url = _get_post_file_url(post)
+        if file_url:
+            post['file_url'] = file_url
+        normalized.append(post)
     return normalized
 
 
@@ -1330,6 +1360,73 @@ def _fetch_booru_posts_with_fallback(
     return posts
 
 
+class _BooruPipelineClient:
+    """Adapts the Forge entry module's HTTP clients to the pure pipeline protocol."""
+
+    def __init__(self, client, request, add_tags):
+        self.client = client
+        self.request = request
+        self.add_tags = add_tags
+
+    def fetch(self):
+        try:
+            return _fetch_booru_posts_with_fallback(
+                self.client,
+                self.request.service,
+                self.add_tags,
+                self.request.max_pages,
+                self.request.post_id,
+                self.request.tag_categories,
+                self.request.tags,
+                self.request.mature_rating,
+            )
+        except requests.exceptions.RequestException as error:
+            raise RetryExhaustedError(str(error)) from error
+
+    def close(self):
+        self.client.close()
+
+
+def _pipeline_request_tags(service, tags, mature_rating):
+    add_tags = '&tags=-animated'
+    if tags:
+        add_tags += '+' + str(tags).replace(',', '+')
+    return add_tags + _get_rating_tag(service, mature_rating)
+
+
+def _pipeline_saved_credentials(service):
+    if service not in ('gelbooru', 'rule34'):
+        return {}
+    saved = credentials_manager.get_booru_credentials(service)
+    return {
+        service: CredentialInput(
+            service=service,
+            api_key=str(saved.get('api_key') or ''),
+            user_id=str(saved.get('user_id') or ''),
+        )
+    }
+
+
+def _pipeline_client_factory(use_cache, fringe_benefits):
+    def factory(request, credential):
+        client = _create_booru_api(
+            request.service,
+            fringe_benefits,
+            credential.api_key if request.service == 'gelbooru' else None,
+            credential.user_id if request.service == 'gelbooru' else None,
+            credential.api_key if request.service == 'rule34' else None,
+            credential.user_id if request.service == 'rule34' else None,
+        )
+        client.configure_http_cache(use_cache)
+        return _BooruPipelineClient(
+            client,
+            request,
+            _pipeline_request_tags(request.service, request.tags, request.mature_rating),
+        )
+
+    return factory
+
+
 def _create_booru_api(
     booru,
     fringe_benefits=True,
@@ -1361,7 +1458,7 @@ def _fetch_image(fetcher, url, headers=None):
         image.load()
         return image.convert('RGB')
     except Exception as error:
-        print(f'[Ranbooru] Could not fetch image {url}: {error}')
+        log_event(logger, "image_failure", "Could not fetch image %s: %s", redact_sensitive(url), error)
         return None
 
 
@@ -1374,11 +1471,11 @@ def _send_to_controlnet_legacy(p, image, denoising):
         get_units = getattr(controlnet_module, 'get_all_units_in_processing', None)
         update_units = getattr(controlnet_module, 'update_cn_script_in_processing', None)
         if get_units is None or update_units is None:
-            print('[Ranbooru] ControlNet legacy API is unavailable; skipping Send to Controlnet.')
+            logger.warning("ControlNet legacy API is unavailable; skipping Send to Controlnet")
             return False
         controlnet_units = list(get_units(p) or [])
         if not controlnet_units:
-            print('[Ranbooru] No ControlNet units found; skipping Send to Controlnet.')
+            logger.warning("No ControlNet units found; skipping Send to Controlnet")
             return False
         copied_network = controlnet_units[0].__dict__.copy()
         copied_network['enabled'] = True
@@ -1390,7 +1487,7 @@ def _send_to_controlnet_legacy(p, image, denoising):
         update_units(p, [copied_network] + controlnet_units[1:])
         return True
     except Exception as error:
-        print(f'[Ranbooru] ControlNet send failed: {error}')
+        logger.error("ControlNet send failed: %s", error)
         return False
 
 
@@ -1519,7 +1616,7 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
             if not isinstance(raw_posts, list):
                 raw_posts = []
             if len(raw_posts) == 0:
-                print(f"[TagCache] 第 {page+1} 页无数据，停止抓取")
+                logger.info("Tag cache page %s returned no data; stopping", page + 1)
                 stats["stop_reason"] = "empty_page"
                 break
             posts = _normalize_posts(raw_posts)
@@ -1576,9 +1673,15 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                     stats["kept"] += 1
                 else:
                     stats["skipped_empty"] += 1
-            print(f"[TagCache] 第 {page+1}/{start_page_index + max_pages} 页完成，获取 {len(raw_posts)} 条，规范化 {len(posts)} 条")
+            logger.info(
+                "Tag cache page %s/%s complete: fetched %s, normalized %s",
+                page + 1,
+                start_page_index + max_pages,
+                len(raw_posts),
+                len(posts),
+            )
         except Exception as ex:
-            print(f"[TagCache] 第 {page+1} 页出错: {ex}")
+            logger.error("Tag cache page %s failed: %s", page + 1, ex)
             stats["complete"] = False
             stats["error"] = str(ex)
             stats["error_page"] = page + 1
@@ -1633,11 +1736,7 @@ class Script(scripts.Script):
             self.prompt_area[i2i] = component.component if hasattr(component, "component") else component
         except Exception:
             self.prompt_area[i2i] = None
-    previous_loras = ''
-    last_img = []
-    real_steps = 0
-    version = "1.3"
-    original_prompt = ''
+    version = __version__
 
     def get_files(self, path):
         files = []
@@ -1645,13 +1744,6 @@ class Script(scripts.Script):
             if file.endswith('.txt'):
                 files.append(file)
         return files
-
-    def hide_object(self, obj, booru):
-        print(f'hide_object: {obj}, {booru.value}')
-        if booru.value == 'konachan' or booru.value == 'yande.re':
-            obj.interactive = False
-        else:
-            obj.interactive = True
 
     def title(self):
         return "Ranbooru"
@@ -1704,16 +1796,6 @@ class Script(scripts.Script):
             gr.update(visible=False, value=""),
             gr.update(visible=False)
         )
-
-    def save_gelbooru_credentials(self, booru, api_key, user_id, save_credentials):
-        """Save Gelbooru credentials if checkbox is checked"""
-        if booru == 'gelbooru' and save_credentials and api_key.strip() and user_id.strip():
-            credentials_manager.save_booru_credentials('gelbooru', api_key.strip(), user_id.strip())
-            return "✓ Credentials saved"
-        elif booru == 'gelbooru' and not save_credentials:
-            # Optionally clear credentials if save is unchecked
-            return "Credentials will not be saved"
-        return ""
 
     def refresh_ser(self):
         return gr.update(choices=self.get_files(user_search_dir))
@@ -2080,17 +2162,6 @@ class Script(scripts.Script):
         return result.get("message", "跳转失败"), Script._cache_refresh_status()
 
     @staticmethod
-    def _cache_delete_by_position(position):
-        """根据真实缓存序号删除标签"""
-        cache_position = Script._parse_cache_id(position)
-        if cache_position is None:
-            return "请输入有效的缓存序号", tag_cache_manager.get_status()
-        success = tag_cache_manager.delete_by_position(cache_position)
-        if success:
-            return f"已删除第 {cache_position} 条", tag_cache_manager.get_status()
-        return f"删除失败：未找到第 {cache_position} 条", tag_cache_manager.get_status()
-
-    @staticmethod
     def _cache_delete_by_id(tag_id):
         stable_id = Script._parse_cache_id(tag_id)
         if stable_id is None:
@@ -2164,13 +2235,6 @@ class Script(scripts.Script):
     @staticmethod
     def _cache_preview_delete_all():
         return Script._format_delete_preview(tag_cache_manager.preview_delete_all())
-
-    @staticmethod
-    def _cache_preview_delete_by_position(position):
-        cache_position = Script._parse_cache_id(position)
-        if cache_position is None:
-            return "请输入有效的缓存序号"
-        return Script._format_delete_preview(tag_cache_manager.preview_delete_by_positions(str(cache_position)))
 
     @staticmethod
     def _cache_preview_delete_by_id(tag_id):
@@ -2286,6 +2350,10 @@ class Script(scripts.Script):
         model,
         api_key,
         timeout,
+        rag_enabled,
+        rag_top_k,
+        rag_min_percentile,
+        rag_context_chars,
     ):
         settings = credentials_manager.save_natural_language_settings(
             preset,
@@ -2295,6 +2363,10 @@ class Script(scripts.Script):
             model,
             api_key,
             timeout,
+            rag_enabled,
+            rag_top_k,
+            rag_min_percentile,
+            rag_context_chars,
         )
         key_status = "已保存 API Key" if settings["api_key"] else "API Key 为空"
         return f"LLM 设置已保存；{key_status}。"
@@ -2310,6 +2382,10 @@ class Script(scripts.Script):
             "",
             "",
             120,
+            False,
+            3,
+            75,
+            3000,
             "已清除保存的 LLM 设置和 API Key。",
         )
 
@@ -2368,6 +2444,10 @@ class Script(scripts.Script):
         model,
         api_key,
         timeout,
+        rag_enabled,
+        rag_top_k,
+        rag_min_percentile,
+        rag_context_chars,
     ):
         if not str(position_spec or "").strip():
             yield (
@@ -2384,6 +2464,26 @@ class Script(scripts.Script):
         if not str(model or "").strip():
             yield (
                 "请填写模型名称。",
+                Script._natural_language_cache_status(),
+            )
+            return
+        try:
+            saved_settings = credentials_manager.save_natural_language_settings(
+                preset,
+                backend,
+                endpoint_policy,
+                endpoint,
+                model,
+                api_key,
+                timeout,
+                rag_enabled,
+                rag_top_k,
+                rag_min_percentile,
+                rag_context_chars,
+            )
+        except OSError as error:
+            yield (
+                f"批量转换未开始：保存 LLM 设置失败：{error}",
                 Script._natural_language_cache_status(),
             )
             return
@@ -2407,18 +2507,55 @@ class Script(scripts.Script):
             )
             return
         config = NaturalLanguageConfig(
-            backend=str(backend or NATURAL_LANGUAGE_OFF),
-            endpoint=str(endpoint or "").strip(),
-            model=str(model or "").strip(),
-            api_key=credentials_manager.resolve_natural_language_api_key(
-                api_key,
-                backend,
-                endpoint,
-            ),
-            timeout=timeout,
-            preset=str(preset or PRESET_KREA2),
-            endpoint_policy=str(endpoint_policy or NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED),
+            backend=saved_settings["backend"],
+            endpoint=saved_settings["endpoint"],
+            model=saved_settings["model"],
+            api_key=saved_settings["api_key"],
+            timeout=saved_settings["timeout"],
+            preset=saved_settings["preset"],
+            endpoint_policy=saved_settings["endpoint_policy"],
+            few_shot_max_chars=saved_settings.get("rag_context_chars", 3000),
         )
+        rag_enabled = bool(saved_settings.get("rag_enabled", False))
+        rag_top_k = int(saved_settings.get("rag_top_k", 3))
+        rag_min_percentile = (
+            float(saved_settings.get("rag_min_percentile", 75)) / 100.0
+        )
+        rag_warning = ""
+        try:
+            rag_candidates = (
+                tag_cache_manager.get_prompt_rag_candidates(
+                    preset=config.preset,
+                    min_score_percentile=rag_min_percentile,
+                )
+                if rag_enabled
+                else []
+            )
+        except Exception as error:
+            rag_candidates = []
+            rag_warning = "；RAG 候选读取失败，已回退 Zero-Shot"
+            logger.warning("Prompt RAG candidate loading failed: %s", error)
+        rag_queries_with_examples = 0
+        rag_examples_used = 0
+
+        def retrieve_examples(original):
+            nonlocal rag_queries_with_examples, rag_examples_used
+            examples = tag_cache_manager.select_prompt_rag_examples(
+                original,
+                rag_candidates,
+                limit=rag_top_k,
+            )
+            injected_count = len(
+                CachedTagNaturalLanguageConverter._few_shot_messages(
+                    examples,
+                    max_chars=config.few_shot_max_chars,
+                )
+            ) // 2
+            if injected_count:
+                rag_queries_with_examples += 1
+                rag_examples_used += injected_count
+            return examples
+
         converter = CachedTagNaturalLanguageConverter()
         pending_updates = []
         processed = 0
@@ -2448,7 +2585,9 @@ class Script(scripts.Script):
 
         try:
             yield (
-                f"已选择 {len(records)} 条整记录，数据库备份完成；开始调用模型。",
+                f"已保存 LLM 设置和服务地址；已选择 {len(records)} 条整记录，"
+                f"数据库备份完成；本地 RAG 候选 {len(rag_candidates)} 条"
+                f"{rag_warning}；开始调用模型。",
                 Script._natural_language_cache_status(),
             )
             for index, original, converted, error, was_reused in iter_cached_tag_conversions(
@@ -2456,6 +2595,7 @@ class Script(scripts.Script):
                 config,
                 converter,
                 should_cancel=_natural_batch_cancel.is_set,
+                example_provider=retrieve_examples if rag_enabled else None,
             ):
                 processed = index + 1
                 if error:
@@ -2543,6 +2683,7 @@ class Script(scripts.Script):
                 (
                     f"批量预转换完成：选择 {len(records)} 条，保存 {saved} 条，"
                     f"复用相同整条 Tag 的结果 {reused} 条，"
+                    f"RAG 命中 {rag_queries_with_examples} 条并注入 {rag_examples_used} 个样例，"
                     f"超时跳过 {timeout_skipped} 条，"
                     f"源记录变化或已删除 {stale} 条。备份：{backup_path}"
                 ),
@@ -2575,6 +2716,10 @@ class Script(scripts.Script):
         model,
         api_key,
         timeout,
+        rag_enabled,
+        rag_top_k,
+        rag_min_percentile,
+        rag_context_chars,
     ):
         if not _natural_batch_lock.acquire(blocking=False):
             yield (
@@ -2594,6 +2739,10 @@ class Script(scripts.Script):
                 model,
                 api_key,
                 timeout,
+                rag_enabled,
+                rag_top_k,
+                rag_min_percentile,
+                rag_context_chars,
             )
         finally:
             _natural_batch_lock.release()
@@ -2734,6 +2883,43 @@ class Script(scripts.Script):
             )
         except (TypeError, ValueError):
             saved_natural_timeout = 120.0
+        saved_rag_enabled = saved_natural_settings.get("rag_enabled", False)
+        if isinstance(saved_rag_enabled, str):
+            saved_rag_enabled = saved_rag_enabled.strip().lower() not in {
+                "0", "false", "no", "off"
+            }
+        else:
+            saved_rag_enabled = bool(saved_rag_enabled)
+        try:
+            saved_rag_top_k = max(
+                1,
+                min(5, int(float(saved_natural_settings.get("rag_top_k", 3)))),
+            )
+        except (TypeError, ValueError, OverflowError):
+            saved_rag_top_k = 3
+        try:
+            saved_rag_min_percentile = max(
+                0.0,
+                min(
+                    100.0,
+                    float(saved_natural_settings.get("rag_min_percentile", 75)),
+                ),
+            )
+        except (TypeError, ValueError, OverflowError):
+            saved_rag_min_percentile = 75.0
+        try:
+            saved_rag_context_chars = max(
+                0,
+                min(
+                    12000,
+                    int(float(saved_natural_settings.get("rag_context_chars", 3000))),
+                ),
+            )
+        except (TypeError, ValueError, OverflowError):
+            saved_rag_context_chars = 3000
+        saved_natural_has_api_key = bool(
+            str(saved_natural_settings.get("api_key", "")).strip()
+        )
         # Determine initial Gelbooru credential visibility based on saved credentials
         has_saved = credentials_manager.has_credentials('gelbooru')
         initial_api_key_visible = not has_saved
@@ -2920,6 +3106,8 @@ class Script(scripts.Script):
                                     "结果，未转换的记录自动回退为原始 Tag，不会临时调用模型。\n\n"
                                     "Krea 2 预设采用紧凑自然语言：优先描述媒介、主体、动作、场景、构图、"
                                     "时间/光线与单一风格锚点，并去掉 masterpiece、8k 等空泛质量词。\n\n"
+                                    "启用本地 RAG 后，会从有效的已转换缓存中检索相似且高分的记录，"
+                                    "作为 Few-Shot 示例并发送到当前模型服务；没有可用样例时自动使用 Zero-Shot。\n\n"
                                     "仅使用你信任的模型服务：OpenAI 兼容模式会把选中的缓存 Tag "
                                     "发送到所填地址；共享或公网 WebUI 应限制此面板的访问。"
                                 )
@@ -2938,6 +3126,35 @@ class Script(scripts.Script):
                                     cache_natural_language_only_missing = gr.Checkbox(
                                         label="只转换尚未转换的记录",
                                         value=True,
+                                    )
+                                with gr.Row():
+                                    cache_prompt_rag_enabled = gr.Checkbox(
+                                        label="启用本地高分 Prompt RAG / Few-Shot",
+                                        value=saved_rag_enabled,
+                                    )
+                                    cache_prompt_rag_top_k = gr.Number(
+                                        label="Few-Shot 样例数",
+                                        minimum=1,
+                                        maximum=5,
+                                        value=saved_rag_top_k,
+                                        step=1,
+                                        precision=0,
+                                    )
+                                    cache_prompt_rag_min_percentile = gr.Number(
+                                        label="RAG 候选最低分位（%）",
+                                        minimum=0,
+                                        maximum=100,
+                                        value=saved_rag_min_percentile,
+                                        step=1,
+                                        precision=0,
+                                    )
+                                    cache_prompt_rag_context_chars = gr.Number(
+                                        label="Few-Shot 上下文字符预算",
+                                        minimum=0,
+                                        maximum=12000,
+                                        value=saved_rag_context_chars,
+                                        step=250,
+                                        precision=0,
                                     )
                                 cache_natural_language_preset = gr.Dropdown(
                                     NATURAL_LANGUAGE_PRESETS,
@@ -2986,10 +3203,18 @@ class Script(scripts.Script):
                                         lines=1,
                                     )
                                     cache_natural_language_api_key = gr.Textbox(
-                                        label="API Key（Ollama 可留空）",
+                                        label=(
+                                            "API Key（已保存，无需重填）"
+                                            if saved_natural_has_api_key
+                                            else "API Key（Ollama 可留空）"
+                                        ),
                                         type="password",
                                         value="",
-                                        placeholder="Saved API key stays on the server; leave blank to keep it.",
+                                        placeholder=(
+                                            "已保存到服务器；留空继续使用，输入新值可替换。"
+                                            if saved_natural_has_api_key
+                                            else "输入后会与服务地址等 LLM 设置一起保存。"
+                                        ),
                                         lines=1,
                                     )
                                 with gr.Row():
@@ -3002,7 +3227,9 @@ class Script(scripts.Script):
                                 cache_natural_language_settings_status = gr.Textbox(
                                     label="LLM 设置",
                                     value=(
-                                        "已加载保存的 LLM 设置。"
+                                        "已加载保存的 LLM 设置；API Key 无需重填。"
+                                        if saved_natural_has_api_key
+                                        else "已加载保存的 LLM 设置。"
                                         if saved_natural_settings
                                         else "尚未保存 LLM 设置。"
                                     ),
@@ -3227,6 +3454,10 @@ class Script(scripts.Script):
                 cache_natural_language_model,
                 cache_natural_language_api_key,
                 cache_natural_language_timeout,
+                cache_prompt_rag_enabled,
+                cache_prompt_rag_top_k,
+                cache_prompt_rag_min_percentile,
+                cache_prompt_rag_context_chars,
             ],
             outputs=[cache_natural_language_settings_status],
         )
@@ -3241,6 +3472,10 @@ class Script(scripts.Script):
                 cache_natural_language_model,
                 cache_natural_language_api_key,
                 cache_natural_language_timeout,
+                cache_prompt_rag_enabled,
+                cache_prompt_rag_top_k,
+                cache_prompt_rag_min_percentile,
+                cache_prompt_rag_context_chars,
                 cache_natural_language_settings_status,
             ],
         )
@@ -3265,6 +3500,10 @@ class Script(scripts.Script):
                 cache_natural_language_model,
                 cache_natural_language_api_key,
                 cache_natural_language_timeout,
+                cache_prompt_rag_enabled,
+                cache_prompt_rag_top_k,
+                cache_prompt_rag_min_percentile,
+                cache_prompt_rag_context_chars,
             ],
             outputs=[
                 cache_natural_language_preview,
@@ -3475,7 +3714,7 @@ class Script(scripts.Script):
                 outputs=[cache_next_output, cache_status_display]
             )
 
-        return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, cache_prompt_write_mode, use_preconverted_cache_prompt]
+        return [enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, use_local_cache_gen, use_local_cache_loop, tag_categories, cache_prompt_write_mode, use_preconverted_cache_prompt]
 
     def check_orientation(self, img):
         """Check if image is portrait, landscape or square"""
@@ -3496,12 +3735,12 @@ class Script(scripts.Script):
                 try:
                     loras = os.listdir(f'{lora_folder}')
                 except Exception as error:
-                    print(f'[Ranbooru] Could not list LoRA folder {lora_folder}: {error}')
+                    logger.error("Could not list LoRA folder %s: %s", lora_folder, error)
                     return p
                 # get only .safetensors files
                 loras = [lora.replace('.safetensors', '') for lora in loras if lora.endswith('.safetensors')]
                 if not loras:
-                    print(f'[Ranbooru] No .safetensors LoRAs found in {lora_folder}; skipping LoRA injection.')
+                    logger.warning("No .safetensors LoRAs found in %s; skipping LoRA injection", lora_folder)
                     return p
                 custom_weights = []
                 if lora_custom_weights != '':
@@ -3527,7 +3766,7 @@ class Script(scripts.Script):
                 p.prompt = f'{lora_prompt} {p.prompt}'
         return p
 
-    def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
+    def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
         max_pages = _normalize_max_pages(max_pages)
         cache_prompt_write_mode = args[0] if args else "追加到后面"
         use_preconverted_cache_prompt = bool(args[1]) if len(args) > 1 else True
@@ -3538,18 +3777,18 @@ class Script(scripts.Script):
             self.real_steps = 0
             self.original_prompt = p.prompt if isinstance(p.prompt, list) else str(p.prompt or '')
         if use_cache and not HAS_REQUESTS_CACHE:
-            print('requests-cache not installed; running without cache')
+            logger.warning("requests-cache is not installed; running without cache")
 
         if enabled:
             if use_local_cache_gen:
                 # 任务ID（A1111 通常有 job_timestamp）
                 # 1) 先拦截 Hires.fix 第二段
                 if _is_hires_second_pass(p):
-                    print("[Ranbooru] 🟡 Hires.fix 第二段，跳过本地缓存取Tag（不推进索引）")
+                    logger.debug("Hires.fix second pass; skipping local cache without advancing cursor")
                     return
                 # 2) 再做同任务防重（保险）
                 if job_id in self._local_cache_applied_jobs:
-                    print(f"[Ranbooru] 🟡 任务 {job_id} 已注入过缓存，跳过重复注入（不推进索引）")
+                    logger.debug("Job %s already received cache prompts; skipping duplicate injection", job_id)
                     return
                 # Keep the current job in the dedupe set while bounding memory.
                 # Clearing the whole set here used to remove the just-added job
@@ -3559,7 +3798,7 @@ class Script(scripts.Script):
                     oldest_job_id = next(iter(self._local_cache_applied_jobs))
                     self._local_cache_applied_jobs.pop(oldest_job_id, None)
                 self._local_cache_applied_jobs[job_id] = None
-                print("[Ranbooru] 🟢 已启用本地缓存模式，执行一次缓存注入。")
+                logger.info("Local cache mode enabled; injecting cached prompts")
                 # 下面保持你原来的取缓存逻辑不变...
 
                 # 计算本次批量生成的总数量 (Batch count * Batch size)
@@ -3573,18 +3812,22 @@ class Script(scripts.Script):
                 cache_prompts = [entry["prompt"] for entry in cache_entries]
                 natural_prompt_flags = [bool(entry["is_natural"]) for entry in cache_entries]
                 if len(cache_prompts) < total_images:
-                    print(
-                        f"[Ranbooru] ⚠️ 缓存已耗尽 "
-                        f"(Index: {idx}/{total})，缺少 {total_images - len(cache_prompts)} 条。"
+                    logger.warning(
+                        "Cache exhausted at index %s/%s; missing %s prompts",
+                        idx,
+                        total,
+                        total_images - len(cache_prompts),
                     )
                     cache_prompts.extend([""] * (total_images - len(cache_prompts)))
                     natural_prompt_flags.extend(
                         [False] * (total_images - len(natural_prompt_flags))
                     )
                 else:
-                    print(
-                        f"[Ranbooru] 📝 已原子读取 {len(cache_prompts)} 条缓存 "
-                        f"(Index: {idx}/{total})"
+                    logger.info(
+                        "Atomically read %s cache prompts at index %s/%s",
+                        len(cache_prompts),
+                        idx,
+                        total,
                     )
                 if change_dash:
                     cache_prompts = [
@@ -3616,9 +3859,9 @@ class Script(scripts.Script):
                     p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev)
                     _sync_prompt_lists(p)
                 if use_img2img or use_ip or use_deepbooru:
-                    print(
-                        "[Ranbooru] Local cache prompt mode has no guaranteed source image; "
-                        "Img2Img, ControlNet image injection and DeepBooru were skipped for this task."
+                    logger.warning(
+                        "Local cache mode has no guaranteed source image; skipped Img2Img, "
+                        "ControlNet image injection, and DeepBooru"
                     )
 
                 # 直接结束 before_process，跳过后续所有联网代码
@@ -3657,7 +3900,7 @@ class Script(scripts.Script):
             try:
                 check_exception(booru, {'tags': tags, 'post_id': post_id})
             except Exception as error:
-                print(f'[Ranbooru] {error}; skipping prompt injection.')
+                logger.error("%s; skipping prompt injection", error)
                 return p
 
             # Manage Bad Tags — use global DEFAULT_BAD_TAGS
@@ -3715,18 +3958,28 @@ class Script(scripts.Script):
                     selected_tags = random.choice(filtered_tags)
                     tags = f'{tags},{selected_tags}' if tags else selected_tags
                 else:
-                    print('No tags found in search file; skipping')
-
-            add_tags = '&tags=-animated'
-            if tags:
-                add_tags += '+' + tags.replace(',', '+')
-            add_tags += _get_rating_tag(booru, mature_rating)
+                    logger.warning("No tags found in search file; skipping")
 
             # Getting Data
             random_post = {'preview_url': ''}
             prompts = []
             last_img = []
             preview_urls = []
+            logger.info("Using %s", booru)
+            credential = CredentialInput(
+                service=booru,
+                api_key=(gelbooru_api_key if booru == 'gelbooru' else rule34_api_key) or '',
+                user_id=(gelbooru_user_id if booru == 'gelbooru' else rule34_user_id) or '',
+            )
+            request = BooruRequestConfig(
+                service=booru,
+                tags=str(tags or ''),
+                max_pages=max_pages,
+                post_id=str(post_id or ''),
+                mature_rating=mature_rating,
+                sorting_order=sorting_order,
+                tag_categories=tuple(tag_categories or ()),
+            )
             api_url = _create_booru_api(
                 booru,
                 fringe_benefits,
@@ -3736,62 +3989,60 @@ class Script(scripts.Script):
                 rule34_user_id,
             )
             api_url.configure_http_cache(use_cache)
-            print(f'Using {booru}')
-
-            # Manage Post ID
             try:
-                posts = _fetch_booru_posts_with_fallback(
-                    api_url,
-                    booru,
-                    add_tags,
-                    max_pages,
-                    post_id,
-                    tag_categories,
-                    tags,
-                    mature_rating,
+                result = generate_online_prompt(
+                    request,
+                    PromptTransformConfig(
+                        remove_bad_tags=True,
+                        custom_remove=tuple(bad_tags),
+                        shuffle_tags=shuffle_tags,
+                        mix_amount=mix_amount if mix_prompt else 0,
+                    ),
+                    credential,
+                    lambda pipeline_request, _credential: _BooruPipelineClient(
+                        api_url,
+                        pipeline_request,
+                        _pipeline_request_tags(
+                            pipeline_request.service,
+                            pipeline_request.tags,
+                            pipeline_request.mature_rating,
+                        ),
+                    ),
+                    rng=random,
                 )
-                print(re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(api_url.booru_url)))
-            except Exception as error:
-                print(_format_ranbooru_error(booru, error))
-                return p
             finally:
                 api_url.close()
-            if len(posts) == 0:
-                print('No posts found; skipping Ranbooru prompt injection.')
+            if result.error:
+                logger.error("%s", _format_ranbooru_error(booru, result.error))
                 return p
-            data = {'post': posts}
-            # Replace null scores with 0s
-            for post in posts:
-                if isinstance(post, dict):
-                    score = post.get('score')
-                    try:
-                        post['score'] = int(score) if score not in (None, '') else 0
-                    except Exception:
-                        post['score'] = 0
-            # Sort based on sorting_order
-            if sorting_order == 'High Score':
-                data['post'] = sorted(posts, key=lambda k: (k.get('score') if isinstance(k, dict) else 0) or 0, reverse=True)
-            elif sorting_order == 'Low Score':
-                data['post'] = sorted(posts, key=lambda k: (k.get('score') if isinstance(k, dict) else 0) or 0)
-            else:
-                data['post'] = posts
+            if result.empty:
+                logger.warning("No posts found; skipping Ranbooru prompt injection")
+                return p
+            posts = [
+                {
+                    **post,
+                    'tags': ' '.join(post['tags']),
+                    'source': post['source_url'],
+                }
+                for post in result.posts
+            ]
             if post_id:
-                print(f'Using post ID: {post_id}')
+                logger.debug("Using post ID %s", post_id)
                 random_numbers = [0 for _ in range(0, p.batch_size * p.n_iter)]
             else:
-                random_numbers = self.random_number(sorting_order, p.batch_size * p.n_iter, len(data['post']))
+                random_numbers = self.random_number(sorting_order, p.batch_size * p.n_iter, len(posts))
             for random_number in random_numbers:
                 post_index = random_numbers[0] if same_prompt else random_number
-                if post_index >= len(data['post']):
-                    print('[Ranbooru] Selected post index is out of range; skipping this prompt.')
+                if post_index >= len(posts):
+                    logger.warning("Selected post index is out of range; skipping this prompt")
                     continue
-                random_post = data['post'][post_index]
+                random_post = posts[post_index]
                 if not same_prompt and mix_prompt:
                     temp_tags = []
                     mix_max_tags = 0
                     for _ in range(0, mix_amount):
-                        random_mix_number = 0 if post_id else self.random_number(sorting_order, 1, len(data['post']))[0]
-                        mix_tags = _get_post_tags(data['post'][random_mix_number]).split(' ')
+                        random_mix_number = 0 if post_id else self.random_number(sorting_order, 1, len(posts))[0]
+                        mix_tags = _get_post_tags(posts[random_mix_number]).split(' ')
                         temp_tags.extend(mix_tags)
                         mix_max_tags = max(mix_max_tags, len(mix_tags))
                     temp_tags = list(set(temp_tags))
@@ -3806,7 +4057,7 @@ class Script(scripts.Script):
                 preview_urls.append(_get_post_file_url(random_post))
                 # Debug picture
                 if DEBUG:
-                    print(random_post)
+                    logger.debug("Selected post metadata: %s", redact_sensitive(random_post))
             # Get Images
             if use_img2img or use_deepbooru:
                 image_urls = [_get_post_file_url(random_post)] if use_last_img else preview_urls
@@ -3831,7 +4082,7 @@ class Script(scripts.Script):
                 finally:
                     image_api_url.close()
                 if not last_img:
-                    print('[Ranbooru] Could not fetch any images; disabling img2img/DeepBooru for this run.')
+                    log_event(logger, "image_failure", "Could not fetch any images; disabling img2img/DeepBooru for this run")
                     use_img2img = False
                     use_ip = False
                     use_deepbooru = False
@@ -3848,10 +4099,10 @@ class Script(scripts.Script):
                 new_prompts.append(new_prompt)
             prompts = new_prompts
             if not prompts:
-                print('No usable tags found after filtering; skipping Ranbooru prompt injection.')
+                logger.warning("No usable tags found after filtering; skipping prompt injection")
                 return p
             if len(prompts) == 1:
-                print('Processing Single Prompt')
+                logger.debug("Processing single prompt")
                 if isinstance(p.prompt, list):
                     p.prompt = [_append_tags(prompt, prompts[-1]) for prompt in p.prompt]
                 else:
@@ -3875,7 +4126,7 @@ class Script(scripts.Script):
                         new_negative_prompts if len(new_negative_prompts) > 1 else new_negative_prompts[0]
                     )
             else:
-                print('Processing Multiple Prompts')
+                logger.debug("Processing multiple prompts")
                 base_prompts = _repeat_to_length(p.prompt, len(prompts))
                 base_negative_prompts = _repeat_to_length(p.negative_prompt, len(prompts))
                 negative_prompts = []
@@ -3943,7 +4194,7 @@ class Script(scripts.Script):
                 for pr in p.negative_prompt:
                     neg_prompt_tokens.append(get_prompt_lengths(pr)[1])
                 if len(set(neg_prompt_tokens)) != 1:
-                    print('Padding negative prompts')
+                    logger.debug("Padding negative prompts")
                     max_tokens = max(neg_prompt_tokens)
                     for num, neg in enumerate(neg_prompt_tokens):
                         while neg < max_tokens:
@@ -3988,7 +4239,7 @@ class Script(scripts.Script):
                         p.prompt = modify_prompt(p.prompt, tagged_prompt, type_deepbooru)
                         p.prompt = remove_repeated_tags(p.prompt)
                 except Exception as error:
-                    print(f'[Ranbooru] DeepBooru failed: {error}')
+                    logger.error("DeepBooru failed: %s", error)
             _sync_prompt_lists(p)
 
             if use_img2img and last_img:
@@ -4003,11 +4254,11 @@ class Script(scripts.Script):
             p = self.loranado(lora_enabled, lora_folder, lora_amount, lora_min, lora_max, lora_custom_weights, p, lora_lock_prev)
             _sync_prompt_lists(p)
 
-    def postprocess(self, p, processed, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, search_refresh_btn, remove_refresh_btn, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, credentials_status, clear_credentials_btn, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
+    def postprocess(self, p, processed, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
         if use_img2img and not use_ip and enabled:
-            print('Using pictures')
+            logger.info("Using source images")
             if not hasattr(self, 'last_img') or not self.last_img:
-                print('[Ranbooru] No source images available for img2img; skipping postprocess img2img.')
+                logger.warning("No source images available; skipping postprocess img2img")
                 return
             if crop_center:
                 width, height = p.width, p.height
@@ -4027,7 +4278,7 @@ class Script(scripts.Script):
                         final_prompts = modify_prompt(final_prompts, tagged_prompt, type_deepbooru)
                         final_prompts = remove_repeated_tags(final_prompts)
                 except Exception as error:
-                    print(f'[Ranbooru] DeepBooru failed during postprocess: {error}')
+                    logger.error("DeepBooru failed during postprocess: %s", error)
             p = StableDiffusionProcessingImg2Img(
                 sd_model=shared.sd_model,
                 outpath_samples=shared.opts.outdir_samples or shared.opts.outdir_img2img_samples,
@@ -4065,158 +4316,79 @@ class Script(scripts.Script):
     def generate_prompts_only(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_categories):
         max_pages = _normalize_max_pages(max_pages)
         if use_cache and not HAS_REQUESTS_CACHE:
-            print('requests-cache not installed; running without cache')
+            logger.warning("requests-cache is not installed; running without cache")
 
-        gelbooru_api_key = None
-        gelbooru_user_id = None
-        rule34_api_key = None
-        rule34_user_id = None
-        if booru == 'gelbooru':
-            if api_key.strip() and user_id.strip():
-                gelbooru_api_key = api_key.strip()
-                gelbooru_user_id = user_id.strip()
-                if save_credentials:
-                    credentials_manager.save_booru_credentials('gelbooru', gelbooru_api_key, gelbooru_user_id)
-            else:
-                saved_credentials = credentials_manager.get_booru_credentials('gelbooru')
-                gelbooru_api_key = saved_credentials.get('api_key', '')
-                gelbooru_user_id = saved_credentials.get('user_id', '')
-        if booru == 'rule34':
-            if api_key.strip() and user_id.strip():
-                rule34_api_key = api_key.strip()
-                rule34_user_id = user_id.strip()
-                if save_credentials:
-                    credentials_manager.save_booru_credentials('rule34', rule34_api_key, rule34_user_id)
-            else:
-                saved_credentials = credentials_manager.get_booru_credentials('rule34')
-                rule34_api_key = saved_credentials.get('api_key', '')
-                rule34_user_id = saved_credentials.get('user_id', '')
+        supplied = CredentialInput(
+            service=booru,
+            api_key=str(api_key or '').strip(),
+            user_id=str(user_id or '').strip(),
+        )
+        credential = resolve_credentials(booru, supplied, _pipeline_saved_credentials(booru))
+        if save_credentials and credential.api_key and credential.user_id and booru in ('gelbooru', 'rule34'):
+            credentials_manager.save_booru_credentials(booru, credential.api_key, credential.user_id)
 
-        # Use global DEFAULT_BAD_TAGS
-        bad_tags = []
-        if remove_bad_tags:
-            bad_tags = list(DEFAULT_BAD_TAGS)
-        if ',' in remove_tags:
-            bad_tags.extend(remove_tags.split(','))
-        else:
-            if remove_tags:
-                bad_tags.append(remove_tags)
+        custom_remove = [item.strip() for item in str(remove_tags or '').split(',') if item.strip()]
         if use_remove_txt:
-            bad_tags.extend(_safe_read_csv_file(user_remove_dir, choose_remove_txt))
-
-        prompt_addition = ''
-        background_options = {
-            'Add Background': ('detailed_background,' + random.choice(["outdoors", "indoors"]), COLORED_BG),
-            'Remove Background': ('plain_background,simple_background,' + random.choice(COLORED_BG), ADD_BG),
-            'Remove All': ('', COLORED_BG + ADD_BG)
-        }
-        if change_background in background_options:
-            pa, tags_to_remove = background_options[change_background]
-            bad_tags.extend(tags_to_remove)
-            prompt_addition = pa
-
-        color_options = {
-            'Colored': BW_BG,
-            'Limited Palette': '(limited_palette:1.3)',
-            'Monochrome': ','.join(BW_BG)
-        }
-        if change_color in color_options:
-            co = color_options[change_color]
-            if isinstance(co, list):
-                bad_tags.extend(co)
-            else:
-                prompt_addition = f'{prompt_addition},{co}' if prompt_addition else co
-
+            custom_remove.extend(_safe_read_csv_file(user_remove_dir, choose_remove_txt))
         if use_search_txt:
-            search_tags = _safe_read_text_file(user_search_dir, choose_search_txt)
-            search_tags_r = search_tags.replace(' ', '')
-            split_tags = search_tags_r.splitlines()
-            filtered_tags = [line for line in split_tags if line.strip()]
-            if filtered_tags:
-                selected_tags = random.choice(filtered_tags)
+            search_tags = [
+                line.strip()
+                for line in _safe_read_text_file(user_search_dir, choose_search_txt).splitlines()
+                if line.strip()
+            ]
+            if search_tags:
+                selected_tags = random.choice(search_tags).replace(' ', '')
                 tags = f'{tags},{selected_tags}' if tags else selected_tags
 
-        add_tags = '&tags=-animated'
-        if tags:
-            add_tags += '+' + tags.replace(',', '+')
-        add_tags += _get_rating_tag(booru, mature_rating)
+        background_tags = []
+        if change_background == 'Add Background':
+            background_tags = ('detailed_background', random.choice(('outdoors', 'indoors')))
+        elif change_background == 'Remove Background':
+            background_tags = ('plain_background', 'simple_background', random.choice(COLORED_BG))
+            custom_remove.extend(ADD_BG)
+        elif change_background == 'Remove All':
+            custom_remove.extend(COLORED_BG + ADD_BG)
+        color_tags = []
+        if change_color == 'Colored':
+            custom_remove.extend(BW_BG)
+        elif change_color == 'Limited Palette':
+            color_tags = ('(limited_palette:1.3)',)
+        elif change_color == 'Monochrome':
+            color_tags = tuple(BW_BG)
 
-        api_url = _create_booru_api(
-            booru,
-            fringe_benefits,
-            gelbooru_api_key,
-            gelbooru_user_id,
-            rule34_api_key,
-            rule34_user_id,
+        request = BooruRequestConfig(
+            service=booru,
+            tags=str(tags or ''),
+            max_pages=max_pages,
+            post_id=str(post_id or ''),
+            mature_rating=mature_rating,
+            sorting_order=sorting_order,
+            tag_categories=tuple(tag_categories or ()),
         )
-        api_url.configure_http_cache(use_cache)
-        try:
-            try:
-                data = _fetch_booru_data(api_url, booru, add_tags, max_pages, post_id, tag_categories)
-            except Exception as error:
-                return _format_ranbooru_error(booru, error)
-            posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
-            if len(posts) == 0 and booru == 'rule34' and add_tags.startswith('&tags=-animated'):
-                ft = '&tags='
-                if tags:
-                    ft += tags.replace(',', '+')
-                ft += _get_rating_tag(booru, mature_rating)
-                try:
-                    data = api_url.get_data(ft, max_pages)
-                except Exception as error:
-                    return _format_ranbooru_error(booru, error)
-                posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
-        finally:
-            api_url.close()
-        if len(posts) == 0:
+        transform = PromptTransformConfig(
+            remove_bad_tags=remove_bad_tags,
+            bad_tags=tuple(DEFAULT_BAD_TAGS),
+            custom_remove=tuple(custom_remove),
+            change_dash=change_dash,
+            shuffle_tags=shuffle_tags,
+            limit_ratio=limit_tags if limit_tags < 1 else 1.0,
+            max_tags=max_tags,
+            background_tags=tuple(background_tags),
+            color_tags=tuple(color_tags),
+            mix_amount=mix_amount if mix_prompt else 0,
+        )
+        result = generate_online_prompt(
+            request,
+            transform,
+            credential,
+            _pipeline_client_factory(use_cache, fringe_benefits),
+            rng=random,
+        )
+        if result.error:
+            return _format_ranbooru_error(booru, result.error)
+        if result.empty or not result.prompt:
             return NO_POSTS_MESSAGE
-
-        for post in posts:
-            if isinstance(post, dict):
-                s = post.get('score')
-                try:
-                    post['score'] = int(s) if s not in (None, '') else 0
-                except Exception:
-                    post['score'] = 0
-        if sorting_order == 'High Score':
-            posts = sorted(posts, key=lambda k: (k.get('score') if isinstance(k, dict) else 0) or 0, reverse=True)
-        elif sorting_order == 'Low Score':
-            posts = sorted(posts, key=lambda k: (k.get('score') if isinstance(k, dict) else 0) or 0)
-
-        rn = self.random_number(sorting_order, 1, len(posts))[0]
-        if mix_prompt:
-            temp_tags = []
-            mt = 0
-            for _ in range(0, mix_amount):
-                rm = self.random_number(sorting_order, 1, len(posts))[0]
-                mix_tags = _get_post_tags(posts[rm]).split(' ')
-                temp_tags.extend(mix_tags)
-                mt = max(mt, len(mix_tags))
-            temp_tags = list(set(temp_tags))
-            rp = posts[rn]
-            mt = min(max(len(temp_tags), 20), mt)
-            if temp_tags and mt > 0:
-                rp['tags'] = ' '.join(random.sample(temp_tags, min(len(temp_tags), mt)))
-        else:
-            rp = posts[rn]
-
-        raw_tags = _get_post_tags(rp)
-        if not raw_tags:
-            return NO_POSTS_MESSAGE
-        temp_tags = random.sample(raw_tags.split(' '), len(raw_tags.split(' '))) if shuffle_tags else raw_tags.split(' ')
-        tag_list = [t for t in temp_tags if t.strip() not in bad_tags]
-        for bt in bad_tags:
-            if '*' in bt:
-                tag_list = [t for t in tag_list if bt.replace('*', '') not in t]
-        prompt = ','.join(tag_list)
-        if change_dash:
-            prompt = prompt.replace('_', ' ')
-        if limit_tags < 1:
-            prompt = limit_prompt_tags(prompt, limit_tags, 'Limit')
-        if max_tags > 0:
-            prompt = limit_prompt_tags(prompt, max_tags, 'Max')
-        final_prompt = f'{prompt_addition},{prompt}' if prompt_addition else prompt
-        return final_prompt
+        return result.prompt
 
     def generate_and_set_prompt(self, booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_prompt_text, current_prompt, tag_categories, write_mode):
         final_prompt = self.generate_prompts_only(booru, max_pages, post_id, tags, remove_bad_tags, remove_tags, change_background, change_color, shuffle_tags, change_dash, mix_prompt, mix_amount, use_search_txt, choose_search_txt, use_remove_txt, choose_remove_txt, fringe_benefits, use_cache, api_key, user_id, save_credentials, mature_rating, sorting_order, limit_tags, max_tags, tag_categories)

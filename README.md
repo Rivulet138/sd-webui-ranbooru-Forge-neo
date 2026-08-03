@@ -4,6 +4,9 @@
 
 它可以从多个 Booru 站点抓取图片标签、清理并写入 Prompt，也可以把结果保存到本地 SQLite 数据库，按可见序号读取、批量管理和离线生成。缓存中的整条 Tag Prompt 还能提前通过 Ollama 或 OpenAI 兼容 LLM 转换为适合 Krea 2 的自然语言描述。
 
+> Forge owns the host packages; this extension manages only the dependency declared
+> by `install.py`.
+
 ![Ranbooru](pics/logo.png)
 
 ![Ranbooru 面板](pics/ranbooru.png)
@@ -151,6 +154,8 @@ user/cache/tag_cache.db
 
 可同时启用循环读取和“优先使用已预转换的自然语言 Prompt”。
 
+缓存读取游标只在当前 Forge 运行期间共享；重启 Forge 或重新加载插件后会从第 1 条开始，不会沿用上次运行保存的“已读”状态。
+
 本地缓存模式只有 Prompt，不保证存在源图片，因此 Img2Img、ControlNet 图片注入和 DeepBooru 图片分析会跳过。需要图片链路时请使用在线 Booru 模式。
 
 ## 批量转换为自然语言
@@ -206,14 +211,20 @@ http://127.0.0.1:1234/v1
 
 预设会保留原 Tag 中明确存在的角色、数量、颜色、关系和镜头信息，不虚构缺失内容；同时删除 `masterpiece`、`best quality`、`beautiful`、`stunning`、`8k`、score/source 等空泛质量词。
 
+### 本地高分 Prompt RAG / Few-Shot
+
+启用后，批量转换会从本地缓存中读取来源未变化、预设一致、转换器版本有效的自然语言记录。插件先在每个 Booru 内计算 Score 分位，再按 Tag Jaccard 相似度、查询 Tag 覆盖率和 Score 分位混合排序，选取最多 5 条作为 `user / assistant` 示例插入当前模型请求。默认只使用各站点前 25% 的高分记录，并拒绝只命中一个普通 Tag 的弱相关样例。
+
+检索只在本地 SQLite 缓存中完成，不需要 Embedding 模型或额外向量数据库。RAG 默认关闭；启用后，召回样例和当前 Tags 都会发送到配置的模型服务。示例只提供输出格式参考，最终请求仍要求模型不得复制当前 Tags 中不存在的视觉事实。没有相关且有效的已转换记录时会自动回退到原来的 Zero-Shot 转换；因此首次建立自然语言库时可以先转换一批高分记录，再对后续记录启用 RAG。
+
 ### 推荐操作流程
 
 1. 输入可见序号或范围，例如 `1-100`。
 2. 点击预览，确认选中记录。
 3. 保持“只转换尚未转换的记录”开启。
 4. 选择后端、模型和 Krea 2 预设。
-5. 根据需要保存 LLM 设置。
-6. 点击批量整条转换并保存。
+5. 根据缓存质量设置 RAG 候选最低分位、Few-Shot 样例数和上下文预算。
+6. 点击批量整条转换并保存；当前 LLM 与 RAG 设置会同时自动保存。
 7. 生成时保持“优先使用已预转换的自然语言 Prompt”开启。
 
 未转换或已经失效的记录会自动回退到原始 Tag。
@@ -247,7 +258,7 @@ http://127.0.0.1:1234/v1
 
 ## LLM 设置和 API Key
 
-点击 `保存 LLM 设置（含 API Key）` 会把配置写入：
+点击 `保存 LLM 设置（含 API Key）`，或直接开始批量转换，都会把配置写入：
 
 ```text
 user/credentials/credentials.json
@@ -263,7 +274,7 @@ user/credentials/credentials.json
 - API Key。
 - 请求超时。
 
-API Key 不会写入缓存数据库，也不会在重新打开界面时回填到浏览器。输入框留空时，插件只会为相同后端和相同端点复用服务端保存的 Key；更换端点不会携带旧 Key。
+服务地址会在重新打开界面时自动回填。API Key 不会写入缓存数据库，也不会把明文回填到浏览器；界面会提示 Key 已保存，输入框留空即可继续使用。插件只会为相同后端和相同服务地址复用服务端保存的 Key；更换地址不会携带旧 Key。
 
 凭据文件采用临时文件替换写入，并在支持的平台上尽量限制为当前用户读写。不要提交或分享 `user/credentials/credentials.json`。
 
@@ -349,18 +360,6 @@ user/remove/tags_remove.txt
 
 ## 故障排查
 
-### `ModuleNotFoundError: natural_prompt_schema`
-
-确认以下文件都存在：
-
-```text
-scripts/cache_db.py
-scripts/natural_language.py
-scripts/natural_prompt_schema.py
-```
-
-然后完整重启 Forge。当前版本已经兼容 Forge 把 `scripts/*.py` 作为独立模块加载的方式。
-
 ### 某条转换超时
 
 插件会自动重试 2 次并跳过该条。重新运行相同范围且保持“只转换尚未转换的记录”开启，即可继续处理剩余记录。
@@ -390,17 +389,15 @@ scripts/natural_prompt_schema.py
 ```text
 sd-webui-ranbooru-reforge/
 ├─ install.py
+├─ pyproject.toml
 ├─ README.md
 ├─ scripts/
-│  ├─ ranbooru.py
+│  ├─ booru_pipeline.py
 │  ├─ cache_db.py
 │  ├─ natural_language.py
-│  └─ natural_prompt_schema.py
-├─ tests/
-│  ├─ test_cache_natural_prompts.py
-│  ├─ test_forge_standalone_loading.py
-│  ├─ test_natural_language.py
-│  └─ test_ranbooru_contract.py
+│  ├─ ranbooru.py
+│  ├─ ranbooru_logging.py
+│  └─ version.py
 ├─ pics/
 └─ user/
    ├─ cache/
@@ -409,35 +406,19 @@ sd-webui-ranbooru-reforge/
    └─ remove/
 ```
 
-## 开发与验证
-
-在 Forge 虚拟环境中运行：
-
-```powershell
-E:\sd-webui-forge-neo\venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py" -v
-```
-
-当前版本包含 96 项自动化测试，覆盖：
-
-- Forge 独立脚本加载。
-- SQLite 迁移、备份、回滚和撤销顺序。
-- 并发去重、游标领取和多 Manager 破坏性操作串行。
-- 主缓存读取、可见序号和共享游标。
-- 几百条完整 Prompt 的选择与更新。
-- Ollama 和 OpenAI 兼容请求。
-- Krea 2 自然语言预设。
-- 超时、429/5xx、连接错误重试和取消。
-- API Key 服务端持久化且不回填浏览器。
-- 自然语言 Prompt 与原始 Tag 管线隔离。
-- Booru Session 异常路径关闭。
-- 导入限制、稳定内部 ID 和 UI 回调契约。
-
 ## 已知边界
 
 - 同步 HTTP 请求开始后，取消只能等待当前请求返回或超时。
 - 进程内支持多个 `TagCacheManager` 实例共享同一数据库；不建议多个独立 Forge 进程同时写同一个缓存目录。
 - `unrestricted` 适合个人本地环境，但共享部署应使用访问控制或更严格的端点策略。
 - 本地缓存模式不包含可靠的源图，无法替代在线模式的 Img2Img / ControlNet / DeepBooru 图片链路。
+- 筛选池（`filtered_pool`）和规则池已经移除，不再是可用功能。升级时旧数据库中的相关表和数据会保留为惰性恢复数据；请使用主缓存的 Tag 搜索、范围操作和删除/整理工具。
+
+## 版本与兼容性
+
+- 版本：`1.1.0`，支持 Python `>=3.10,<3.14`。
+- Forge 集成目标为当前 Forge Neo 主机和 Gradio `4.40.0`。Pillow `<11` 是该 Gradio 版本的声明兼容上限；当前主机的 Pillow `12.2.0` 冲突不会被本扩展自动降级。
+- 扩展只管理 `requests-cache>=1.2,<2`。Gradio、Pillow、NumPy 和其他 WebUI 包由 Forge 主机管理。
 
 ## 致谢
 

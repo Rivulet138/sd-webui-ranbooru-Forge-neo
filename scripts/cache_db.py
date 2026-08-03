@@ -5,7 +5,6 @@ Focus:
 - hard dedupe for exact tag sets
 - stable ordered reading for large caches
 - lightweight keyword filtering
-- optional filtered pools / rules for power users
 """
 
 import os
@@ -16,24 +15,28 @@ import math
 import re
 import shlex
 import sqlite3
+import sys
 import threading
 from datetime import datetime, timedelta
 from functools import wraps
 
 try:
-    from .natural_prompt_schema import NATURAL_PROMPT_CONVERTER_VERSION
+    from .ranbooru_logging import get_logger, log_event
+    from .version import NATURAL_PROMPT_CONVERTER_VERSION
 except ImportError:
-    import sys
-
     _scripts_dir = os.path.dirname(os.path.abspath(__file__))
     _added_scripts_dir = _scripts_dir not in sys.path
     if _added_scripts_dir:
         sys.path.insert(0, _scripts_dir)
     try:
-        from natural_prompt_schema import NATURAL_PROMPT_CONVERTER_VERSION
+        from ranbooru_logging import get_logger, log_event
+        from version import NATURAL_PROMPT_CONVERTER_VERSION
     finally:
         if _added_scripts_dir:
             sys.path.remove(_scripts_dir)
+
+
+logger = get_logger("cache_db")
 
 
 def _serialized_destructive_operation(method):
@@ -49,7 +52,10 @@ def _serialized_destructive_operation(method):
 class TagCacheManager:
     _destructive_locks = {}
     _destructive_locks_guard = threading.Lock()
+    _session_cursor_paths = set()
     MAX_POSITION_SELECTION = 10000
+    MAX_PROMPT_RAG_CANDIDATES = 5000
+    MAX_PROMPT_RAG_EXAMPLES = 5
     MAX_IMPORT_BYTES = 64 * 1024 * 1024
     MAX_IMPORT_RECORDS = 100000
     BACKUP_MAX_COUNT = 20
@@ -102,8 +108,22 @@ class TagCacheManager:
                 threading.RLock(),
             )
         self.current_index = 0
-        self._init_db()
-        self._load_index()
+        with self._destructive_lock:
+            self._init_db()
+            with self._destructive_locks_guard:
+                first_open_this_session = lock_key not in self._session_cursor_paths
+                if first_open_this_session:
+                    self._session_cursor_paths.add(lock_key)
+            try:
+                if first_open_this_session:
+                    self.reset_index()
+                else:
+                    self._load_index()
+            except Exception:
+                if first_open_this_session:
+                    with self._destructive_locks_guard:
+                        self._session_cursor_paths.discard(lock_key)
+                raise
 
     def _connect(self):
         conn = sqlite3.connect(self.db_path, timeout=30)
@@ -130,36 +150,51 @@ class TagCacheManager:
                 )
                 """
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS rules (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    query TEXT DEFAULT '',
-                    must_include TEXT DEFAULT '',
-                    must_exclude TEXT DEFAULT '',
-                    sort_order TEXT DEFAULT 'ID',
-                    limit_count INTEGER DEFAULT 0,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS filtered_pool (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    tag_id INTEGER,
-                    tags TEXT NOT NULL
-                )
-                """
-            )
             self._migrate_tags_table(conn)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_post ON tags (booru, post_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_tags_score ON tags (score)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_filtered_pool_tag_id ON filtered_pool (tag_id)")
             conn.commit()
+            self._retire_filtered_pool_v1(conn)
         finally:
             conn.close()
+
+    @staticmethod
+    def _retire_filtered_pool_v1(conn):
+        migration_key = "retire_filtered_pool_v1"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                (migration_key,),
+            ).fetchone()
+            if row and row["value"] in ("not-present", "inert-retained"):
+                conn.commit()
+                return
+
+            legacy_tables = {
+                item["name"]
+                for item in conn.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name IN ('rules', 'filtered_pool')
+                    """
+                ).fetchall()
+            }
+            state = "inert-retained" if legacy_tables else "not-present"
+            if legacy_tables:
+                conn.execute(
+                    "DELETE FROM metadata WHERE key IN (?, ?)",
+                    ("use_filtered_pool", "active_rule_id"),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
+                (migration_key, state),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
     def _migrate_tags_table(self, conn):
         existing = {row["name"] for row in conn.execute("PRAGMA table_info(tags)")}
@@ -308,7 +343,7 @@ class TagCacheManager:
             if value in (None, ""):
                 return default
             return int(float(value))
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             return default
 
     @staticmethod
@@ -368,10 +403,6 @@ class TagCacheManager:
             return self.SORT_SQL.get(sort_order or "Random", "RANDOM()")
         return self.SORT_SQL.get(sort_order or "ID", "id ASC")
 
-    @staticmethod
-    def _normalize_tags(tags):
-        return ",".join(TagCacheManager._split_prompt_tokens(tags))
-
     def _make_duplicate_key(self, record):
         tag_key = self._canonical_tag_key(
             record.get("tags_raw") or record.get("tags_prompt") or record.get("tags") or ""
@@ -417,25 +448,6 @@ class TagCacheManager:
             coerced["natural_converter_version"] = ""
         coerced["duplicate_key"] = self._make_duplicate_key(coerced)
         return coerced
-
-    def _set_metadata(self, key, value, conn=None):
-        own_conn = conn is None
-        conn = conn or self._connect()
-        try:
-            conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)", (key, str(value)))
-            if own_conn:
-                conn.commit()
-        finally:
-            if own_conn:
-                conn.close()
-
-    def _get_metadata(self, key, default=None):
-        conn = self._connect()
-        try:
-            row = conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
-            return row["value"] if row else default
-        finally:
-            conn.close()
 
     def _rebuild_duplicate_keys(self, conn):
         rows = conn.execute(
@@ -735,26 +747,8 @@ class TagCacheManager:
         try:
             return self._save_last_deleted(records, reason, backup_path)
         except Exception as error:
-            print(f"[CacheDB] Failed to update undo journal after commit: {error}")
+            log_event(logger, "cache_mutation_failure", "Failed to update undo journal after commit: %s", error)
             return ""
-
-    def get_last_deleted_info(self):
-        path = self._last_deleted_path()
-        if not os.path.exists(path):
-            return {"ok": False, "message": "没有可撤销的删除记录", "count": 0}
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                payload = json.load(handle)
-            return {
-                "ok": True,
-                "path": path,
-                "created_at": payload.get("created_at", ""),
-                "reason": payload.get("reason", ""),
-                "count": len(payload.get("records") or []),
-                "backup_path": payload.get("backup_path", ""),
-            }
-        except Exception as e:
-            return {"ok": False, "message": f"读取撤销记录失败: {e}", "count": 0}
 
     @_serialized_destructive_operation
     def restore_last_deleted(self, dedupe=True):
@@ -779,13 +773,6 @@ class TagCacheManager:
             "created_at": payload.get("created_at", ""),
         }
 
-    def save_cache(self, tags_list):
-        return self.save_records([{"tags_prompt": tags} for tags in tags_list])
-
-    def append_cache(self, tags_list):
-        result = self.append_records([{"tags_prompt": tags} for tags in tags_list])
-        return result["total"]
-
     @_serialized_destructive_operation
     def save_records(self, records, dedupe=True, min_score=None, backup_reason="overwrite"):
         conn = self._connect()
@@ -796,7 +783,6 @@ class TagCacheManager:
             existing_records = self._all_records(conn)
             backup_path = self.backup_db(backup_reason) if existing_records else ""
             conn.execute("DELETE FROM tags")
-            conn.execute("DELETE FROM filtered_pool")
             self.current_index = 0
             self._save_index(conn)
             stats = self._insert_records(conn, records, dedupe=dedupe, min_score=min_score)
@@ -875,9 +861,6 @@ class TagCacheManager:
         finally:
             conn.close()
 
-    def get_next_tags(self, loop=True):
-        return self.get_next_tags_from_pool(loop=loop)
-
     def reset_index(self):
         conn = self._connect()
         try:
@@ -901,13 +884,7 @@ class TagCacheManager:
             conn.execute("BEGIN IMMEDIATE")
             deleted_records = self._all_records(conn)
             backup_path = self.backup_db("delete_cache")
-            conn.execute("DELETE FROM filtered_pool")
-            conn.execute("DELETE FROM rules")
             conn.execute("DELETE FROM tags")
-            conn.execute(
-                "DELETE FROM metadata WHERE key IN (?, ?)",
-                ("active_rule_id", "use_filtered_pool"),
-            )
             self.current_index = 0
             self._save_index(conn)
             conn.commit()
@@ -920,7 +897,7 @@ class TagCacheManager:
         except Exception as e:
             conn.rollback()
             self._load_index()
-            print(f"[CacheDB] Delete failed: {e}")
+            log_event(logger, "cache_mutation_failure", "Delete failed: %s", e)
             return {"deleted": 0, "backup_path": "", "undo_path": "", "error": str(e)}
         finally:
             conn.close()
@@ -941,7 +918,6 @@ class TagCacheManager:
                 duplicate_ids,
             )
             removed = self._delete_ids_in_chunks(conn, duplicate_ids) if duplicate_ids else 0
-            self._delete_filtered_pool_tag_ids(conn, duplicate_ids)
             self._apply_cursor_after_deletion(
                 conn,
                 current_index,
@@ -959,7 +935,7 @@ class TagCacheManager:
             return {"updated": updated, "removed": removed, "total": total, "backup_path": backup_path}
         except Exception as e:
             conn.rollback()
-            print(f"[CacheDB] Compact duplicates failed: {e}")
+            log_event(logger, "cache_mutation_failure", "Duplicate compaction failed: %s", e)
             return {"updated": 0, "removed": 0, "total": self.get_active_total(), "backup_path": backup_path, "error": str(e)}
         finally:
             conn.close()
@@ -992,12 +968,12 @@ class TagCacheManager:
     def compact_similar(self, threshold=0.9, keep_per_group=2, must_include="", must_exclude="", query=""):
         try:
             threshold = float(threshold)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             threshold = 0.9
         threshold = max(0.5, min(1.0, threshold))
         try:
             keep_per_group = int(keep_per_group)
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             keep_per_group = 2
         keep_per_group = max(1, keep_per_group)
 
@@ -1018,7 +994,6 @@ class TagCacheManager:
                 exact_new_total,
             ) = self._deletion_cursor_adjustment(conn, exact_delete_ids)
             exact_removed = self._delete_ids_in_chunks(conn, exact_delete_ids) if exact_delete_ids else 0
-            self._delete_filtered_pool_tag_ids(conn, exact_delete_ids)
             self._apply_cursor_after_deletion(
                 conn,
                 exact_current_index,
@@ -1114,7 +1089,6 @@ class TagCacheManager:
                 similar_new_total,
             ) = self._deletion_cursor_adjustment(conn, delete_ids)
             similar_removed = self._delete_ids_in_chunks(conn, delete_ids) if delete_ids else 0
-            self._delete_filtered_pool_tag_ids(conn, delete_ids)
             self._apply_cursor_after_deletion(
                 conn,
                 similar_current_index,
@@ -1147,7 +1121,7 @@ class TagCacheManager:
             }
         except Exception as e:
             conn.rollback()
-            print(f"[CacheDB] Compact similar failed: {e}")
+            log_event(logger, "cache_mutation_failure", "Similarity compaction failed: %s", e)
             return {
                 "updated": 0,
                 "exact_removed": 0,
@@ -1174,14 +1148,13 @@ class TagCacheManager:
             ).fetchone()
             current_index = self._safe_int(row["value"], 0) if row else 0
             self.current_index = current_index
-            active_total = self.get_active_total()
+            active_total = main_total
             if main_total <= 0:
                 return "缓存为空"
             read_count = max(0, min(current_index, active_total))
             next_position = 1 if current_index >= active_total else current_index + 1
-            pool_name = "活动筛选/规则池" if self.is_using_filtered_pool() else "主缓存"
             return (
-                f"{pool_name}下一条: {next_position} / 活动总数: {active_total}"
+                f"主缓存下一条: {next_position} / 活动总数: {active_total}"
                 f"（已读 {read_count}）| 主缓存总数: {main_total}"
             )
         except Exception:
@@ -1196,7 +1169,7 @@ class TagCacheManager:
         normalized = str(query or "").replace("，", " ").replace(",", " ").replace("\n", " ")
         try:
             tokens = shlex.split(normalized)
-        except Exception:
+        except ValueError:
             tokens = normalized.split()
         for token in tokens:
             token = token.strip()
@@ -1296,61 +1269,6 @@ class TagCacheManager:
         finally:
             conn.close()
 
-    def _count_records(self, include=None, exclude=None, conn=None):
-        where, params = self._where_for_terms(include, exclude)
-        own_conn = conn is None
-        conn = conn or self._connect()
-        try:
-            return conn.execute(f"SELECT COUNT(*) AS c FROM tags {where}", params).fetchone()["c"]
-        finally:
-            if own_conn:
-                conn.close()
-
-    def _active_context(self, conn):
-        metadata = {
-            row["key"]: row["value"]
-            for row in conn.execute(
-                """
-                SELECT key, value
-                FROM metadata
-                WHERE key IN ('use_filtered_pool', 'active_rule_id')
-                """
-            ).fetchall()
-        }
-        use_pool = metadata.get("use_filtered_pool", "0") == "1"
-        active_rule_id = self._safe_int(metadata.get("active_rule_id"), 0)
-        rule = None
-        if use_pool and active_rule_id > 0:
-            row = conn.execute("SELECT * FROM rules WHERE id = ?", (active_rule_id,)).fetchone()
-            rule = dict(row) if row else None
-        if rule:
-            include, exclude = self.parse_search_syntax(
-                rule.get("query", ""),
-                rule.get("must_include", ""),
-                rule.get("must_exclude", ""),
-            )
-            total = self._count_records(include, exclude, conn=conn)
-            limit_count = max(0, self._safe_int(rule.get("limit_count"), 0))
-            if limit_count:
-                total = min(total, limit_count)
-        else:
-            table_name = "filtered_pool" if use_pool else "tags"
-            total = conn.execute(f"SELECT COUNT(*) AS c FROM {table_name}").fetchone()["c"]
-        return use_pool, rule, int(total or 0)
-
-    def _clamp_current_index(self, conn=None):
-        own_conn = conn is None
-        conn = conn or self._connect()
-        try:
-            total = self.get_active_total() if own_conn else conn.execute("SELECT COUNT(*) AS c FROM tags").fetchone()["c"]
-            self.current_index = max(0, min(int(self.current_index or 0), int(total or 0)))
-            self._save_index(conn)
-            if own_conn:
-                conn.commit()
-        finally:
-            if own_conn:
-                conn.close()
-
     def _deletion_cursor_adjustment(self, conn, deleted_ids):
         deleted_ids = set(int(tag_id) for tag_id in deleted_ids)
         current_row = conn.execute(
@@ -1364,76 +1282,6 @@ class TagCacheManager:
         if not deleted_ids:
             total = conn.execute("SELECT COUNT(*) AS c FROM tags").fetchone()["c"]
             return current_index, 0, total
-
-        metadata = {
-            row["key"]: row["value"]
-            for row in conn.execute(
-                """
-                SELECT key, value
-                FROM metadata
-                WHERE key IN ('use_filtered_pool', 'active_rule_id')
-                """
-            ).fetchall()
-        }
-        use_filtered_pool = metadata.get("use_filtered_pool", "0") == "1"
-        active_rule_id = self._safe_int(metadata.get("active_rule_id"), 0)
-
-        if use_filtered_pool and active_rule_id > 0:
-            rule_row = conn.execute(
-                "SELECT * FROM rules WHERE id = ?",
-                (active_rule_id,),
-            ).fetchone()
-            if rule_row:
-                rule = dict(rule_row)
-                include, exclude = self.parse_search_syntax(
-                    rule.get("query", ""),
-                    rule.get("must_include", ""),
-                    rule.get("must_exclude", ""),
-                )
-                where, params = self._where_for_terms(include, exclude)
-                order = self._sort_sql(
-                    rule.get("sort_order") or "ID",
-                    rule.get("id"),
-                )
-                limit_count = max(0, self._safe_int(rule.get("limit_count"), 0))
-                limit_sql = " LIMIT ?" if limit_count else ""
-                if limit_count:
-                    params.append(limit_count)
-                rows = conn.execute(
-                    f"SELECT id FROM tags {where} ORDER BY {order}{limit_sql}",
-                    params,
-                ).fetchall()
-                rule_ids = [int(row["id"]) for row in rows]
-                deleted_offsets = [
-                    offset
-                    for offset, tag_id in enumerate(rule_ids)
-                    if tag_id in deleted_ids
-                ]
-                deleted_before_cursor = sum(
-                    1 for offset in deleted_offsets if offset < current_index
-                )
-                return (
-                    current_index,
-                    deleted_before_cursor,
-                    max(0, len(rule_ids) - len(deleted_offsets)),
-                )
-
-        if use_filtered_pool:
-            placeholders = ",".join("?" for _ in deleted_ids)
-            rows = conn.execute(
-                f"SELECT id FROM filtered_pool WHERE tag_id IN ({placeholders}) ORDER BY id ASC",
-                list(deleted_ids),
-            ).fetchall()
-            deleted_before_cursor = 0
-            for row in rows:
-                position = conn.execute(
-                    "SELECT COUNT(*) AS c FROM filtered_pool WHERE id < ?",
-                    (row["id"],),
-                ).fetchone()["c"]
-                if position < current_index:
-                    deleted_before_cursor += 1
-            total = conn.execute("SELECT COUNT(*) AS c FROM filtered_pool").fetchone()["c"]
-            return current_index, deleted_before_cursor, max(0, total - len(rows))
 
         deleted_before_cursor = 0
         for tag_id in deleted_ids:
@@ -1454,18 +1302,6 @@ class TagCacheManager:
             max(0, total - existing_deleted),
         )
 
-    def _delete_filtered_pool_tag_ids(self, conn, tag_ids):
-        if not tag_ids:
-            return 0
-        removed = 0
-        ids = list(dict.fromkeys(int(tag_id) for tag_id in tag_ids))
-        for start in range(0, len(ids), 800):
-            chunk = ids[start:start + 800]
-            placeholders = ",".join("?" for _ in chunk)
-            cursor = conn.execute(f"DELETE FROM filtered_pool WHERE tag_id IN ({placeholders})", chunk)
-            removed += cursor.rowcount
-        return removed
-
     def _apply_cursor_after_deletion(
         self,
         conn,
@@ -1484,20 +1320,20 @@ class TagCacheManager:
     def get_active_total(self):
         conn = self._connect()
         try:
-            return self._active_context(conn)[2]
+            return conn.execute("SELECT COUNT(*) AS c FROM tags").fetchone()["c"]
         finally:
             conn.close()
 
     def jump_to_position(self, position):
         try:
             position = int(float(position))
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             return {"ok": False, "message": "请输入有效的缓存序号", "total": self.get_active_total()}
 
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            total = self._active_context(conn)[2]
+            total = conn.execute("SELECT COUNT(*) AS c FROM tags").fetchone()["c"]
             if total <= 0:
                 conn.rollback()
                 return {"ok": False, "message": "缓存为空，请先批量爬取", "total": total}
@@ -1528,7 +1364,7 @@ class TagCacheManager:
     def _tag_id_at_main_position(self, position, conn=None):
         try:
             position = int(float(position))
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             return None
         if position < 1:
             return None
@@ -1544,42 +1380,7 @@ class TagCacheManager:
             if own_conn:
                 conn.close()
 
-    def _tag_id_at_filtered_position(self, position, conn=None):
-        try:
-            position = int(float(position))
-        except Exception:
-            return None
-        if position < 1:
-            return None
-        own_conn = conn is None
-        conn = conn or self._connect()
-        try:
-            row = conn.execute(
-                "SELECT tag_id FROM filtered_pool ORDER BY id ASC LIMIT 1 OFFSET ?",
-                (position - 1,),
-            ).fetchone()
-            return int(row["tag_id"]) if row and row["tag_id"] is not None else None
-        finally:
-            if own_conn:
-                conn.close()
-
-    def _tag_id_at_active_rule_position(self, position):
-        try:
-            position = int(float(position))
-        except Exception:
-            return None
-        if position < 1:
-            return None
-        rows, total = self._active_rule_rows()
-        if position > total or position > len(rows):
-            return None
-        return int(rows[position - 1][0])
-
     def tag_id_at_position(self, position):
-        if self.is_using_filtered_pool() and self.get_active_rule_id():
-            return self._tag_id_at_active_rule_position(position)
-        if self.is_using_filtered_pool():
-            return self._tag_id_at_filtered_position(position)
         return self._tag_id_at_main_position(position)
 
     def get_by_position(self, position, prefer_natural=False):
@@ -1594,7 +1395,7 @@ class TagCacheManager:
     def get_record_by_position(self, position):
         try:
             position = int(float(position))
-        except Exception:
+        except (TypeError, ValueError, OverflowError):
             return None
         if position < 1:
             return None
@@ -1616,28 +1417,10 @@ class TagCacheManager:
         if not positions:
             return []
 
-        if self.is_using_filtered_pool() and self.get_active_rule_id():
-            rows, total = self._active_rule_rows()
-            return [
-                (position, int(rows[position - 1][0]))
-                for position in positions
-                if position <= total and position <= len(rows)
-            ]
-
         conn = self._connect()
         try:
-            if self.is_using_filtered_pool():
-                rows = conn.execute(
-                    "SELECT tag_id FROM filtered_pool ORDER BY id ASC"
-                ).fetchall()
-                ids = [
-                    int(row["tag_id"])
-                    for row in rows
-                    if row["tag_id"] is not None
-                ]
-            else:
-                rows = conn.execute("SELECT id FROM tags ORDER BY id ASC").fetchall()
-                ids = [int(row["id"]) for row in rows]
+            rows = conn.execute("SELECT id FROM tags ORDER BY id ASC").fetchall()
+            ids = [int(row["id"]) for row in rows]
         finally:
             conn.close()
         return [
@@ -1836,13 +1619,6 @@ class TagCacheManager:
         finally:
             conn.close()
 
-    def clear_natural_prompts_by_positions(self, position_spec):
-        positions = self.parse_positions(position_spec, self.get_active_total())
-        pairs = self._active_position_id_pairs(positions)
-        return self.clear_natural_prompts_by_ids(
-            tag_id for _, tag_id in pairs
-        )
-
     def get_natural_prompt_status(self):
         conn = self._connect()
         try:
@@ -1873,13 +1649,176 @@ class TagCacheManager:
         finally:
             conn.close()
 
-    def get_natural_prompt_by_id(self, tag_id):
+    def get_prompt_rag_candidates(
+        self,
+        preset="",
+        min_score_percentile=0.75,
+        per_booru_limit=512,
+        max_candidates=None,
+    ):
+        """Load a bounded snapshot of valid high-score prompt conversion pairs."""
         try:
-            tag_id = int(tag_id)
-        except (TypeError, ValueError):
-            return ""
-        record = self.get_record_by_id(tag_id)
-        return str(record["natural_prompt"] or "") if record else ""
+            min_score_percentile = float(min_score_percentile)
+        except (TypeError, ValueError, OverflowError):
+            min_score_percentile = 0.75
+        min_score_percentile = max(0.0, min(1.0, min_score_percentile))
+        preset = str(preset or "").strip()
+        max_candidates = self._safe_int(
+            max_candidates,
+            self.MAX_PROMPT_RAG_CANDIDATES,
+        )
+        max_candidates = max(1, min(max_candidates, self.MAX_PROMPT_RAG_CANDIDATES))
+        per_booru_limit = max(1, min(self._safe_int(per_booru_limit, 512), 2000))
+        candidates = []
+        booru_counts = {}
+        offset = 0
+        batch_size = max_candidates
+        conn = self._connect()
+        try:
+            while len(candidates) < max_candidates:
+                rows = conn.execute(
+                    """
+                    WITH ranked AS (
+                        SELECT id, COALESCE(booru, '') AS booru,
+                               COALESCE(tags_prompt, tags) AS tags_prompt,
+                               natural_prompt, natural_preset, natural_source_hash,
+                               natural_converter_version, COALESCE(score, 0) AS score,
+                               PERCENT_RANK() OVER (
+                                   PARTITION BY COALESCE(booru, '')
+                                   ORDER BY COALESCE(score, 0)
+                               ) AS score_percentile
+                        FROM tags
+                    )
+                    SELECT id, booru, tags_prompt, natural_prompt, natural_preset,
+                           natural_source_hash, natural_converter_version,
+                           score, score_percentile
+                    FROM ranked
+                    WHERE score_percentile >= ?
+                      AND COALESCE(natural_prompt, '') != ''
+                      AND natural_converter_version = ?
+                      AND (? = '' OR COALESCE(natural_preset, '') = ?)
+                    ORDER BY score_percentile DESC, booru ASC, score DESC, id ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (
+                        min_score_percentile,
+                        self.NATURAL_CONVERTER_VERSION,
+                        preset,
+                        preset,
+                        batch_size,
+                        offset,
+                    ),
+                ).fetchall()
+                if not rows:
+                    break
+                offset += len(rows)
+                for row in rows:
+                    tags_prompt = str(row["tags_prompt"] or "").strip()
+                    natural_prompt = str(row["natural_prompt"] or "").strip()
+                    booru = str(row["booru"] or "")
+                    if not tags_prompt or not natural_prompt:
+                        continue
+                    if (
+                        str(row["natural_source_hash"] or "")
+                        != self._natural_source_hash(tags_prompt)
+                    ):
+                        continue
+                    if booru_counts.get(booru, 0) >= per_booru_limit:
+                        continue
+                    candidates.append(
+                        {
+                            "id": int(row["id"]),
+                            "booru": booru,
+                            "tags_prompt": tags_prompt,
+                            "natural_prompt": natural_prompt,
+                            "score": self._safe_int(row["score"], 0),
+                            "score_percentile": float(
+                                row["score_percentile"] or 0.0
+                            ),
+                            "tokens": frozenset(
+                                self._split_prompt_tokens(tags_prompt)
+                            ),
+                        }
+                    )
+                    booru_counts[booru] = booru_counts.get(booru, 0) + 1
+                    if len(candidates) >= max_candidates:
+                        break
+        finally:
+            conn.close()
+        return candidates
+
+    @classmethod
+    def select_prompt_rag_examples(
+        cls,
+        query_tags,
+        candidates,
+        limit=3,
+        min_similarity=0.08,
+    ):
+        """Rank relevant conversion pairs by tag similarity with a score prior."""
+        limit = max(0, min(cls._safe_int(limit, 3), cls.MAX_PROMPT_RAG_EXAMPLES))
+        query_tokens = frozenset(cls._split_prompt_tokens(query_tags))
+        if not query_tokens or limit <= 0:
+            return []
+
+        try:
+            min_similarity = float(min_similarity)
+        except (TypeError, ValueError, OverflowError):
+            min_similarity = 0.08
+        min_similarity = max(0.0, min(1.0, min_similarity))
+        usable = [candidate for candidate in candidates or [] if candidate.get("tokens")]
+        query_key = cls._canonical_tag_key(query_tags)
+        ranked = []
+        for candidate in usable:
+            candidate_tokens = frozenset(candidate["tokens"])
+            if cls._canonical_tag_key(candidate.get("tags_prompt")) == query_key:
+                continue
+            overlap = len(query_tokens & candidate_tokens)
+            if overlap <= 0:
+                continue
+            if min(len(query_tokens), len(candidate_tokens)) >= 3 and overlap < 2:
+                continue
+            union_size = len(query_tokens | candidate_tokens)
+            jaccard = overlap / union_size if union_size else 0.0
+            coverage = overlap / len(query_tokens)
+            similarity = (0.65 * jaccard) + (0.35 * coverage)
+            if similarity < min_similarity:
+                continue
+            score_quality = max(
+                0.0,
+                min(1.0, float(candidate.get("score_percentile") or 0.0)),
+            )
+            rank_score = (0.85 * similarity) + (0.15 * score_quality)
+            ranked.append(
+                (
+                    -rank_score,
+                    -overlap,
+                    -score_quality,
+                    str(candidate.get("booru") or ""),
+                    cls._safe_int(candidate.get("id"), 0),
+                    candidate,
+                    similarity,
+                )
+            )
+
+        ranked.sort(key=lambda item: item[:5])
+        examples = []
+        for _, overlap_sort, _, _, _, candidate, similarity in ranked[:limit]:
+            examples.append(
+                {
+                    "id": candidate.get("id"),
+                    "tags_prompt": str(candidate.get("tags_prompt") or ""),
+                    "natural_prompt": str(candidate.get("natural_prompt") or ""),
+                    "score": cls._safe_int(candidate.get("score"), 0),
+                    "score_percentile": round(
+                        float(candidate.get("score_percentile") or 0.0),
+                        6,
+                    ),
+                    "overlap": -overlap_sort,
+                    "similarity": round(similarity, 6),
+                }
+            )
+        return examples
 
     def _preview_result(self, records, requested=0, sample_limit=8, title="预览"):
         records = list(records or [])
@@ -1941,17 +1880,6 @@ class TagCacheManager:
             conn.close()
         return self._preview_result(records, requested=len(ids), sample_limit=sample_limit, title="按 Tag 删除预览")
 
-    def preview_delete_by_filter(self, must_include="", must_exclude="", query="", sample_limit=8):
-        include, exclude = self.parse_search_syntax(query, must_include, must_exclude)
-        where, params = self._where_for_terms(include, exclude)
-        conn = self._connect()
-        try:
-            ids = self._ids_matching_where(conn, where, params)
-            records = self._records_by_ids(conn, ids)
-        finally:
-            conn.close()
-        return self._preview_result(records, requested=len(ids), sample_limit=sample_limit, title="当前筛选删除预览")
-
     def preview_delete_all(self, sample_limit=8):
         conn = self._connect()
         try:
@@ -1959,107 +1887,6 @@ class TagCacheManager:
         finally:
             conn.close()
         return self._preview_result(records, requested=len(records), sample_limit=sample_limit, title="删除全部预览")
-
-    def delete_by_positions(self, positions):
-        ids = []
-        for position in positions:
-            tag_id = self.tag_id_at_position(position)
-            if tag_id is not None:
-                ids.append(tag_id)
-        ids = list(dict.fromkeys(ids))
-        return self.delete_by_ids(ids) if ids else 0
-
-    def delete_by_position(self, position):
-        return self.delete_by_positions([position]) > 0
-
-    def delete_by_position_spec(self, position_spec):
-        positions = self.parse_positions(position_spec, self.get_active_total())
-        return self.delete_by_positions(positions), len(positions)
-
-    def create_filtered_pool_by_positions(self, positions):
-        tag_ids = []
-        for position in positions:
-            tag_id = self._tag_id_at_main_position(position)
-            if tag_id is not None:
-                tag_ids.append(tag_id)
-        tag_ids = list(dict.fromkeys(tag_ids))
-        return self.create_filtered_pool(tag_ids)
-
-    def create_filtered_pool_by_position_spec(self, position_spec):
-        positions = self.parse_positions(position_spec, self._count_records())
-        return self.create_filtered_pool_by_positions(positions), len(positions)
-
-    def jump_to_id(self, tag_id):
-        try:
-            tag_id = int(float(tag_id))
-        except Exception:
-            return {"ok": False, "message": "请输入有效的缓存 ID", "total": self.get_active_total()}
-
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            use_pool, rule, total = self._active_context(conn)
-            if rule:
-                include, exclude = self.parse_search_syntax(
-                    rule.get("query", ""),
-                    rule.get("must_include", ""),
-                    rule.get("must_exclude", ""),
-                )
-                where, params = self._where_for_terms(include, exclude)
-                order = self._sort_sql(rule.get("sort_order") or "ID", rule.get("id"))
-                limit_count = max(0, self._safe_int(rule.get("limit_count"), 0))
-                limit_sql = " LIMIT ?" if limit_count else ""
-                if limit_count:
-                    params.append(limit_count)
-                rows = conn.execute(
-                    f"SELECT id FROM tags {where} ORDER BY {order}{limit_sql}",
-                    params,
-                ).fetchall()
-                offset = next(
-                    (index for index, row in enumerate(rows) if int(row["id"]) == tag_id),
-                    None,
-                )
-                if offset is None:
-                    conn.rollback()
-                    return {"ok": False, "message": f"缓存 ID {tag_id} 不在当前规则池中", "total": total}
-            elif use_pool:
-                row = conn.execute(
-                    "SELECT id FROM filtered_pool WHERE tag_id = ? ORDER BY id ASC LIMIT 1",
-                    (tag_id,),
-                ).fetchone()
-                if not row:
-                    conn.rollback()
-                    return {"ok": False, "message": f"缓存 ID {tag_id} 不在当前筛选池中", "total": total}
-                offset = conn.execute(
-                    "SELECT COUNT(*) AS c FROM filtered_pool WHERE id < ?",
-                    (row["id"],),
-                ).fetchone()["c"]
-            else:
-                row = conn.execute("SELECT id FROM tags WHERE id = ?", (tag_id,)).fetchone()
-                if not row:
-                    conn.rollback()
-                    return {"ok": False, "message": f"未找到缓存 ID {tag_id}", "total": total}
-                offset = conn.execute(
-                    "SELECT COUNT(*) AS c FROM tags WHERE id < ?",
-                    (tag_id,),
-                ).fetchone()["c"]
-
-            self.current_index = offset
-            self._save_index(conn)
-            conn.commit()
-            return {
-                "ok": True,
-                "id": tag_id,
-                "position": offset + 1,
-                "current_index": self.current_index,
-                "total": total,
-            }
-        except Exception:
-            conn.rollback()
-            self._load_index()
-            raise
-        finally:
-            conn.close()
 
     def search_cache(self, keyword="", limit=200):
         include, exclude = self.parse_search_syntax(keyword)
@@ -2083,21 +1910,6 @@ class TagCacheManager:
             return self._records_by_ids(conn, tag_ids)
         finally:
             conn.close()
-
-    @staticmethod
-    def tag_ids_from_search_results(results):
-        tag_ids = []
-        for result in results or []:
-            try:
-                tag_id = int(result[6])
-            except (IndexError, TypeError, ValueError):
-                continue
-            if tag_id > 0 and tag_id not in tag_ids:
-                tag_ids.append(tag_id)
-        return tag_ids
-
-    def create_filtered_pool_by_ids(self, tag_ids):
-        return self.create_filtered_pool(tag_ids)
 
     def export_records(self, file_format="json", file_path=None):
         file_format = str(file_format or "json").lower().strip()
@@ -2263,9 +2075,6 @@ class TagCacheManager:
         )
         return {"ok": True, **stats}
 
-    def delete_by_id(self, tag_id):
-        return self.delete_by_ids([tag_id]) > 0
-
     @_serialized_destructive_operation
     def delete_by_ids(self, tag_ids):
         ids = list(dict.fromkeys(int(tag_id) for tag_id in tag_ids if str(tag_id).strip().isdigit()))
@@ -2285,7 +2094,6 @@ class TagCacheManager:
                 existing_ids,
             )
             cursor = conn.execute(f"DELETE FROM tags WHERE id IN ({placeholders})", existing_ids)
-            self._delete_filtered_pool_tag_ids(conn, existing_ids)
             self._apply_cursor_after_deletion(
                 conn,
                 current_index,
@@ -2297,43 +2105,7 @@ class TagCacheManager:
             return cursor.rowcount
         except Exception as e:
             conn.rollback()
-            print(f"[CacheDB] Delete IDs failed: {e}")
-            return 0
-        finally:
-            conn.close()
-
-    def filter_tags_by_keywords(self, must_include="", must_exclude="", query="", sort_order="ID", limit=200):
-        include, exclude = self.parse_search_syntax(query, must_include, must_exclude)
-        return self._query_records(include, exclude, sort_order=sort_order, limit=limit, visible_positions=True)
-
-    @_serialized_destructive_operation
-    def delete_by_filter(self, must_include="", must_exclude="", query=""):
-        include, exclude = self.parse_search_syntax(query, must_include, must_exclude)
-        where, params = self._where_for_terms(include, exclude)
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            deleted_ids = self._ids_matching_where(conn, where, params)
-            deleted_records = self._records_by_ids(conn, deleted_ids)
-            backup_path = self.backup_db("delete_filter") if deleted_ids else ""
-            current_index, deleted_before_cursor, new_total = self._deletion_cursor_adjustment(
-                conn,
-                deleted_ids,
-            )
-            cursor = conn.execute(f"DELETE FROM tags {where}", params)
-            self._delete_filtered_pool_tag_ids(conn, deleted_ids)
-            self._apply_cursor_after_deletion(
-                conn,
-                current_index,
-                deleted_before_cursor,
-                new_total,
-            )
-            conn.commit()
-            self._save_last_deleted_after_commit(deleted_records, "delete_filter", backup_path)
-            return cursor.rowcount
-        except Exception as e:
-            conn.rollback()
-            print(f"[CacheDB] Delete filter failed: {e}")
+            log_event(logger, "cache_mutation_failure", "ID deletion failed: %s", e)
             return 0
         finally:
             conn.close()
@@ -2354,7 +2126,6 @@ class TagCacheManager:
                 deleted_ids,
             )
             cursor = conn.execute(f"DELETE FROM tags {where}", params)
-            self._delete_filtered_pool_tag_ids(conn, deleted_ids)
             self._apply_cursor_after_deletion(
                 conn,
                 current_index,
@@ -2366,294 +2137,10 @@ class TagCacheManager:
             return cursor.rowcount
         except Exception as e:
             conn.rollback()
-            print(f"[CacheDB] Delete by tags failed: {e}")
+            log_event(logger, "cache_mutation_failure", "Tag deletion failed: %s", e)
             return 0
         finally:
             conn.close()
-
-    def create_filtered_pool(self, filtered_ids):
-        if not filtered_ids:
-            return 0
-        filtered_ids = list(
-            dict.fromkeys(
-                int(tag_id)
-                for tag_id in filtered_ids
-                if str(tag_id).strip().isdigit() and int(tag_id) > 0
-            )
-        )
-        if not filtered_ids:
-            return 0
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute("DELETE FROM filtered_pool")
-            for tag_id in filtered_ids:
-                conn.execute(
-                    """
-                INSERT INTO filtered_pool (tag_id, tags)
-                SELECT id, COALESCE(tags_prompt, tags) FROM tags WHERE id = ?
-                    """,
-                    (tag_id,),
-                )
-            count = conn.execute("SELECT COUNT(*) AS c FROM filtered_pool").fetchone()["c"]
-            self.current_index = 0
-            self._set_metadata("active_rule_id", "", conn)
-            self._save_index(conn)
-            conn.commit()
-            return count
-        except Exception as e:
-            conn.rollback()
-            print(f"[CacheDB] Create filtered pool failed: {e}")
-            return 0
-        finally:
-            conn.close()
-
-    def create_filtered_pool_by_keywords(self, must_include="", must_exclude="", query="", sort_order="ID", limit=0):
-        include, exclude = self.parse_search_syntax(query, must_include, must_exclude)
-        where, params = self._where_for_terms(include, exclude)
-        order = self.SORT_SQL.get(sort_order or "ID", "id ASC")
-        limit_sql = ""
-        if limit and int(limit) > 0:
-            limit_sql = " LIMIT ?"
-            params.append(int(limit))
-        conn = self._connect()
-        try:
-            conn.execute("DELETE FROM filtered_pool")
-            conn.execute(
-                f"""
-                INSERT INTO filtered_pool (tag_id, tags)
-                SELECT id, COALESCE(tags_prompt, tags)
-                FROM tags
-                {where}
-                ORDER BY {order}
-                {limit_sql}
-                """,
-                params,
-            )
-            count = conn.execute("SELECT COUNT(*) AS c FROM filtered_pool").fetchone()["c"]
-            self.current_index = 0
-            self._set_metadata("active_rule_id", "", conn)
-            self._save_index(conn)
-            conn.commit()
-            return count
-        except Exception as e:
-            print(f"[CacheDB] Create keyword filtered pool failed: {e}")
-            return 0
-        finally:
-            conn.close()
-
-    def create_rule(self, name="", query="", must_include="", must_exclude="", sort_order="ID", limit_count=0):
-        include, exclude = self.parse_search_syntax(query, must_include, must_exclude)
-        count = self._count_records(include, exclude)
-        if not name:
-            label_bits = []
-            if query:
-                label_bits.append(query)
-            if must_include:
-                label_bits.append(f"+ {must_include}")
-            if must_exclude:
-                label_bits.append(f"- {must_exclude}")
-            name = " / ".join(label_bits) or "未命名规则"
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            cursor = conn.execute(
-                """
-                INSERT INTO rules (name, query, must_include, must_exclude, sort_order, limit_count)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (name, query or "", must_include or "", must_exclude or "", sort_order or "ID", int(limit_count or 0)),
-            )
-            rule_id = cursor.lastrowid
-            self._set_metadata("active_rule_id", int(rule_id), conn)
-            self._set_metadata("use_filtered_pool", "1", conn)
-            self.current_index = 0
-            self._save_index(conn)
-            conn.commit()
-            return rule_id, count
-        except Exception:
-            conn.rollback()
-            self._load_index()
-            raise
-        finally:
-            conn.close()
-
-    def list_rules(self):
-        conn = self._connect()
-        try:
-            rows = conn.execute(
-                """
-                SELECT id, name, query, must_include, must_exclude, sort_order, limit_count
-                FROM rules ORDER BY id DESC
-                """
-            ).fetchall()
-            result = []
-            for row in rows:
-                include, exclude = self.parse_search_syntax(row["query"], row["must_include"], row["must_exclude"])
-                result.append(
-                    (
-                        row["id"],
-                        row["name"],
-                        row["query"] or "",
-                        row["must_include"] or "",
-                        row["must_exclude"] or "",
-                        row["sort_order"] or "ID",
-                        row["limit_count"] or 0,
-                        self._count_records(include, exclude, conn=conn),
-                    )
-                )
-            return result
-        finally:
-            conn.close()
-
-    def get_rule(self, rule_id):
-        if not rule_id:
-            return None
-        conn = self._connect()
-        try:
-            row = conn.execute("SELECT * FROM rules WHERE id = ?", (int(rule_id),)).fetchone()
-            return dict(row) if row else None
-        finally:
-            conn.close()
-
-    def activate_rule(self, rule_id):
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT * FROM rules WHERE id = ?", (int(rule_id),)).fetchone()
-            if not row:
-                conn.rollback()
-                return "规则不存在"
-            rule = dict(row)
-            self._set_metadata("active_rule_id", int(rule_id), conn)
-            self._set_metadata("use_filtered_pool", "1", conn)
-            self.current_index = 0
-            self._save_index(conn)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            self._load_index()
-            raise
-        finally:
-            conn.close()
-        return f"已启用规则池: {rule['name']}"
-
-    def delete_rule(self, rule_id):
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            active_row = conn.execute(
-                "SELECT value FROM metadata WHERE key = ?",
-                ("active_rule_id",),
-            ).fetchone()
-            was_active = str(rule_id) == str(active_row["value"] if active_row else "")
-            cursor = conn.execute("DELETE FROM rules WHERE id = ?", (int(rule_id),))
-            if was_active:
-                self._set_metadata("active_rule_id", "", conn)
-                self._set_metadata("use_filtered_pool", "0", conn)
-                self.current_index = 0
-                self._save_index(conn)
-            conn.commit()
-            return cursor.rowcount > 0
-        except Exception:
-            conn.rollback()
-            self._load_index()
-            raise
-        finally:
-            conn.close()
-
-    def get_active_rule_id(self):
-        value = self._get_metadata("active_rule_id", "")
-        return int(value) if str(value).isdigit() else None
-
-    def get_filtered_pool_status(self):
-        active_rule = self.get_rule(self.get_active_rule_id())
-        if active_rule and self.is_using_filtered_pool():
-            include, exclude = self.parse_search_syntax(
-                active_rule["query"], active_rule["must_include"], active_rule["must_exclude"]
-            )
-            count = self._count_records(include, exclude)
-            limit_count = int(active_rule.get("limit_count") or 0)
-            if limit_count > 0:
-                count = min(count, limit_count)
-            return f"规则池: {active_rule['name']} / {count} 条"
-        conn = self._connect()
-        try:
-            count = conn.execute("SELECT COUNT(*) AS c FROM filtered_pool").fetchone()["c"]
-            return f"筛选池: {count} 条" if count else "筛选池: 未创建"
-        finally:
-            conn.close()
-
-    def use_filtered_pool(self, use_pool=True):
-        if use_pool:
-            active_rule = self.get_rule(self.get_active_rule_id())
-            if not active_rule:
-                conn = self._connect()
-                try:
-                    count = conn.execute("SELECT COUNT(*) AS c FROM filtered_pool").fetchone()["c"]
-                finally:
-                    conn.close()
-                if count <= 0:
-                    return "规则池/筛选池不存在，请先创建"
-            use_value = "1"
-        else:
-            use_value = "0"
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            self._set_metadata("use_filtered_pool", use_value, conn)
-            self.current_index = 0
-            self._save_index(conn)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            self._load_index()
-            raise
-        finally:
-            conn.close()
-        return "已切换到规则池/筛选池" if use_pool else "已切换到主缓存"
-
-    def is_using_filtered_pool(self):
-        return self._get_metadata("use_filtered_pool", "0") == "1"
-
-    def _active_rule_rows(self, limit_for_count=False):
-        rule = self.get_rule(self.get_active_rule_id())
-        if not rule:
-            return [], 0
-        include, exclude = self.parse_search_syntax(rule["query"], rule["must_include"], rule["must_exclude"])
-        total = self._count_records(include, exclude)
-        limit_count = int(rule.get("limit_count") or 0)
-        if limit_count > 0:
-            total = min(total, limit_count)
-        rows = self._query_records(
-            include,
-            exclude,
-            sort_order=rule.get("sort_order") or "ID",
-            limit=limit_count if limit_count > 0 else 0,
-            random_seed=rule.get("id"),
-        )
-        return rows, total
-
-    def _active_rule_next_row(self):
-        rule = self.get_rule(self.get_active_rule_id())
-        if not rule:
-            return None, 0
-        include, exclude = self.parse_search_syntax(rule["query"], rule["must_include"], rule["must_exclude"])
-        total = self._count_records(include, exclude)
-        limit_count = int(rule.get("limit_count") or 0)
-        if limit_count > 0:
-            total = min(total, limit_count)
-        if total == 0:
-            return None, 0
-        row = self._query_records(
-            include,
-            exclude,
-            sort_order=rule.get("sort_order") or "ID",
-            limit=1,
-            offset=self.current_index,
-            random_seed=rule.get("id"),
-        )
-        return (row[0] if row else None), total
 
     def get_next_tags_batch_from_pool(
         self,
@@ -2669,73 +2156,21 @@ class TagCacheManager:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            metadata = {
-                row["key"]: row["value"]
-                for row in conn.execute(
-                    """
-                    SELECT key, value
-                    FROM metadata
-                    WHERE key IN ('current_index', 'use_filtered_pool', 'active_rule_id')
-                    """
-                ).fetchall()
-            }
-            current_index = max(0, self._safe_int(metadata.get("current_index"), 0))
-            use_pool = metadata.get("use_filtered_pool", "0") == "1"
-            active_rule_id = self._safe_int(metadata.get("active_rule_id"), 0)
-            rule = None
-            if use_pool and active_rule_id > 0:
-                row = conn.execute("SELECT * FROM rules WHERE id = ?", (active_rule_id,)).fetchone()
-                rule = dict(row) if row else None
-
-            params = []
-            if rule:
-                include, exclude = self.parse_search_syntax(
-                    rule.get("query", ""),
-                    rule.get("must_include", ""),
-                    rule.get("must_exclude", ""),
-                )
-                where, params = self._where_for_terms(include, exclude)
-                order = self._sort_sql(rule.get("sort_order") or "ID", rule.get("id"))
-                total = conn.execute(
-                    f"SELECT COUNT(*) AS c FROM tags {where}",
-                    params,
-                ).fetchone()["c"]
-                limit_count = max(0, self._safe_int(rule.get("limit_count"), 0))
-                if limit_count:
-                    total = min(total, limit_count)
-                select_sql = f"""
-                    SELECT COALESCE(tags_prompt, tags) AS tags_prompt,
-                           COALESCE(natural_prompt, '') AS natural_prompt,
-                           COALESCE(natural_source_hash, '') AS natural_source_hash,
-                           COALESCE(natural_converter_version, '') AS natural_converter_version
-                    FROM tags
-                    {where}
-                    ORDER BY {order}
-                    LIMIT ? OFFSET ?
-                """
-            elif use_pool:
-                total = conn.execute("SELECT COUNT(*) AS c FROM filtered_pool").fetchone()["c"]
-                select_sql = """
-                    SELECT COALESCE(tags.tags_prompt, tags.tags, filtered_pool.tags) AS tags_prompt,
-                           COALESCE(tags.natural_prompt, '') AS natural_prompt,
-                           COALESCE(tags.natural_source_hash, '') AS natural_source_hash,
-                           COALESCE(tags.natural_converter_version, '') AS natural_converter_version
-                    FROM filtered_pool
-                    LEFT JOIN tags ON tags.id = filtered_pool.tag_id
-                    ORDER BY filtered_pool.id ASC
-                    LIMIT ? OFFSET ?
-                """
-            else:
-                total = conn.execute("SELECT COUNT(*) AS c FROM tags").fetchone()["c"]
-                select_sql = """
-                    SELECT COALESCE(tags_prompt, tags) AS tags_prompt,
-                           COALESCE(natural_prompt, '') AS natural_prompt,
-                           COALESCE(natural_source_hash, '') AS natural_source_hash,
-                           COALESCE(natural_converter_version, '') AS natural_converter_version
-                    FROM tags
-                    ORDER BY id ASC
-                    LIMIT ? OFFSET ?
-                """
+            row = conn.execute(
+                "SELECT value FROM metadata WHERE key = ?",
+                ("current_index",),
+            ).fetchone()
+            current_index = max(0, self._safe_int(row["value"] if row else 0, 0))
+            total = conn.execute("SELECT COUNT(*) AS c FROM tags").fetchone()["c"]
+            select_sql = """
+                SELECT COALESCE(tags_prompt, tags) AS tags_prompt,
+                       COALESCE(natural_prompt, '') AS natural_prompt,
+                       COALESCE(natural_source_hash, '') AS natural_source_hash,
+                       COALESCE(natural_converter_version, '') AS natural_converter_version
+                FROM tags
+                ORDER BY id ASC
+                LIMIT ? OFFSET ?
+            """
 
             total = int(total or 0)
             if total <= 0:
@@ -2751,8 +2186,7 @@ class TagCacheManager:
                             break
                         current_index = 0
                     take = min(remaining, total - current_index)
-                    query_params = list(params) + [take, current_index]
-                    segment = conn.execute(select_sql, query_params).fetchall()
+                    segment = conn.execute(select_sql, (take, current_index)).fetchall()
                     if not segment:
                         break
                     rows.extend(segment)
