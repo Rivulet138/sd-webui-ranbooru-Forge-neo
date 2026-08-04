@@ -3038,14 +3038,14 @@ class Script(scripts.Script):
         with row_container:
             with input_row:
                 with gr.Column(scale=2, min_width=220):
-                    tags = gr.Textbox(lines=1, label="Tags to Search (Pre)")
+                    tags = gr.Textbox(lines=1, label="Tags to Search (Pre)", elem_id="ranbooru_tags", elem_classes=["ranbooru-input"])
                 with gr.Column(scale=8):
-                    tag_prompt_input = gr.Textbox(lines=3, label="Tag Prompt")
+                    tag_prompt_input = gr.Textbox(lines=3, label="Tag Prompt", elem_id="ranbooru_tag_prompt", elem_classes=["ranbooru-input"])
             with action_row:
                 with gr.Column(scale=2, min_width=220):
-                    generate_prompt_btn = gr.Button("生成提示词")
+                    generate_prompt_btn = gr.Button("生成提示词", elem_id="ranbooru_generate_prompt", elem_classes=["ranbooru-primary-action"])
                 with gr.Column(scale=8):
-                    with gr.Accordion(label="Ranbooru", open=False):
+                    with gr.Accordion(label="Ranbooru 在线生成设置", open=False, elem_id="ranbooru_online_workspace", elem_classes=["ranbooru-panel"]):
                         enabled = gr.Checkbox(label="Enabled", value=False)
                         with gr.Row():
                             with gr.Column(scale=1):
@@ -3127,100 +3127,107 @@ class Script(scripts.Script):
                             use_same_seed = gr.Checkbox(label="Use same seed for all pictures", value=False)
                             use_cache = gr.Checkbox(label="Use cache", value=True)
 
-                        # ─── Tag Cache 面板（中文 UI） ────────────────────────
-                        with gr.Accordion("Tag 缓存管理", open=False):
-                            gr.Markdown("### 📦 批量爬取 Tag 并缓存到本地")
-                            with gr.Row():
-                                cache_status_display = gr.Textbox(
-                                    label="缓存状态", value=tag_cache_manager.get_status(),
-                                    interactive=False, lines=1
-                                )
-                                cache_refresh_status_btn = gr.Button("🔄 刷新状态")
+                    # ─── 本地缓存工作区 ────────────────────────────────────────
+                    with gr.Group(elem_id="ranbooru_cache_workspace", elem_classes=["ranbooru-cache-workspace"]):
+                        gr.Markdown("### 本地缓存工作区", elem_classes=["ranbooru-section-title"])
+                        with gr.Tabs(elem_id="ranbooru_cache_tabs", elem_classes=["ranbooru-cache-tabs"]):
+                            with gr.Tab("缓存采集", elem_id="ranbooru_tab_collect"):
+                                gr.Markdown("### 采集条件")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_status_display = gr.Textbox(
+                                        elem_id="ranbooru_cache_status",
+                                        label="缓存状态", value=tag_cache_manager.get_status(),
+                                        interactive=False, lines=1
+                                    )
+                                    cache_refresh_status_btn = gr.Button("刷新状态")
 
-                            gr.Markdown("#### 爬取设置")
-                            with gr.Row():
-                                cache_pages = gr.Number(label="爬取页数", minimum=1, maximum=100, value=5, step=1, precision=0)
-                                cache_start_page = gr.Number(label="从第几页开始缓存", minimum=1, maximum=100000, value=1, step=1, precision=0)
-                                cache_append_mode = gr.Checkbox(label="追加模式（不覆盖已有缓存）", value=True)
-                                cache_dedupe = gr.Checkbox(label="强制入库去重（完全相同 Tag 必删）", value=True, interactive=False)
-                            with gr.Row():
-                                cache_min_score_enabled = gr.Checkbox(label="启用最低分过滤", value=False)
-                                cache_min_score = gr.Number(label="最低 Score", value=0, step=1, precision=0)
-                            with gr.Row():
-                                cache_keep_all_tags = gr.Textbox(
-                                    label="缓存必须全部包含",
-                                    placeholder="例如: kafuu_chino",
+                                gr.Markdown("#### 爬取设置")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_pages = gr.Number(label="爬取页数", minimum=1, maximum=100, value=5, step=1, precision=0)
+                                    cache_start_page = gr.Number(label="从第几页开始缓存", minimum=1, maximum=100000, value=1, step=1, precision=0)
+                                    cache_append_mode = gr.Checkbox(label="追加模式（不覆盖已有缓存）", value=True)
+                                    cache_dedupe = gr.Checkbox(label="强制入库去重（完全相同 Tag 必删）", value=True, interactive=False)
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_min_score_enabled = gr.Checkbox(label="启用最低分过滤", value=False)
+                                    cache_min_score = gr.Number(label="最低 Score", value=0, step=1, precision=0)
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_keep_all_tags = gr.Textbox(
+                                        label="缓存必须全部包含",
+                                        placeholder="例如: kafuu_chino",
+                                        lines=1,
+                                    )
+                                    cache_keep_any_tags = gr.Textbox(
+                                        label="缓存必须任意包含",
+                                        placeholder="例如: 1girl,2girls",
+                                        lines=1,
+                                    )
+                                cache_exclude_tags = gr.Textbox(
+                                    label="缓存排除 Tag（命中任意一个就不入库）",
+                                    placeholder="例如: comic,text,speech_bubble,english_text",
                                     lines=1,
                                 )
-                                cache_keep_any_tags = gr.Textbox(
-                                    label="缓存必须任意包含",
-                                    placeholder="例如: 1girl,2girls",
-                                    lines=1,
-                                )
-                            cache_exclude_tags = gr.Textbox(
-                                label="缓存排除 Tag（命中任意一个就不入库）",
-                                placeholder="例如: comic,text,speech_bubble,english_text",
-                                lines=1,
-                            )
-                            cache_fetch_btn = gr.Button("🚀 开始批量爬取", variant="primary")
-                            cache_fetch_result = gr.Textbox(label="爬取结果", interactive=False, lines=2)
+                                cache_fetch_btn = gr.Button("开始批量爬取", variant="primary")
+                                cache_fetch_result = gr.Textbox(label="爬取结果", interactive=False, lines=2)
 
-                            gr.Markdown("#### 顺序输出")
-                            with gr.Row():
-                                cache_loop_mode = gr.Checkbox(label="循环播放（到末尾后从头开始）", value=True)
-                            with gr.Row():
-                                cache_next_btn = gr.Button("▶ 取出下一条")
-                                cache_next_set_btn = gr.Button("▶ 取出并设置到提示词", variant="primary")
-                                cache_prompt_write_mode = gr.Dropdown(
-                                    ["追加到后面", "追加到前面", "替换", "只输出"],
-                                    label="写入模式",
-                                    value="追加到后面"
+                            with gr.Tab("浏览与联动", elem_id="ranbooru_tab_browse"):
+                                gr.Markdown("### 浏览与使用")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_loop_mode = gr.Checkbox(label="循环播放（到末尾后从头开始）", value=True)
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_next_btn = gr.Button("取出下一条")
+                                    cache_next_set_btn = gr.Button("取出并设置到提示词", variant="primary")
+                                    cache_prompt_write_mode = gr.Dropdown(
+                                        ["追加到后面", "追加到前面", "替换", "只输出"],
+                                        label="写入模式",
+                                        value="追加到后面"
+                                    )
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_lookup_id = gr.Textbox(label="按缓存序号取 Tag", placeholder="例如: 110", lines=1)
+                                    cache_lookup_id_btn = gr.Button("按序号取出")
+                                    cache_lookup_id_set_btn = gr.Button("按序号写入 Tag Prompt")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_jump_position = gr.Number(label="跳转到第几条", minimum=1, step=1, precision=0)
+                                    cache_jump_position_btn = gr.Button("跳转到该条")
+                                    cache_jump_take_btn = gr.Button("跳转并取出")
+                                    cache_jump_take_set_btn = gr.Button("跳转并写入 Tag Prompt", variant="primary")
+                                cache_jump_result = gr.Textbox(label="跳转结果", interactive=False, lines=1)
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_preview_next_btn = gr.Button("预览下一条")
+                                cache_preview_output = gr.Textbox(label="下一条预览", interactive=False, lines=3)
+                                cache_next_output = gr.Textbox(
+                                    elem_id="ranbooru_cache_current_prompt",
+                                    label="当前取出的 Tag / 转换后 Prompt",
+                                    interactive=False,
+                                    lines=3,
                                 )
-                            with gr.Row():
-                                cache_lookup_id = gr.Textbox(label="按缓存序号取 Tag", placeholder="例如: 110", lines=1)
-                                cache_lookup_id_btn = gr.Button("按序号取出")
-                                cache_lookup_id_set_btn = gr.Button("按序号写入 Tag Prompt")
-                            with gr.Row():
-                                cache_jump_position = gr.Number(label="跳转到第几条", minimum=1, step=1, precision=0)
-                                cache_jump_position_btn = gr.Button("跳转到该条")
-                                cache_jump_take_btn = gr.Button("跳转并取出")
-                                cache_jump_take_set_btn = gr.Button("跳转并写入 Tag Prompt", variant="primary")
-                            cache_jump_result = gr.Textbox(label="跳转结果", interactive=False, lines=1)
-                            with gr.Row():
-                                cache_preview_next_btn = gr.Button("预览下一条")
-                            cache_preview_output = gr.Textbox(label="下一条预览", interactive=False, lines=3)
-                            cache_next_output = gr.Textbox(
-                                label="当前取出的 Tag / 转换后 Prompt",
-                                interactive=False,
-                                lines=3,
-                            )
-                            cache_current_record_id = gr.State("")
-                            with gr.Row():
-                                cache_send_prompt_studio_btn = gr.Button("发送到 LLM 提示词工作室")
-                                cache_process_prompt_studio_btn = gr.Button(
-                                    "使用 LLM 处理并缓存",
-                                    variant="primary",
+                                cache_current_record_id = gr.State("")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_send_prompt_studio_btn = gr.Button("发送到 LLM 提示词工作室")
+                                    cache_process_prompt_studio_btn = gr.Button(
+                                        "使用 LLM 处理并缓存",
+                                        variant="primary",
+                                    )
+                                cache_prompt_studio_result = gr.Textbox(
+                                    label="LLM 提示词工作室处理结果",
+                                    interactive=False,
+                                    lines=4,
                                 )
-                            cache_prompt_studio_result = gr.Textbox(
-                                label="LLM 提示词工作室处理结果",
-                                interactive=False,
-                                lines=4,
-                            )
-                            cache_prompt_studio_status = gr.Textbox(
-                                label="LLM 提示词工作室联动状态",
-                                interactive=False,
-                                lines=2,
-                            )
+                                cache_prompt_studio_status = gr.Textbox(
+                                    elem_id="ranbooru_llm_handoff_status",
+                                    label="LLM 提示词工作室联动状态",
+                                    interactive=False,
+                                    lines=2,
+                                )
 
-                            gr.Markdown("#### ⚙️ 生成设置")
-                            with gr.Row():
-                                use_local_cache_gen = gr.Checkbox(label="生成时使用此缓存", value=False)
-                                use_local_cache_loop = gr.Checkbox(label="生成时循环读取 (到末尾自动重头)", value=True)
-                                use_preconverted_cache_prompt = gr.Checkbox(
-                                    label="优先使用已预转换的自然语言 Prompt",
-                                    value=True,
-                                )
-                            with gr.Accordion("批量预转换缓存为自然语言", open=False):
+                                gr.Markdown("### 生成使用方式")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    use_local_cache_gen = gr.Checkbox(label="生成时使用此缓存", value=False)
+                                    use_local_cache_loop = gr.Checkbox(label="生成时循环读取 (到末尾自动重头)", value=True)
+                                    use_preconverted_cache_prompt = gr.Checkbox(
+                                        label="优先使用已预转换的自然语言 Prompt",
+                                        value=True,
+                                    )
+                            with gr.Tab("自然语言与 RAG", elem_id="ranbooru_tab_natural"):
                                 gr.Markdown(
                                     "按主缓存的**可见序号**选择几十或"
                                     "几百条记录；每条记录的整个 `tags_prompt` 会一次性转换并保存到数据库的"
@@ -3239,7 +3246,7 @@ class Script(scripts.Script):
                                     interactive=False,
                                     lines=1,
                                 )
-                                with gr.Row():
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
                                     cache_natural_language_positions = gr.Textbox(
                                         label="选择可见序号 / 范围",
                                         placeholder="例如：1-100,205-240,301",
@@ -3249,7 +3256,7 @@ class Script(scripts.Script):
                                         label="只转换尚未转换的记录",
                                         value=True,
                                     )
-                                with gr.Row():
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
                                     cache_prompt_rag_enabled = gr.Checkbox(
                                         label="启用本地高分 Prompt RAG / Few-Shot",
                                         value=saved_rag_enabled,
@@ -3283,7 +3290,7 @@ class Script(scripts.Script):
                                     label="自然语言预设",
                                     value=saved_natural_preset,
                                 )
-                                with gr.Row():
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
                                     cache_natural_language_backend = gr.Dropdown(
                                         NATURAL_LANGUAGE_BACKENDS,
                                         label="转换方式",
@@ -3317,7 +3324,7 @@ class Script(scripts.Script):
                                     ),
                                     lines=1,
                                 )
-                                with gr.Row():
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
                                     cache_natural_language_model = gr.Textbox(
                                         label="模型名称",
                                         value=str(saved_natural_settings.get("model", "")),
@@ -3339,7 +3346,7 @@ class Script(scripts.Script):
                                         ),
                                         lines=1,
                                     )
-                                with gr.Row():
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
                                     cache_natural_language_save_settings_btn = gr.Button(
                                         "保存 LLM 设置（含 API Key）"
                                     )
@@ -3358,7 +3365,7 @@ class Script(scripts.Script):
                                     interactive=False,
                                     lines=1,
                                 )
-                                with gr.Row():
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
                                     cache_natural_language_preview_btn = gr.Button(
                                         "预览所选缓存"
                                     )
@@ -3382,85 +3389,86 @@ class Script(scripts.Script):
                                     lines=8,
                                 )
 
-                        # ─── 管理操作面板 ────────────────────────
-                        with gr.Accordion("缓存管理操作", open=False):
-                            gr.Markdown("### 🔧 搜索、删除、重置缓存")
-                            with gr.Row():
-                                cache_search_keyword = gr.Textbox(label="搜索语法", placeholder="例如: +1girl +blue_eyes -2girls -text", lines=1)
-                                cache_search_btn = gr.Button("🔍 搜索")
-                            cache_search_results = gr.Dataframe(
-                                headers=["主缓存序号", "Booru", "Post ID", "Score", "Rating", "Tags", "内部 ID"],
-                                label="搜索结果",
-                                interactive=False,
-                                wrap=True
-                            )
-                            with gr.Row():
-                                cache_select_id = gr.Number(
-                                    label="搜索结果内部 ID",
-                                    minimum=1,
-                                    step=1,
-                                    precision=0,
+                            with gr.Tab("维护与导入导出", elem_id="ranbooru_tab_maintenance"):
+                                gr.Markdown("### 搜索与维护")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_search_keyword = gr.Textbox(label="搜索语法", placeholder="例如: +1girl +blue_eyes -2girls -text", lines=1)
+                                    cache_search_btn = gr.Button("搜索")
+                                cache_search_results = gr.Dataframe(
+                                    headers=["主缓存序号", "Booru", "Post ID", "Score", "Rating", "Tags", "内部 ID"],
+                                    label="搜索结果",
+                                    interactive=False,
+                                    wrap=True,
+                                    elem_classes=["ranbooru-table"],
                                 )
-                                cache_fill_btn = gr.Button("📝 填充到输出")
-                                cache_preview_delete_id_btn = gr.Button("预览此条")
-                                cache_delete_id_btn = gr.Button("🗑️ 删除此条", variant="stop")
-                            with gr.Row():
-                                cache_reset_btn = gr.Button("🔁 重置索引")
-                                cache_backup_btn = gr.Button("备份缓存")
-                                cache_restore_deleted_btn = gr.Button("撤销上一次删除")
-                                cache_preview_delete_all_btn = gr.Button("预览全部删除")
-                                cache_delete_btn = gr.Button("🗑️ 删除全部缓存", variant="stop")
-                                cache_compact_btn = gr.Button("手动清除完全一致 Tag", variant="secondary")
-                            with gr.Row():
-                                cache_delete_tags = gr.Textbox(
-                                    label="按包含 Tag 删除缓存",
-                                    placeholder="例如: comic,text,speech_bubble,english_text",
-                                    lines=1,
-                                )
-                                cache_preview_delete_tags_btn = gr.Button("预览删除这些 Tag")
-                                cache_delete_tags_btn = gr.Button("删除包含这些 Tag", variant="stop")
-                            with gr.Row():
-                                cache_delete_range = gr.Textbox(
-                                    label="按序号/范围删除缓存",
-                                    placeholder="例如: 100-140, 150, 166",
-                                    lines=1,
-                                )
-                                cache_preview_delete_range_btn = gr.Button("预览删除这些序号")
-                                cache_delete_range_btn = gr.Button("删除这些序号", variant="stop")
-                            cache_delete_preview = gr.Textbox(label="删除预览", interactive=False, lines=8)
-                            with gr.Row():
-                                cache_similar_threshold = gr.Number(
-                                    label="相似去重阈值",
-                                    minimum=0.5,
-                                    maximum=1.0,
-                                    value=0.90,
-                                    step=0.01,
-                                )
-                                cache_similar_keep = gr.Number(
-                                    label="每组最多保留",
-                                    minimum=1,
-                                    maximum=20,
-                                    value=2,
-                                    step=1,
-                                    precision=0,
-                                )
-                                cache_compact_similar_btn = gr.Button("清除相似 Tag (>=90%)", variant="secondary")
-                            with gr.Row():
-                                cache_export_format = gr.Dropdown(["json", "csv"], label="导出格式", value="json")
-                                cache_export_btn = gr.Button("导出缓存")
-                            with gr.Row():
-                                cache_import_path = gr.File(
-                                    label="上传要导入的 JSON / CSV",
-                                    file_count="single",
-                                    file_types=[".json", ".csv"],
-                                    type="filepath",
-                                )
-                                cache_import_append = gr.Checkbox(label="导入时追加", value=True)
-                                cache_import_dedupe = gr.Checkbox(label="导入时去重", value=True)
-                                cache_import_preflight_btn = gr.Button("预检导入")
-                                cache_import_btn = gr.Button("导入缓存", variant="primary")
-                            cache_import_export_result = gr.Textbox(label="导入/导出结果", interactive=False, lines=8)
-                            cache_manage_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_select_id = gr.Number(
+                                        label="搜索结果内部 ID",
+                                        minimum=1,
+                                        step=1,
+                                        precision=0,
+                                    )
+                                    cache_fill_btn = gr.Button("填充到输出")
+                                    cache_preview_delete_id_btn = gr.Button("预览此条")
+                                    cache_delete_id_btn = gr.Button("删除此条", variant="stop")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_reset_btn = gr.Button("重置索引")
+                                    cache_backup_btn = gr.Button("备份缓存")
+                                    cache_restore_deleted_btn = gr.Button("撤销上一次删除")
+                                    cache_preview_delete_all_btn = gr.Button("预览全部删除")
+                                    cache_delete_btn = gr.Button("删除全部缓存", variant="stop")
+                                    cache_compact_btn = gr.Button("手动清除完全一致 Tag", variant="secondary")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_delete_tags = gr.Textbox(
+                                        label="按包含 Tag 删除缓存",
+                                        placeholder="例如: comic,text,speech_bubble,english_text",
+                                        lines=1,
+                                    )
+                                    cache_preview_delete_tags_btn = gr.Button("预览删除这些 Tag")
+                                    cache_delete_tags_btn = gr.Button("删除包含这些 Tag", variant="stop")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_delete_range = gr.Textbox(
+                                        label="按序号/范围删除缓存",
+                                        placeholder="例如: 100-140, 150, 166",
+                                        lines=1,
+                                    )
+                                    cache_preview_delete_range_btn = gr.Button("预览删除这些序号")
+                                    cache_delete_range_btn = gr.Button("删除这些序号", variant="stop")
+                                cache_delete_preview = gr.Textbox(label="删除预览", elem_id="ranbooru_cache_delete_preview", interactive=False, lines=8)
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_similar_threshold = gr.Number(
+                                        label="相似去重阈值",
+                                        minimum=0.5,
+                                        maximum=1.0,
+                                        value=0.90,
+                                        step=0.01,
+                                    )
+                                    cache_similar_keep = gr.Number(
+                                        label="每组最多保留",
+                                        minimum=1,
+                                        maximum=20,
+                                        value=2,
+                                        step=1,
+                                        precision=0,
+                                    )
+                                    cache_compact_similar_btn = gr.Button("清除相似 Tag (>=90%)", variant="secondary")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_export_format = gr.Dropdown(["json", "csv"], label="导出格式", value="json")
+                                    cache_export_btn = gr.Button("导出缓存")
+                                with gr.Row(elem_classes=["ranbooru-form-row"]):
+                                    cache_import_path = gr.File(
+                                        label="上传要导入的 JSON / CSV",
+                                        file_count="single",
+                                        file_types=[".json", ".csv"],
+                                        type="filepath",
+                                    )
+                                    cache_import_append = gr.Checkbox(label="导入时追加", value=True)
+                                    cache_import_dedupe = gr.Checkbox(label="导入时去重", value=True)
+                                    cache_import_preflight_btn = gr.Button("预检导入")
+                                    cache_import_btn = gr.Button("导入缓存", variant="primary")
+                                cache_import_export_result = gr.Textbox(label="导入/导出结果", interactive=False, lines=8)
+                                cache_manage_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
+
 
         with InputAccordion(False, label="LoRAnado", elem_id=self.elem_id("lo_enable")) as lora_enabled:
             with gr.Group():

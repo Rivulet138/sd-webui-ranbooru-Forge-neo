@@ -1,0 +1,28 @@
+#ranbooru_cache_workspace {
+  margin-top: 0.75rem;
+  min-width: 0;
+}
+
+#ranbooru_cache_workspace .ranbooru-section-title h3 {
+  margin: 0;
+  font-size: 1.05rem;
+  letter-spacing: 0;
+}
+
+.ranbooru-cache-tabs { margin-top: 0.35rem; }
+.ranbooru-form-row { display: flex; flex-wrap: wrap; gap: 0.65rem; align-items: flex-end; }
+.ranbooru-form-row > * { min-width: min(100%, 12rem); }
+.ranbooru-table { width: 100%; overflow-x: auto; }
+.ranbooru-table .dataframe { min-width: 52rem; }
+.ranbooru-primary-action button { min-height: 2.4rem; }
+.ranbooru-input textarea, .ranbooru-input input { min-width: 0; }
+#ranbooru_cache_tabs > .tab-nav { overflow-x: auto; flex-wrap: nowrap; }
+#ranbooru_cache_tabs > .tab-nav button { flex: 0 0 auto; min-width: max-content; min-height: 2.5rem; white-space: nowrap; }
+
+@media (max-width: 900px) {
+  #ranbooru_cache_workspace { width: 100%; }
+  .ranbooru-form-row { flex-direction: column; align-items: stretch; }
+  .ranbooru-form-row > * { width: 100%; min-width: 0 !important; }
+  .ranbooru-table { overflow-x: auto; }
+  #ranbooru_cache_workspace button { min-height: 2.65rem; white-space: normal; }
+}
