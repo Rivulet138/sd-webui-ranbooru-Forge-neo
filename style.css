@@ -3,9 +3,9 @@
   min-width: 0;
 }
 
-#ranbooru_cache_workspace .ranbooru-section-title h3 {
-  margin: 0;
-  font-size: 1.05rem;
+#ranbooru_cache_workspace > .label-wrap {
+  min-height: 2.75rem;
+  font-weight: 600;
   letter-spacing: 0;
 }
 

@@ -3045,7 +3045,7 @@ class Script(scripts.Script):
                 with gr.Column(scale=2, min_width=220):
                     generate_prompt_btn = gr.Button("生成提示词", elem_id="ranbooru_generate_prompt", elem_classes=["ranbooru-primary-action"])
                 with gr.Column(scale=8):
-                    with gr.Accordion(label="Ranbooru 在线生成设置", open=False, elem_id="ranbooru_online_workspace", elem_classes=["ranbooru-panel"]):
+                    with gr.Accordion(label="Ranbooru", open=False, elem_id="ranbooru_online_workspace", elem_classes=["ranbooru-panel"]):
                         enabled = gr.Checkbox(label="Enabled", value=False)
                         with gr.Row():
                             with gr.Column(scale=1):
@@ -3128,8 +3128,12 @@ class Script(scripts.Script):
                             use_cache = gr.Checkbox(label="Use cache", value=True)
 
                     # ─── 本地缓存工作区 ────────────────────────────────────────
-                    with gr.Group(elem_id="ranbooru_cache_workspace", elem_classes=["ranbooru-cache-workspace"]):
-                        gr.Markdown("### 本地缓存工作区", elem_classes=["ranbooru-section-title"])
+                    with gr.Accordion(
+                        "本地缓存工作区",
+                        open=False,
+                        elem_id="ranbooru_cache_workspace",
+                        elem_classes=["ranbooru-cache-workspace"],
+                    ):
                         with gr.Tabs(elem_id="ranbooru_cache_tabs", elem_classes=["ranbooru-cache-tabs"]):
                             with gr.Tab("缓存采集", elem_id="ranbooru_tab_collect"):
                                 gr.Markdown("### 采集条件")

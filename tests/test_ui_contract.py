@@ -10,6 +10,8 @@ class RanbooruUiContractTests(unittest.TestCase):
     def test_cache_workspace_exposes_task_tabs_and_stable_ids(self):
         source = (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
 
+        self.assertIn('gr.Accordion(label="Ranbooru", open=False', source)
+        self.assertNotIn("Ranbooru 在线生成设置", source)
         for label in ("缓存采集", "浏览与联动", "自然语言与 RAG", "维护与导入导出"):
             self.assertIn(f'gr.Tab("{label}"', source)
 
@@ -22,6 +24,43 @@ class RanbooruUiContractTests(unittest.TestCase):
             "ranbooru_cache_delete_preview",
         ):
             self.assertIn(f'elem_id="{elem_id}"', source)
+
+    def test_cache_workspace_is_collapsible_and_closed_by_default(self):
+        source = ast.parse(
+            (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
+        )
+        workspace = next(
+            node
+            for node in ast.walk(source)
+            if isinstance(node, ast.With)
+            and node.items
+            and isinstance(node.items[0].context_expr, ast.Call)
+            and isinstance(node.items[0].context_expr.func, ast.Attribute)
+            and node.items[0].context_expr.func.attr == "Accordion"
+            and node.items[0].context_expr.args
+            and isinstance(node.items[0].context_expr.args[0], ast.Constant)
+            and node.items[0].context_expr.args[0].value == "本地缓存工作区"
+        )
+        keywords = {
+            keyword.arg: keyword.value
+            for keyword in workspace.items[0].context_expr.keywords
+        }
+
+        self.assertIs(keywords["open"].value, False)
+        self.assertEqual(keywords["elem_id"].value, "ranbooru_cache_workspace")
+        nested_tabs = {
+            call.args[0].value
+            for call in ast.walk(workspace)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "Tab"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+        }
+        self.assertTrue(
+            {"缓存采集", "浏览与联动", "自然语言与 RAG", "维护与导入导出"}
+            <= nested_tabs
+        )
 
     def test_each_cache_tab_owns_its_workflow_controls(self):
         source = ast.parse(
