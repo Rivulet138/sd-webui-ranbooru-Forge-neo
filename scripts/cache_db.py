@@ -20,6 +20,13 @@ import threading
 from datetime import datetime, timedelta
 from functools import wraps
 
+PROMPT_BATCH_SCHEMA = "prompt_batch.v1"
+PROMPT_BATCH_MAX_RECORDS = 200
+PROMPT_BATCH_MAX_PROMPT_LENGTH = 12_000
+PROMPT_BATCH_MAX_TOTAL_LENGTH = 1_000_000
+PROMPT_BATCH_MAX_BYTES = 4 * 1024 * 1024
+PROMPT_BATCH_META_PREFIX = "prompt_batch.v1:"
+
 try:
     from .ranbooru_logging import get_logger, log_event
     from .version import NATURAL_PROMPT_CONVERTER_VERSION
@@ -404,6 +411,10 @@ class TagCacheManager:
         return self.SORT_SQL.get(sort_order or "ID", "id ASC")
 
     def _make_duplicate_key(self, record):
+        metadata = self._prompt_batch_metadata(record)
+        image_identity = metadata.get("sha256") or metadata.get("record_id") or metadata.get("filename")
+        if image_identity:
+            return f"prompt_batch:{image_identity}"
         tag_key = self._canonical_tag_key(
             record.get("tags_raw") or record.get("tags_prompt") or record.get("tags") or ""
         )
@@ -414,6 +425,29 @@ class TagCacheManager:
         if booru and post_id:
             return f"post:{booru}:{post_id}"
         return "tags:"
+
+    @staticmethod
+    def prompt_batch_search_query(record):
+        image = record.get("image") if isinstance(record.get("image"), dict) else {}
+        metadata = {
+            "record_id": str(record.get("record_id") or "")[:256],
+            "filename": os.path.basename(str(image.get("filename") or ""))[:255],
+            "sha256": str(image.get("sha256") or "")[:128],
+        }
+        if not any(metadata.values()):
+            return ""
+        return PROMPT_BATCH_META_PREFIX + json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+
+    @staticmethod
+    def _prompt_batch_metadata(record):
+        value = str(record.get("search_query") or "")
+        if not value.startswith(PROMPT_BATCH_META_PREFIX):
+            return {}
+        try:
+            metadata = json.loads(value[len(PROMPT_BATCH_META_PREFIX):])
+        except (TypeError, ValueError):
+            return {}
+        return metadata if isinstance(metadata, dict) else {}
 
     def _coerce_record(self, record):
         if isinstance(record, str):
@@ -451,7 +485,7 @@ class TagCacheManager:
 
     def _rebuild_duplicate_keys(self, conn):
         rows = conn.execute(
-            "SELECT id, booru, post_id, tags, tags_prompt, tags_raw, duplicate_key FROM tags ORDER BY id"
+            "SELECT id, booru, post_id, tags, tags_prompt, tags_raw, search_query, duplicate_key FROM tags ORDER BY id"
         ).fetchall()
         updated = 0
         for row in rows:
@@ -464,6 +498,7 @@ class TagCacheManager:
                     "tags_raw": tags_raw,
                     "tags_prompt": tags_prompt,
                     "tags": tags_raw,
+                    "search_query": row["search_query"],
                 }
             )
             if row["duplicate_key"] != duplicate_key or row["tags_prompt"] != tags_prompt or row["tags_raw"] != tags_raw:
@@ -1931,6 +1966,33 @@ class TagCacheManager:
         finally:
             conn.close()
 
+    def _to_prompt_batch_record(self, row, position):
+        metadata = self._prompt_batch_metadata(row)
+        positive = str(row.get("tags_prompt") or "")
+        natural = str(row.get("natural_prompt") or "")
+        if len(positive) > PROMPT_BATCH_MAX_PROMPT_LENGTH or len(natural) > PROMPT_BATCH_MAX_PROMPT_LENGTH:
+            raise ValueError(f"记录 {row.get('id', position)} 的 Prompt 超过 {PROMPT_BATCH_MAX_PROMPT_LENGTH} 字符")
+        prompt = {"positive": positive, "natural": natural}
+        if natural:
+            prompt["processed"] = natural
+        return {
+            "record_id": str(metadata.get("record_id") or row.get("id", "")),
+            "index": position,
+            "image": {
+                "filename": str(metadata.get("filename") or ""),
+                "sha256": str(metadata.get("sha256") or ""),
+                "source_url": row.get("source_url", ""),
+                "preview_url": row.get("preview_url", ""),
+            },
+            "prompt": prompt,
+            "booru": {
+                "site": row.get("booru", ""),
+                "post_id": row.get("post_id", ""),
+                "score": row.get("score", 0),
+                "rating": row.get("rating", ""),
+            },
+        }
+
     def export_records(self, file_format="json", file_path=None):
         file_format = str(file_format or "json").lower().strip()
         if file_format not in ("json", "csv"):
@@ -1948,7 +2010,7 @@ class TagCacheManager:
         ]
         conn = self._connect()
         try:
-            rows = [
+            all_rows = [
                 {field: record.get(field, "") for field in fieldnames}
                 for record in self._all_records(conn)
             ]
@@ -1956,14 +2018,40 @@ class TagCacheManager:
             conn.close()
 
         if file_format == "csv":
+            rows = all_rows
             with open(file_path, "w", encoding="utf-8-sig", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(rows)
         else:
+            records = []
+            prompt_total = 0
+            for row in all_rows:
+                if len(records) >= PROMPT_BATCH_MAX_RECORDS:
+                    break
+                record = self._to_prompt_batch_record(row, len(records) + 1)
+                prompt_total += len(record["prompt"]["positive"]) + len(record["prompt"]["natural"])
+                if prompt_total > PROMPT_BATCH_MAX_TOTAL_LENGTH:
+                    break
+                records.append(record)
+            payload = {
+                "schema_version": PROMPT_BATCH_SCHEMA,
+                "producer": {"name": "ranbooru"},
+                "records": records,
+            }
+            content = json.dumps(payload, ensure_ascii=False, indent=2)
+            if len(content.encode("utf-8")) > PROMPT_BATCH_MAX_BYTES:
+                raise ValueError("导出 JSON 超过 4 MB")
             with open(file_path, "w", encoding="utf-8") as handle:
-                json.dump(rows, handle, ensure_ascii=False, indent=2)
-        return {"path": file_path, "count": len(rows), "format": file_format}
+                handle.write(content)
+            rows = records
+        return {
+            "path": file_path,
+            "count": len(rows),
+            "total_count": len(all_rows),
+            "truncated": len(rows) < len(all_rows),
+            "format": file_format,
+        }
 
     def _load_import_records(self, file_path):
         file_path = str(file_path or "").strip().strip('"')
@@ -1986,7 +2074,10 @@ class TagCacheManager:
         ext = os.path.splitext(file_path)[1].lower()
         if ext not in (".csv", ".json"):
             return {"ok": False, "message": "仅支持 JSON 或 CSV 导入", "records": []}
+        if ext == ".json" and file_stat.st_size > PROMPT_BATCH_MAX_BYTES:
+            return {"ok": False, "message": "JSON 导入文件超过 4 MB", "records": []}
         records = []
+        is_prompt_batch = False
         try:
             if ext == ".csv":
                 with open(file_path, "r", encoding="utf-8-sig", newline="") as handle:
@@ -2003,6 +2094,10 @@ class TagCacheManager:
                 with open(file_path, "r", encoding="utf-8") as handle:
                     payload = json.load(handle)
                 if isinstance(payload, dict):
+                    if payload.get("schema_version"):
+                        if payload.get("schema_version") != PROMPT_BATCH_SCHEMA:
+                            return {"ok": False, "message": "不支持的 prompt_batch schema", "records": []}
+                        is_prompt_batch = True
                     records = payload.get("records") or payload.get("tags") or []
                 elif isinstance(payload, list):
                     records = payload
@@ -2017,13 +2112,48 @@ class TagCacheManager:
                 "message": f"导入记录过多（上限 {self.MAX_IMPORT_RECORDS} 条）",
                 "records": [],
             }
+        if is_prompt_batch and len(records) > PROMPT_BATCH_MAX_RECORDS:
+            return {"ok": False, "message": "prompt_batch.v1 最多 200 条记录", "records": []}
 
         normalized = []
+        prompt_total = 0
         for record in records:
             if isinstance(record, str):
+                if is_prompt_batch:
+                    return {"ok": False, "message": "prompt_batch.v1 的记录必须是对象", "records": []}
                 normalized.append({"tags_prompt": record})
             elif isinstance(record, dict):
-                normalized.append(record)
+                prompt = record.get("prompt") or {}
+                image = record.get("image") or {}
+                booru = record.get("booru") or {}
+                if is_prompt_batch and (not isinstance(prompt, dict) or not isinstance(image, dict)):
+                    return {"ok": False, "message": "prompt_batch.v1 记录缺少 image 或 prompt", "records": []}
+                if not isinstance(prompt, dict) or not isinstance(image, dict) or not isinstance(booru, (dict, str)):
+                    continue
+                positive = record.get("tags_prompt") or prompt.get("positive") or ""
+                natural = record.get("natural_prompt") or prompt.get("natural") or prompt.get("processed") or ""
+                if is_prompt_batch:
+                    if not str(positive).strip():
+                        return {"ok": False, "message": "prompt_batch.v1 记录缺少正向 Prompt", "records": []}
+                    if len(str(positive)) > PROMPT_BATCH_MAX_PROMPT_LENGTH or len(str(natural)) > PROMPT_BATCH_MAX_PROMPT_LENGTH:
+                        return {"ok": False, "message": "prompt_batch.v1 的 Prompt 超过 12000 字符", "records": []}
+                    prompt_total += len(str(positive)) + len(str(natural))
+                    if prompt_total > PROMPT_BATCH_MAX_TOTAL_LENGTH:
+                        return {"ok": False, "message": "prompt_batch.v1 文本总长度超过限制", "records": []}
+                normalized.append({
+                    **record,
+                    "tags_prompt": positive,
+                    "natural_prompt": natural,
+                    "natural_source_hash": record.get("natural_source_hash") or (self._natural_source_hash(positive) if natural else ""),
+                    "natural_converter_version": record.get("natural_converter_version") or (self.NATURAL_CONVERTER_VERSION if natural else ""),
+                    "source_url": record.get("source_url") or image.get("source_url") or "",
+                    "preview_url": record.get("preview_url") or image.get("preview_url") or "",
+                    "booru": record.get("booru") if isinstance(record.get("booru"), str) else booru.get("site", ""),
+                    "post_id": record.get("post_id") or booru.get("post_id", ""),
+                    "score": record.get("score", booru.get("score", 0)),
+                    "rating": record.get("rating", booru.get("rating", "")),
+                    "search_query": record.get("search_query") or self.prompt_batch_search_query(record),
+                })
         if not normalized:
             return {"ok": False, "message": "导入文件没有可用 tag", "records": []}
         return {"ok": True, "records": normalized, "path": file_path}

@@ -2918,7 +2918,8 @@ class Script(scripts.Script):
     def _cache_export(file_format):
         try:
             result = tag_cache_manager.export_records(file_format)
-            return f"已导出 {result['count']} 条 {result['format'].upper()}：{result['path']}"
+            scope = f"{result['count']}/{result['total_count']} 条" if result.get("truncated") else f"{result['count']} 条"
+            return f"已导出 {scope} {result['format'].upper()}：{result['path']}"
         except Exception as e:
             return f"导出失败: {e}"
 
@@ -2932,6 +2933,61 @@ class Script(scripts.Script):
             f"导入完成: 写入 {result['inserted']} 条，重复跳过 {result['skipped_duplicate']} 条，总计 {result['total']} 条{backup_note}",
             tag_cache_manager.get_status(),
         )
+
+    @staticmethod
+    def _cache_import_payload(payload, append_mode=True, dedupe=True):
+        """Import a Collector JSON batch directly from a textbox payload."""
+        try:
+            payload_text = str(payload or "")
+            if len(payload_text.encode("utf-8")) > 4 * 1024 * 1024:
+                return "Collector 批次超过 4 MB", tag_cache_manager.get_status()
+            data = json.loads(payload_text)
+            if not isinstance(data, dict) or data.get("schema_version") != "prompt_batch.v1":
+                return "Collector 批次 schema_version 无效", tag_cache_manager.get_status()
+            records = data.get("records", [])
+            if not isinstance(records, list) or not records:
+                return "Collector 批次没有可用记录", tag_cache_manager.get_status()
+            if len(records) > 200:
+                return "Collector 批次超过 200 条上限", tag_cache_manager.get_status()
+            preview = []
+            normalized = []
+            prompt_total = 0
+            for index, item in enumerate(records, 1):
+                if not isinstance(item, dict):
+                    return f"Collector 第 {index} 条记录格式无效", tag_cache_manager.get_status()
+                prompt = item.get("prompt") or {}
+                image = item.get("image") or {}
+                booru = item.get("booru") or {}
+                record = {
+                    "tags_prompt": item.get("tags_prompt") or prompt.get("positive") or "",
+                    "natural_prompt": prompt.get("natural") or prompt.get("processed") or "",
+                    "natural_source_hash": tag_cache_manager._natural_source_hash(item.get("tags_prompt") or prompt.get("positive") or ""),
+                    "natural_converter_version": tag_cache_manager.NATURAL_CONVERTER_VERSION,
+                    "source_url": image.get("source_url") or "",
+                    "preview_url": image.get("preview_url") or "",
+                    "booru": booru.get("site", "") if isinstance(booru, dict) else booru,
+                    "post_id": booru.get("post_id", "") if isinstance(booru, dict) else "",
+                    "score": booru.get("score", 0) if isinstance(booru, dict) else 0,
+                    "rating": booru.get("rating", "") if isinstance(booru, dict) else "",
+                    "search_query": tag_cache_manager.prompt_batch_search_query(item),
+                }
+                prompt_total += len(str(record["tags_prompt"])) + len(str(record["natural_prompt"]))
+                if prompt_total > 1_000_000:
+                    return "Collector 批次文本总长度超过限制", tag_cache_manager.get_status()
+                if not record["tags_prompt"]:
+                    return f"Collector 第 {index} 条缺少正向 Prompt", tag_cache_manager.get_status()
+                if len(record["tags_prompt"]) > 12000 or len(record["natural_prompt"]) > 12000:
+                    return f"Collector 第 {index} 条 Prompt 超过 12000 字符", tag_cache_manager.get_status()
+                normalized.append(record)
+                if len(preview) < 8:
+                    preview.append(f"{index}: {record['tags_prompt'][:120]}")
+            if not normalized:
+                return "Collector 批次没有有效 Prompt", tag_cache_manager.get_status()
+            result = (tag_cache_manager.append_records(normalized, dedupe=dedupe)
+                      if append_mode else tag_cache_manager.save_records(normalized, dedupe=dedupe, backup_reason="collector_import"))
+            return "Collector 批次导入完成\n" + "\n".join(preview) + f"\n写入 {result.get('inserted', 0)} 条", tag_cache_manager.get_status()
+        except Exception as error:
+            return f"Collector 批次解析失败: {error}", tag_cache_manager.get_status()
 
     @staticmethod
     def _format_import_preview(result):
@@ -3457,20 +3513,23 @@ class Script(scripts.Script):
                                     )
                                     cache_compact_similar_btn = gr.Button("清除相似 Tag (>=90%)", variant="secondary")
                                 with gr.Row(elem_classes=["ranbooru-form-row"]):
-                                    cache_export_format = gr.Dropdown(["json", "csv"], label="导出格式", value="json")
-                                    cache_export_btn = gr.Button("导出缓存")
+                                    cache_export_format = gr.Dropdown(["json", "csv"], label="导出格式", value="json", elem_id="ranbooru_cache_export_format")
+                                    cache_export_btn = gr.Button("导出缓存", elem_id="ranbooru_cache_export_btn")
                                 with gr.Row(elem_classes=["ranbooru-form-row"]):
                                     cache_import_path = gr.File(
+                                        elem_id="ranbooru_cache_import_path",
                                         label="上传要导入的 JSON / CSV",
                                         file_count="single",
                                         file_types=[".json", ".csv"],
                                         type="filepath",
                                     )
                                     cache_import_append = gr.Checkbox(label="导入时追加", value=True)
-                                    cache_import_dedupe = gr.Checkbox(label="导入时去重", value=True)
+                                    cache_import_dedupe = gr.Checkbox(label="导入时按来源去重", value=True)
                                     cache_import_preflight_btn = gr.Button("预检导入")
                                     cache_import_btn = gr.Button("导入缓存", variant="primary")
-                                cache_import_export_result = gr.Textbox(label="导入/导出结果", interactive=False, lines=8)
+                                cache_import_export_result = gr.Textbox(label="导入/导出结果", elem_id="ranbooru_cache_import_result", interactive=False, lines=8)
+                                cache_prompt_batch_payload = gr.Textbox(label="Prompt Batch JSON", elem_id="ranbooru_prompt_batch_payload", visible=False, lines=1)
+                                cache_prompt_batch_import_btn = gr.Button("导入 Collector 批次", elem_id="ranbooru_prompt_batch_import_btn")
                                 cache_manage_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
 
 
@@ -3760,6 +3819,12 @@ class Script(scripts.Script):
             fn=self._cache_import,
             inputs=[cache_import_path, cache_import_append, cache_import_dedupe],
             outputs=[cache_import_export_result, cache_status_display]
+        )
+
+        cache_prompt_batch_import_btn.click(
+            fn=self._cache_import_payload,
+            inputs=[cache_prompt_batch_payload, cache_import_append, cache_import_dedupe],
+            outputs=[cache_import_export_result, cache_status_display],
         )
 
         cache_search_btn.click(
