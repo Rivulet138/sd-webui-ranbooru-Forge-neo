@@ -2935,41 +2935,16 @@ class Script(scripts.Script):
             data = json.loads(payload_text)
             if not isinstance(data, dict) or data.get("schema_version") != "prompt_batch.v1":
                 return "Collector 批次 schema_version 无效", tag_cache_manager.get_status()
-            records = data.get("records", [])
-            if not isinstance(records, list) or not records:
-                return "Collector 批次没有可用记录", tag_cache_manager.get_status()
+            loaded = tag_cache_manager.normalize_prompt_batch_payload(data)
+            if not loaded.get("ok"):
+                return loaded.get("message", "Collector 批次无效"), tag_cache_manager.get_status()
+            records = loaded["records"]
             preview = []
-            normalized = []
-            for index, item in enumerate(records, 1):
-                if not isinstance(item, dict):
-                    return f"Collector 第 {index} 条记录格式无效", tag_cache_manager.get_status()
-                prompt = item.get("prompt") or {}
-                image = item.get("image") or {}
-                booru = item.get("booru") or {}
-                record = {
-                    "tags_prompt": item.get("tags_prompt") or prompt.get("positive") or "",
-                    "natural_prompt": prompt.get("natural") or prompt.get("processed") or "",
-                    "natural_source_hash": tag_cache_manager._natural_source_hash(item.get("tags_prompt") or prompt.get("positive") or ""),
-                    "natural_converter_version": tag_cache_manager.NATURAL_CONVERTER_VERSION,
-                    "source_url": image.get("source_url") or "",
-                    "preview_url": image.get("preview_url") or "",
-                    "booru": booru.get("site", "") if isinstance(booru, dict) else booru,
-                    "post_id": booru.get("post_id", "") if isinstance(booru, dict) else "",
-                    "score": booru.get("score", 0) if isinstance(booru, dict) else 0,
-                    "rating": booru.get("rating", "") if isinstance(booru, dict) else "",
-                    "search_query": tag_cache_manager.prompt_batch_search_query(item),
-                }
-                if not record["tags_prompt"]:
-                    return f"Collector 第 {index} 条缺少正向 Prompt", tag_cache_manager.get_status()
-                if len(record["tags_prompt"]) > 12000 or len(record["natural_prompt"]) > 12000:
-                    return f"Collector 第 {index} 条 Prompt 超过 12000 字符", tag_cache_manager.get_status()
-                normalized.append(record)
+            for index, record in enumerate(records, 1):
                 if len(preview) < 8:
                     preview.append(f"{index}: {record['tags_prompt'][:120]}")
-            if not normalized:
-                return "Collector 批次没有有效 Prompt", tag_cache_manager.get_status()
-            result = (tag_cache_manager.append_records(normalized, dedupe=dedupe)
-                      if append_mode else tag_cache_manager.save_records(normalized, dedupe=dedupe, backup_reason="collector_import"))
+            result = (tag_cache_manager.append_records(records, dedupe=dedupe)
+                      if append_mode else tag_cache_manager.save_records(records, dedupe=dedupe, backup_reason="collector_import"))
             return "Collector 批次导入完成\n" + "\n".join(preview) + f"\n写入 {result.get('inserted', 0)} 条", tag_cache_manager.get_status()
         except Exception as error:
             return f"Collector 批次解析失败: {error}", tag_cache_manager.get_status()

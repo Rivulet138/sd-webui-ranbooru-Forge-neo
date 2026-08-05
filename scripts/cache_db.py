@@ -2182,6 +2182,59 @@ class TagCacheManager:
             "format": file_format,
         }
 
+    def normalize_prompt_batch_payload(self, payload, file_path=""):
+        if not isinstance(payload, dict) or payload.get("schema_version") != PROMPT_BATCH_SCHEMA:
+            return {"ok": False, "message": "不支持的 prompt_batch schema", "records": []}
+        records = payload.get("records")
+        if not isinstance(records, list) or not records:
+            return {"ok": False, "message": "导入文件没有可用记录", "records": []}
+        producer = payload.get("producer") if isinstance(payload.get("producer"), dict) else {}
+        producer_name = str(producer.get("name") or "unknown")[:160]
+        normalized = []
+        seen_record_ids = set()
+        for record_index, record in enumerate(records, 1):
+            if not isinstance(record, dict):
+                return {"ok": False, "message": "prompt_batch.v1 的记录必须是对象", "records": []}
+            prompt = record.get("prompt") or {}
+            image = record.get("image") or {}
+            booru = record.get("booru") or {}
+            if not isinstance(prompt, dict) or not isinstance(image, dict) or not isinstance(booru, (dict, str)):
+                return {"ok": False, "message": "prompt_batch.v1 记录缺少 image 或 prompt", "records": []}
+            positive = record.get("tags_prompt") or prompt.get("positive") or ""
+            natural = record.get("natural_prompt") or prompt.get("natural") or prompt.get("processed") or ""
+            if not str(positive).strip():
+                return {"ok": False, "message": "prompt_batch.v1 记录缺少正向 Prompt", "records": []}
+            if len(str(positive)) > PROMPT_BATCH_MAX_PROMPT_LENGTH or len(str(natural)) > PROMPT_BATCH_MAX_PROMPT_LENGTH:
+                return {"ok": False, "message": "prompt_batch.v1 的 Prompt 超过 12000 字符", "records": []}
+            record_id = str(record.get("record_id") or "").strip()
+            sha256 = str(image.get("sha256") or "")
+            if sha256 and (len(sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in sha256)):
+                return {"ok": False, "message": f"prompt_batch.v1 第 {record_index} 条 sha256 必须是 64 位十六进制", "records": []}
+            if not record_id:
+                identity = f"{producer_name}\x1f{sha256}\x1f{image.get('filename', '')}\x1f{positive}"
+                record_id = f"generated-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+            if record_id in seen_record_ids:
+                return {"ok": False, "message": f"prompt_batch.v1 第 {record_index} 条 record_id 重复: {record_id}", "records": []}
+            seen_record_ids.add(record_id)
+            normalized_record = {
+                **record,
+                "record_id": record_id,
+                "prompt_batch_producer": producer_name,
+                "tags_prompt": positive,
+                "natural_prompt": natural,
+                "natural_source_hash": record.get("natural_source_hash") or (self._natural_source_hash(positive) if natural else ""),
+                "natural_converter_version": record.get("natural_converter_version") or (self.NATURAL_CONVERTER_VERSION if natural else ""),
+                "source_url": record.get("source_url") or image.get("source_url") or "",
+                "preview_url": record.get("preview_url") or image.get("preview_url") or "",
+                "booru": record.get("booru") if isinstance(record.get("booru"), str) else booru.get("site", ""),
+                "post_id": record.get("post_id") or booru.get("post_id", ""),
+                "score": record.get("score", booru.get("score", 0)),
+                "rating": record.get("rating", booru.get("rating", "")),
+            }
+            normalized_record["search_query"] = record.get("search_query") or self.prompt_batch_search_query(normalized_record)
+            normalized.append(normalized_record)
+        return {"ok": True, "records": normalized, "path": file_path}
+
     def _load_import_records(self, file_path):
         file_path = str(file_path or "").strip().strip('"')
         if not file_path:
@@ -2217,6 +2270,7 @@ class TagCacheManager:
         records = []
         is_prompt_batch = False
         producer_name = ""
+        payload = None
         try:
             if ext == ".csv":
                 with open(file_path, "r", encoding="utf-8-sig", newline="") as handle:
@@ -2247,6 +2301,8 @@ class TagCacheManager:
 
         if not isinstance(records, list) or not records:
             return {"ok": False, "message": "导入文件没有可用记录", "records": []}
+        if is_prompt_batch:
+            return self.normalize_prompt_batch_payload(payload, file_path)
         if not is_prompt_batch and len(records) > int(self.MAX_IMPORT_RECORDS):
             return {
                 "ok": False,

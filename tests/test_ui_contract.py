@@ -12,6 +12,10 @@ class RanbooruUiContractTests(unittest.TestCase):
         self.assertIn('importlib.import_module("prompt_studio_ui")', source)
         self.assertNotIn('spec_from_file_location("ranbooru_prompt_studio_bridge"', source)
 
+    def test_realtime_prompt_batch_import_uses_shared_normalizer(self):
+        source = (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
+        self.assertIn("tag_cache_manager.normalize_prompt_batch_payload(data)", source)
+
     def test_cache_workspace_exposes_task_tabs_and_stable_ids(self):
         source = (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
 
