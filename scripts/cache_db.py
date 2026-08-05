@@ -531,9 +531,16 @@ class TagCacheManager:
 
     def _make_duplicate_key(self, record):
         metadata = self._prompt_batch_metadata(record)
-        image_identity = metadata.get("sha256") or metadata.get("record_id") or metadata.get("filename")
-        if image_identity:
-            return f"prompt_batch:{image_identity}"
+        sha256 = str(metadata.get("sha256") or "")
+        if sha256:
+            return f"prompt_batch:sha256:{sha256}"
+        producer = str(metadata.get("producer") or "unknown")
+        record_id = str(metadata.get("record_id") or "")
+        if record_id:
+            return f"prompt_batch:{producer}:record:{record_id}"
+        filename = str(metadata.get("filename") or "")
+        if filename:
+            return f"prompt_batch:{producer}:file:{filename}"
         tag_key = self._canonical_tag_key(
             record.get("tags_raw") or record.get("tags_prompt") or record.get("tags") or ""
         )
@@ -549,9 +556,13 @@ class TagCacheManager:
     def prompt_batch_search_query(record):
         image = record.get("image") if isinstance(record.get("image"), dict) else {}
         metadata = {
+            "producer": str(record.get("prompt_batch_producer") or "")[:160],
             "record_id": str(record.get("record_id") or "")[:256],
             "filename": os.path.basename(str(image.get("filename") or ""))[:255],
             "sha256": str(image.get("sha256") or "")[:128],
+            "status": str(record.get("status") or "")[:80],
+            "error": str(record.get("error") or "")[:2000],
+            "appended": record.get("appended") is True,
         }
         if not any(metadata.values()):
             return ""
@@ -2094,7 +2105,7 @@ class TagCacheManager:
         prompt = {"positive": positive, "natural": natural}
         if natural:
             prompt["processed"] = natural
-        return {
+        result = {
             "record_id": str(metadata.get("record_id") or row.get("id", "")),
             "index": position,
             "image": {
@@ -2111,6 +2122,13 @@ class TagCacheManager:
                 "rating": row.get("rating", ""),
             },
         }
+        if metadata.get("status"):
+            result["status"] = str(metadata["status"])
+        if metadata.get("error"):
+            result["error"] = str(metadata["error"])
+        if metadata.get("appended") is True:
+            result["appended"] = True
+        return result
 
     def export_records(self, file_format="json", file_path=None):
         file_format = str(file_format or "json").lower().strip()
@@ -2198,6 +2216,7 @@ class TagCacheManager:
                 }
         records = []
         is_prompt_batch = False
+        producer_name = ""
         try:
             if ext == ".csv":
                 with open(file_path, "r", encoding="utf-8-sig", newline="") as handle:
@@ -2218,6 +2237,8 @@ class TagCacheManager:
                         if payload.get("schema_version") != PROMPT_BATCH_SCHEMA:
                             return {"ok": False, "message": "不支持的 prompt_batch schema", "records": []}
                         is_prompt_batch = True
+                        producer = payload.get("producer") if isinstance(payload.get("producer"), dict) else {}
+                        producer_name = str(producer.get("name") or "unknown")[:160]
                     records = payload.get("records") or payload.get("tags") or []
                 elif isinstance(payload, list):
                     records = payload
@@ -2234,7 +2255,8 @@ class TagCacheManager:
             }
 
         normalized = []
-        for record in records:
+        seen_record_ids = set()
+        for record_index, record in enumerate(records, 1):
             if isinstance(record, str):
                 if is_prompt_batch:
                     return {"ok": False, "message": "prompt_batch.v1 的记录必须是对象", "records": []}
@@ -2254,8 +2276,22 @@ class TagCacheManager:
                         return {"ok": False, "message": "prompt_batch.v1 记录缺少正向 Prompt", "records": []}
                     if len(str(positive)) > PROMPT_BATCH_MAX_PROMPT_LENGTH or len(str(natural)) > PROMPT_BATCH_MAX_PROMPT_LENGTH:
                         return {"ok": False, "message": "prompt_batch.v1 的 Prompt 超过 12000 字符", "records": []}
-                normalized.append({
+                    record_id = str(record.get("record_id") or "").strip()
+                    sha256 = str(image.get("sha256") or "")
+                    if sha256 and (len(sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in sha256)):
+                        return {"ok": False, "message": f"prompt_batch.v1 第 {record_index} 条 sha256 必须是 64 位十六进制", "records": []}
+                    if not record_id:
+                        identity = f"{producer_name}\x1f{sha256}\x1f{image.get('filename', '')}\x1f{positive}"
+                        record_id = f"generated-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
+                    if record_id in seen_record_ids:
+                        return {"ok": False, "message": f"prompt_batch.v1 第 {record_index} 条 record_id 重复: {record_id}", "records": []}
+                    seen_record_ids.add(record_id)
+                else:
+                    record_id = record.get("record_id") or ""
+                normalized_record = {
                     **record,
+                    "record_id": record_id,
+                    "prompt_batch_producer": producer_name,
                     "tags_prompt": positive,
                     "natural_prompt": natural,
                     "natural_source_hash": record.get("natural_source_hash") or (self._natural_source_hash(positive) if natural else ""),
@@ -2266,8 +2302,9 @@ class TagCacheManager:
                     "post_id": record.get("post_id") or booru.get("post_id", ""),
                     "score": record.get("score", booru.get("score", 0)),
                     "rating": record.get("rating", booru.get("rating", "")),
-                    "search_query": record.get("search_query") or self.prompt_batch_search_query(record),
-                })
+                }
+                normalized_record["search_query"] = record.get("search_query") or self.prompt_batch_search_query(normalized_record)
+                normalized.append(normalized_record)
         if not normalized:
             return {"ok": False, "message": "导入文件没有可用 tag", "records": []}
         return {"ok": True, "records": normalized, "path": file_path}

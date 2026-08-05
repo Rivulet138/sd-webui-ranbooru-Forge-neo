@@ -12,6 +12,7 @@ from scripts.natural_language import (
     BACKEND_OLLAMA,
     ENDPOINT_POLICY_UNRESTRICTED,
     CachedTagNaturalLanguageConverter,
+    NaturalLanguageConversionError,
     NaturalLanguageConfig,
     iter_cached_tag_conversions,
 )
@@ -301,6 +302,33 @@ class PromptFewShotMessageTests(unittest.TestCase):
         self.assertEqual(rows[0][2], "Converted forest, night.")
         self.assertEqual(rows[0][3], "")
         warning.assert_called_once()
+
+    def test_batch_sends_each_unique_prompt_once_without_retry(self):
+        class _Converter:
+            def __init__(self):
+                self.calls = []
+
+            def convert(self, tags, config):
+                self.calls.append(tags)
+                if tags == "timeout":
+                    raise NaturalLanguageConversionError("模型请求超时: simulated")
+                return f"Converted {tags}."
+
+        converter = _Converter()
+        rows = list(
+            iter_cached_tag_conversions(
+                ["forest", "forest", "timeout", "timeout"],
+                NaturalLanguageConfig(backend=BACKEND_OLLAMA, model="test-model"),
+                converter=converter,
+                timeout_retries=3,
+            )
+        )
+
+        self.assertEqual(converter.calls, ["forest", "timeout"])
+        self.assertTrue(rows[1][4])
+        self.assertIn("未自动重试", rows[2][3])
+        self.assertTrue(rows[3][4])
+        self.assertEqual(rows[3][3], rows[2][3])
 
 
 class PromptRagUiContractTests(unittest.TestCase):

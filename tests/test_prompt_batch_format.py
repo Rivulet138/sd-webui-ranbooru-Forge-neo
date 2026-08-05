@@ -67,6 +67,55 @@ class PromptBatchFormatTests(unittest.TestCase):
             self.assertEqual(record["prompt"]["positive"], "raw tags")
             self.assertEqual(record["prompt"]["processed"], "polished prompt")
 
+    def test_prompt_batch_identity_is_validated_and_producer_scoped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            duplicate = Path(directory) / "duplicate.json"
+            duplicate.write_text(json.dumps({
+                "schema_version": "prompt_batch.v1",
+                "producer": {"name": "collector-a"},
+                "records": [
+                    {"record_id": "same", "image": {"filename": "one.png"}, "prompt": {"positive": "one"}},
+                    {"record_id": "same", "image": {"filename": "two.png"}, "prompt": {"positive": "two"}},
+                ],
+            }), encoding="utf-8")
+            self.assertIn("record_id 重复", manager._load_import_records(str(duplicate))["message"])
+
+            invalid_sha = Path(directory) / "invalid-sha.json"
+            invalid_sha.write_text(json.dumps({
+                "schema_version": "prompt_batch.v1",
+                "records": [{"image": {"filename": "one.png", "sha256": "bad"}, "prompt": {"positive": "one"}}],
+            }), encoding="utf-8")
+            self.assertIn("sha256", manager._load_import_records(str(invalid_sha))["message"])
+
+            first = {"record_id": "same", "prompt_batch_producer": "collector-a", "image": {"filename": "one.png"}}
+            second = {"record_id": "same", "prompt_batch_producer": "collector-b", "image": {"filename": "one.png"}}
+            first["search_query"] = manager.prompt_batch_search_query(first)
+            second["search_query"] = manager.prompt_batch_search_query(second)
+            self.assertNotEqual(manager._make_duplicate_key(first), manager._make_duplicate_key(second))
+
+    def test_processing_status_round_trips_through_ranbooru(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            source = Path(directory) / "status.json"
+            source.write_text(json.dumps({
+                "schema_version": "prompt_batch.v1",
+                "producer": {"name": "collector"},
+                "records": [{
+                    "record_id": "one",
+                    "image": {"filename": "one.png", "sha256": "a" * 64},
+                    "prompt": {"positive": "raw", "processed": "done"},
+                    "status": "completed",
+                    "error": "kept evidence",
+                    "appended": True,
+                }],
+            }), encoding="utf-8")
+            self.assertEqual(manager.import_records(str(source))["inserted"], 1)
+            record = json.loads(Path(manager.export_records("json")["path"]).read_text(encoding="utf-8"))["records"][0]
+            self.assertEqual(record["status"], "completed")
+            self.assertEqual(record["error"], "kept evidence")
+            self.assertTrue(record["appended"])
+
     def test_json_export_and_import_have_no_batch_record_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = TagCacheManager(directory)

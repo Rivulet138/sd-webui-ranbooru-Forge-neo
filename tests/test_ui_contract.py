@@ -7,6 +7,11 @@ ROOT = Path(__file__).parents[1]
 
 
 class RanbooruUiContractTests(unittest.TestCase):
+    def test_prompt_studio_bridge_uses_canonical_module_singleton(self):
+        source = (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
+        self.assertIn('importlib.import_module("prompt_studio_ui")', source)
+        self.assertNotIn('spec_from_file_location("ranbooru_prompt_studio_bridge"', source)
+
     def test_cache_workspace_exposes_task_tabs_and_stable_ids(self):
         source = (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
 

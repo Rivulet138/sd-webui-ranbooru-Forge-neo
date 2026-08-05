@@ -226,16 +226,9 @@ def _load_prompt_studio_module():
         if added_path:
             sys.path.insert(0, studio_scripts)
         try:
-            spec = importlib.util.spec_from_file_location("ranbooru_prompt_studio_bridge", studio_ui)
-            if spec is None or spec.loader is None:
-                raise RuntimeError("无法加载 LLM 提示词工作室联动模块")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = module
-            try:
-                spec.loader.exec_module(module)
-            except Exception:
-                sys.modules.pop(spec.name, None)
-                raise
+            module = importlib.import_module("prompt_studio_ui")
+            if not hasattr(module, "receive_ranbooru_handoff"):
+                raise RuntimeError("LLM 提示词工作室缺少实时联动接口")
             _prompt_studio_module = module
             return module
         finally:
@@ -2712,7 +2705,7 @@ class Script(scripts.Script):
                             yield (
                                 (
                                     f"批量转换在第 {processed}/{len(records)} 条停止："
-                                    f"已连续 {consecutive_timeouts} 条记录在自动重试 2 次后仍超时。\n"
+                                    f"已连续 {consecutive_timeouts} 条记录单次请求超时。\n"
                                     f"本次已保存 {saved} 条；超时跳过 {timeout_skipped} 条；"
                                     f"源记录变化或已删除 {stale} 条。备份：{backup_path}"
                                 ),
@@ -2721,7 +2714,7 @@ class Script(scripts.Script):
                             return
                         yield (
                             (
-                                f"第 {processed}/{len(records)} 条在自动重试 2 次后仍超时，"
+                                f"第 {processed}/{len(records)} 条单次请求超时，"
                                 f"已跳过并继续；连续超时 {consecutive_timeouts}/"
                                 f"{max_consecutive_timeouts}；已保存 {saved} 条。"
                             ),
@@ -2733,7 +2726,7 @@ class Script(scripts.Script):
                         consecutive_timeouts = 0
                         yield (
                             (
-                                f"Record {processed}/{len(records)} still failed after 2 retries; "
+                                f"Record {processed}/{len(records)} failed after one request; "
                                 f"skipped and continuing. Saved {saved}.\n{error}"
                             ),
                             Script._natural_language_cache_status(),

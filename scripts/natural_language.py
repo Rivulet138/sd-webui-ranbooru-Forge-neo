@@ -408,19 +408,20 @@ def iter_cached_tag_conversions(
     tags_list,
     config,
     converter=None,
-    timeout_retries=2,
+    timeout_retries=0,
     should_cancel=None,
     retry_backoff_seconds=0.5,
     sleep_fn=time.sleep,
     example_provider=None,
 ):
-    """Yield whole-record conversions, retrying transient failures per record."""
+    """Yield whole-record conversions with at most one LLM request per unique prompt."""
     originals = [str(tags or "").strip() for tags in tags_list]
     owns_converter = converter is None
     converter = converter or CachedTagNaturalLanguageConverter()
-    converted_by_original = {}
-    timeout_retries = max(0, int(timeout_retries or 0))
-    retry_backoff_seconds = max(0.0, float(retry_backoff_seconds or 0.0))
+    outcomes_by_original = {}
+    # Retain these arguments for extension API compatibility. Automatic retries are
+    # deliberately disabled so a unique Prompt is dispatched at most once per run.
+    _ = timeout_retries, retry_backoff_seconds, sleep_fn
 
     def raise_if_cancelled():
         if should_cancel is not None and should_cancel():
@@ -432,8 +433,9 @@ def iter_cached_tag_conversions(
             if not original:
                 yield index, original, "", "", False
                 continue
-            if original in converted_by_original:
-                yield index, original, converted_by_original[original], "", True
+            if original in outcomes_by_original:
+                prepared, error = outcomes_by_original[original]
+                yield index, original, prepared, error, True
                 continue
 
             examples = ()
@@ -446,35 +448,21 @@ def iter_cached_tag_conversions(
                         redact_sensitive(error),
                     )
 
-            for attempt in range(timeout_retries + 1):
-                raise_if_cancelled()
-                prepared, error = convert_cached_tags_safely(
-                    original,
-                    config,
-                    converter,
-                    examples,
-                )
-                if not error or not is_retryable_conversion_error(error):
-                    break
-                if attempt >= timeout_retries:
-                    break
-                raise_if_cancelled()
-                if retry_backoff_seconds:
-                    sleep_fn(retry_backoff_seconds * (2**attempt))
-                raise_if_cancelled()
+            prepared, error = convert_cached_tags_safely(
+                original,
+                config,
+                converter,
+                examples,
+            )
+            if error and is_retryable_conversion_error(error):
+                error = f"{error}（未自动重试）"
+            outcomes_by_original[original] = (prepared, error)
             if error:
                 if is_retryable_conversion_error(error):
-                    yield (
-                        index,
-                        original,
-                        "",
-                        f"{error}（已自动重试 {timeout_retries} 次）",
-                        False,
-                    )
+                    yield index, original, "", error, False
                     continue
                 yield index, original, "", error, False
                 return
-            converted_by_original[original] = prepared
             yield index, original, prepared, "", False
     finally:
         if owns_converter:
