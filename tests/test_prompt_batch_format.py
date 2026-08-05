@@ -146,6 +146,24 @@ class PromptBatchFormatTests(unittest.TestCase):
             self.assertIn("导入文件过大", result["message"])
             load.assert_not_called()
 
+    def test_oversized_json_with_invalid_tokens_is_rejected_before_parse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            manager.MAX_IMPORT_BYTES = 16
+            invalid_payloads = (
+                '{"schema_version":"prompt_batch.v1","producer":wat,"records":[]}',
+                '{"schema_version":"prompt_batch.v1","producer":"\\q","records":[]}',
+            )
+            for index, payload in enumerate(invalid_payloads):
+                with self.subTest(index=index):
+                    source = Path(directory) / f"invalid-token-{index}.json"
+                    source.write_text(payload, encoding="utf-8")
+                    with mock.patch("scripts.cache_db.json.load") as load:
+                        result = manager._load_import_records(str(source))
+                    self.assertFalse(result["ok"])
+                    self.assertIn("导入文件过大", result["message"])
+                    load.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

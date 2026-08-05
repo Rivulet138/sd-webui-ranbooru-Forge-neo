@@ -45,6 +45,7 @@ logger = get_logger("cache_db")
 
 def _large_json_declares_prompt_batch(file_path):
     pushed = []
+    number_re = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?\Z")
 
     with open(file_path, "r", encoding="utf-8") as handle:
         def take():
@@ -52,93 +53,116 @@ def _large_json_declares_prompt_batch(file_path):
 
         def take_nonspace():
             char = take()
-            while char and char.isspace():
+            while char and char in " \t\r\n":
                 char = take()
             return char
 
-        def read_string(limit=1024):
-            chars = ['"']
-            escaped = False
+        def read_string(capture=False, limit=1024):
+            raw = ['"'] if capture else None
             while True:
                 char = take()
                 if not char:
                     raise ValueError("JSON string is incomplete")
-                if len(chars) <= limit:
-                    chars.append(char)
-                elif not escaped and char != '"':
-                    raise ValueError("JSON key is too long")
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    return json.loads("".join(chars))
+                if ord(char) < 0x20:
+                    raise ValueError("JSON string contains a control character")
+                if char == '"':
+                    if capture:
+                        raw.append(char)
+                        return json.loads("".join(raw))
+                    return None
+                if char == "\\":
+                    escape = take()
+                    if escape not in '"\\/bfnrtu':
+                        raise ValueError("JSON string contains an invalid escape")
+                    escape_text = escape
+                    if escape == "u":
+                        digits = "".join(take() for _ in range(4))
+                        if len(digits) != 4 or any(digit not in "0123456789abcdefABCDEF" for digit in digits):
+                            raise ValueError("JSON string contains an invalid unicode escape")
+                        escape_text += digits
+                    if capture:
+                        raw.extend(("\\", escape_text))
+                elif capture:
+                    raw.append(char)
+                if capture and sum(len(part) for part in raw) > limit:
+                    raise ValueError("JSON string is too long")
 
-        def skip_string():
-            escaped = False
-            while True:
-                char = take()
-                if not char:
-                    raise ValueError("JSON string is incomplete")
-                if escaped:
-                    escaped = False
-                elif char == "\\":
-                    escaped = True
-                elif char == '"':
-                    return
-
-        def skip_value():
-            char = take_nonspace()
-            if char == '"':
-                skip_string()
-                return
-            if char in "[{":
-                stack = [char]
-                while stack:
-                    char = take()
-                    if not char:
-                        raise ValueError("JSON value is incomplete")
-                    if char == '"':
-                        skip_string()
-                    elif char in "[{":
-                        stack.append(char)
-                    elif char == "}" and stack[-1] == "{":
-                        stack.pop()
-                    elif char == "]" and stack[-1] == "[":
-                        stack.pop()
-                return
-            while char and char not in ",}":
+        def parse_scalar(first):
+            chars = [first]
+            char = take()
+            while char and char not in " \t\r\n,]}":
+                chars.append(char)
+                if len(chars) > 128:
+                    raise ValueError("JSON scalar is too long")
                 char = take()
             if char:
                 pushed.append(char)
+            token = "".join(chars)
+            if token not in ("true", "false", "null") and number_re.fullmatch(token) is None:
+                raise ValueError("JSON scalar is invalid")
+
+        def parse_value(depth):
+            if depth > 256:
+                raise ValueError("JSON nesting is too deep")
+            char = take_nonspace()
+            if char == '"':
+                read_string()
+                return
+            if char == "{":
+                parse_object(depth + 1)
+                return
+            if char == "[":
+                parse_array(depth + 1)
+                return
+            if not char:
+                raise ValueError("JSON value is incomplete")
+            parse_scalar(char)
+
+        schema_version = None
+
+        def parse_object(depth, top_level=False):
+            nonlocal schema_version
+            char = take_nonspace()
+            if char == "}":
+                return
+            while True:
+                if char != '"':
+                    raise ValueError("JSON object key is invalid")
+                key = read_string(capture=True)
+                if take_nonspace() != ":":
+                    raise ValueError("JSON object is missing a colon")
+                if top_level and key == "schema_version":
+                    if schema_version is not None or take_nonspace() != '"':
+                        raise ValueError("JSON schema_version is invalid or duplicated")
+                    schema_version = read_string(capture=True, limit=128)
+                else:
+                    parse_value(depth + 1)
+                separator = take_nonspace()
+                if separator == "}":
+                    return
+                if separator != ",":
+                    raise ValueError("JSON object separator is invalid")
+                char = take_nonspace()
+
+        def parse_array(depth):
+            char = take_nonspace()
+            if char == "]":
+                return
+            pushed.append(char)
+            while True:
+                parse_value(depth + 1)
+                separator = take_nonspace()
+                if separator == "]":
+                    return
+                if separator != ",":
+                    raise ValueError("JSON array separator is invalid")
 
         if take_nonspace() != "{":
             return False
-        schema_version = None
-        while True:
-            char = take_nonspace()
-            if char == "}":
-                return schema_version == PROMPT_BATCH_SCHEMA
-            if char != '"':
-                return False
-            key = read_string()
-            if take_nonspace() != ":":
-                return False
-            if key == "schema_version":
-                if schema_version is not None:
-                    return False
-                if take_nonspace() != '"':
-                    return False
-                schema_version = read_string(limit=128)
-                if schema_version != PROMPT_BATCH_SCHEMA:
-                    return False
-            else:
-                skip_value()
-            separator = take_nonspace()
-            if separator == "}":
-                return schema_version == PROMPT_BATCH_SCHEMA
-            if separator != ",":
-                return False
+        parse_object(0, top_level=True)
+        if take_nonspace():
+            raise ValueError("JSON contains trailing content")
+        return schema_version == PROMPT_BATCH_SCHEMA
 
 
 def _serialized_destructive_operation(method):
