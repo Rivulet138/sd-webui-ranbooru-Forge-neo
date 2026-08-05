@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from scripts.cache_db import TagCacheManager
@@ -66,14 +67,84 @@ class PromptBatchFormatTests(unittest.TestCase):
             self.assertEqual(record["prompt"]["positive"], "raw tags")
             self.assertEqual(record["prompt"]["processed"], "polished prompt")
 
-    def test_json_export_reports_the_compatible_batch_limit(self):
+    def test_json_export_and_import_have_no_batch_record_limit(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = TagCacheManager(directory)
-            manager.append_records([{"tags_prompt": f"prompt {index}"} for index in range(201)], dedupe=False)
+            manager.append_records(
+                [{"tags_prompt": f"prompt {index} " + "x" * 1024} for index in range(5001)],
+                dedupe=False,
+            )
             result = manager.export_records("json")
-            self.assertEqual(result["count"], 200)
-            self.assertEqual(result["total_count"], 201)
-            self.assertTrue(result["truncated"])
+            self.assertEqual(result["count"], 5001)
+            self.assertEqual(result["total_count"], 5001)
+            self.assertFalse(result["truncated"])
+            self.assertGreater(Path(result["path"]).stat().st_size, 4 * 1024 * 1024)
+
+            imported = TagCacheManager(Path(directory) / "imported")
+            imported_result = imported.import_records(result["path"], dedupe=False)
+            self.assertTrue(imported_result["ok"])
+            self.assertEqual(imported_result["inserted"], 5001)
+
+    def test_oversized_legacy_json_is_rejected_before_full_parse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            manager.MAX_IMPORT_BYTES = 16
+            legacy = Path(directory) / "legacy-large.json"
+            legacy.write_text(json.dumps({"records": ["x" * 64]}), encoding="utf-8")
+
+            with mock.patch("scripts.cache_db.json.load") as load:
+                result = manager._load_import_records(str(legacy))
+
+            self.assertFalse(result["ok"])
+            self.assertIn("导入文件过大", result["message"])
+            load.assert_not_called()
+
+    def test_oversized_prompt_batch_uses_unbounded_schema_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            manager.MAX_IMPORT_BYTES = 16
+            source = Path(directory) / "prompt-batch-large.json"
+            source.write_text(json.dumps({
+                "producer": {"name": "collector"},
+                "schema_version": "prompt_batch.v1",
+                "records": [{"image": {"filename": "one.png"}, "prompt": {"positive": "prompt"}}],
+            }), encoding="utf-8")
+
+            result = manager._load_import_records(str(source))
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(len(result["records"]), 1)
+
+    def test_oversized_json_with_duplicate_schema_is_rejected_before_parse(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            manager.MAX_IMPORT_BYTES = 16
+            source = Path(directory) / "duplicate-schema.json"
+            source.write_text(
+                '{"schema_version":"prompt_batch.v1","schema_version":"legacy","records":[]}',
+                encoding="utf-8",
+            )
+
+            with mock.patch("scripts.cache_db.json.load") as load:
+                result = manager._load_import_records(str(source))
+
+            self.assertFalse(result["ok"])
+            self.assertIn("导入文件过大", result["message"])
+            load.assert_not_called()
+
+    def test_oversized_malformed_json_is_rejected_without_raising(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            manager.MAX_IMPORT_BYTES = 16
+            source = Path(directory) / "malformed-large.json"
+            source.write_text('{"producer":"' + "x" * 64, encoding="utf-8")
+
+            with mock.patch("scripts.cache_db.json.load") as load:
+                result = manager._load_import_records(str(source))
+
+            self.assertFalse(result["ok"])
+            self.assertIn("导入文件过大", result["message"])
+            load.assert_not_called()
 
 
 if __name__ == "__main__":

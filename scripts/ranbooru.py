@@ -2939,19 +2939,14 @@ class Script(scripts.Script):
         """Import a Collector JSON batch directly from a textbox payload."""
         try:
             payload_text = str(payload or "")
-            if len(payload_text.encode("utf-8")) > 4 * 1024 * 1024:
-                return "Collector 批次超过 4 MB", tag_cache_manager.get_status()
             data = json.loads(payload_text)
             if not isinstance(data, dict) or data.get("schema_version") != "prompt_batch.v1":
                 return "Collector 批次 schema_version 无效", tag_cache_manager.get_status()
             records = data.get("records", [])
             if not isinstance(records, list) or not records:
                 return "Collector 批次没有可用记录", tag_cache_manager.get_status()
-            if len(records) > 200:
-                return "Collector 批次超过 200 条上限", tag_cache_manager.get_status()
             preview = []
             normalized = []
-            prompt_total = 0
             for index, item in enumerate(records, 1):
                 if not isinstance(item, dict):
                     return f"Collector 第 {index} 条记录格式无效", tag_cache_manager.get_status()
@@ -2971,9 +2966,6 @@ class Script(scripts.Script):
                     "rating": booru.get("rating", "") if isinstance(booru, dict) else "",
                     "search_query": tag_cache_manager.prompt_batch_search_query(item),
                 }
-                prompt_total += len(str(record["tags_prompt"])) + len(str(record["natural_prompt"]))
-                if prompt_total > 1_000_000:
-                    return "Collector 批次文本总长度超过限制", tag_cache_manager.get_status()
                 if not record["tags_prompt"]:
                     return f"Collector 第 {index} 条缺少正向 Prompt", tag_cache_manager.get_status()
                 if len(record["tags_prompt"]) > 12000 or len(record["natural_prompt"]) > 12000:

@@ -21,10 +21,7 @@ from datetime import datetime, timedelta
 from functools import wraps
 
 PROMPT_BATCH_SCHEMA = "prompt_batch.v1"
-PROMPT_BATCH_MAX_RECORDS = 200
 PROMPT_BATCH_MAX_PROMPT_LENGTH = 12_000
-PROMPT_BATCH_MAX_TOTAL_LENGTH = 1_000_000
-PROMPT_BATCH_MAX_BYTES = 4 * 1024 * 1024
 PROMPT_BATCH_META_PREFIX = "prompt_batch.v1:"
 
 try:
@@ -44,6 +41,104 @@ except ImportError:
 
 
 logger = get_logger("cache_db")
+
+
+def _large_json_declares_prompt_batch(file_path):
+    pushed = []
+
+    with open(file_path, "r", encoding="utf-8") as handle:
+        def take():
+            return pushed.pop() if pushed else handle.read(1)
+
+        def take_nonspace():
+            char = take()
+            while char and char.isspace():
+                char = take()
+            return char
+
+        def read_string(limit=1024):
+            chars = ['"']
+            escaped = False
+            while True:
+                char = take()
+                if not char:
+                    raise ValueError("JSON string is incomplete")
+                if len(chars) <= limit:
+                    chars.append(char)
+                elif not escaped and char != '"':
+                    raise ValueError("JSON key is too long")
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    return json.loads("".join(chars))
+
+        def skip_string():
+            escaped = False
+            while True:
+                char = take()
+                if not char:
+                    raise ValueError("JSON string is incomplete")
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    return
+
+        def skip_value():
+            char = take_nonspace()
+            if char == '"':
+                skip_string()
+                return
+            if char in "[{":
+                stack = [char]
+                while stack:
+                    char = take()
+                    if not char:
+                        raise ValueError("JSON value is incomplete")
+                    if char == '"':
+                        skip_string()
+                    elif char in "[{":
+                        stack.append(char)
+                    elif char == "}" and stack[-1] == "{":
+                        stack.pop()
+                    elif char == "]" and stack[-1] == "[":
+                        stack.pop()
+                return
+            while char and char not in ",}":
+                char = take()
+            if char:
+                pushed.append(char)
+
+        if take_nonspace() != "{":
+            return False
+        schema_version = None
+        while True:
+            char = take_nonspace()
+            if char == "}":
+                return schema_version == PROMPT_BATCH_SCHEMA
+            if char != '"':
+                return False
+            key = read_string()
+            if take_nonspace() != ":":
+                return False
+            if key == "schema_version":
+                if schema_version is not None:
+                    return False
+                if take_nonspace() != '"':
+                    return False
+                schema_version = read_string(limit=128)
+                if schema_version != PROMPT_BATCH_SCHEMA:
+                    return False
+            else:
+                skip_value()
+            separator = take_nonspace()
+            if separator == "}":
+                return schema_version == PROMPT_BATCH_SCHEMA
+            if separator != ",":
+                return False
 
 
 def _serialized_destructive_operation(method):
@@ -2024,24 +2119,16 @@ class TagCacheManager:
                 writer.writeheader()
                 writer.writerows(rows)
         else:
-            records = []
-            prompt_total = 0
-            for row in all_rows:
-                if len(records) >= PROMPT_BATCH_MAX_RECORDS:
-                    break
-                record = self._to_prompt_batch_record(row, len(records) + 1)
-                prompt_total += len(record["prompt"]["positive"]) + len(record["prompt"]["natural"])
-                if prompt_total > PROMPT_BATCH_MAX_TOTAL_LENGTH:
-                    break
-                records.append(record)
+            records = [
+                self._to_prompt_batch_record(row, position)
+                for position, row in enumerate(all_rows, 1)
+            ]
             payload = {
                 "schema_version": PROMPT_BATCH_SCHEMA,
                 "producer": {"name": "ranbooru"},
                 "records": records,
             }
             content = json.dumps(payload, ensure_ascii=False, indent=2)
-            if len(content.encode("utf-8")) > PROMPT_BATCH_MAX_BYTES:
-                raise ValueError("导出 JSON 超过 4 MB")
             with open(file_path, "w", encoding="utf-8") as handle:
                 handle.write(content)
             rows = records
@@ -2064,18 +2151,27 @@ class TagCacheManager:
             return {"ok": False, "message": f"导入文件不存在: {e}", "records": []}
         if not os.path.isfile(file_path):
             return {"ok": False, "message": "导入路径不是普通文件", "records": []}
-        if file_stat.st_size > int(self.MAX_IMPORT_BYTES):
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext not in (".csv", ".json"):
+            return {"ok": False, "message": "仅支持 JSON 或 CSV 导入", "records": []}
+        is_large_file = file_stat.st_size > int(self.MAX_IMPORT_BYTES)
+        if ext == ".csv" and is_large_file:
             return {
                 "ok": False,
                 "message": f"导入文件过大（上限 {self.MAX_IMPORT_BYTES} 字节）",
                 "records": [],
             }
-
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext not in (".csv", ".json"):
-            return {"ok": False, "message": "仅支持 JSON 或 CSV 导入", "records": []}
-        if ext == ".json" and file_stat.st_size > PROMPT_BATCH_MAX_BYTES:
-            return {"ok": False, "message": "JSON 导入文件超过 4 MB", "records": []}
+        if ext == ".json" and is_large_file:
+            try:
+                is_large_prompt_batch = _large_json_declares_prompt_batch(file_path)
+            except (OSError, UnicodeError, ValueError):
+                is_large_prompt_batch = False
+            if not is_large_prompt_batch:
+                return {
+                    "ok": False,
+                    "message": f"导入文件过大（上限 {self.MAX_IMPORT_BYTES} 字节）；超大 JSON 必须声明 prompt_batch.v1 schema_version",
+                    "records": [],
+                }
         records = []
         is_prompt_batch = False
         try:
@@ -2106,17 +2202,14 @@ class TagCacheManager:
 
         if not isinstance(records, list) or not records:
             return {"ok": False, "message": "导入文件没有可用记录", "records": []}
-        if len(records) > int(self.MAX_IMPORT_RECORDS):
+        if not is_prompt_batch and len(records) > int(self.MAX_IMPORT_RECORDS):
             return {
                 "ok": False,
                 "message": f"导入记录过多（上限 {self.MAX_IMPORT_RECORDS} 条）",
                 "records": [],
             }
-        if is_prompt_batch and len(records) > PROMPT_BATCH_MAX_RECORDS:
-            return {"ok": False, "message": "prompt_batch.v1 最多 200 条记录", "records": []}
 
         normalized = []
-        prompt_total = 0
         for record in records:
             if isinstance(record, str):
                 if is_prompt_batch:
@@ -2137,9 +2230,6 @@ class TagCacheManager:
                         return {"ok": False, "message": "prompt_batch.v1 记录缺少正向 Prompt", "records": []}
                     if len(str(positive)) > PROMPT_BATCH_MAX_PROMPT_LENGTH or len(str(natural)) > PROMPT_BATCH_MAX_PROMPT_LENGTH:
                         return {"ok": False, "message": "prompt_batch.v1 的 Prompt 超过 12000 字符", "records": []}
-                    prompt_total += len(str(positive)) + len(str(natural))
-                    if prompt_total > PROMPT_BATCH_MAX_TOTAL_LENGTH:
-                        return {"ok": False, "message": "prompt_batch.v1 文本总长度超过限制", "records": []}
                 normalized.append({
                     **record,
                     "tags_prompt": positive,
