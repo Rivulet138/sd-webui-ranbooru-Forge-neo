@@ -223,6 +223,48 @@ class CacheCursorSessionTests(unittest.TestCase):
             self.assertEqual((prompt, index), ("first", 1))
 
 
+class NaturalPromptSourceSynchronizationTests(unittest.TestCase):
+    def test_updates_report_changed_deleted_and_unchanged_sources_separately(self):
+        with tempfile.TemporaryDirectory() as cache_dir:
+            manager = TagCacheManager(cache_dir)
+            manager.append_records([
+                {"tags_prompt": "unchanged"},
+                {"tags_prompt": "changed now"},
+            ])
+            records = manager.get_records_by_position_spec("1-2")
+            manager.update_natural_prompts([{
+                "id": records[0]["id"],
+                "source_tags_prompt": "unchanged",
+                "natural_prompt": "Already converted.",
+            }])
+
+            result = manager.update_natural_prompts(
+                [
+                    {
+                        "id": records[0]["id"],
+                        "source_tags_prompt": "unchanged",
+                        "natural_prompt": "Should not replace.",
+                    },
+                    {
+                        "id": records[1]["id"],
+                        "source_tags_prompt": "changed before conversion",
+                        "natural_prompt": "Stale conversion.",
+                    },
+                    {
+                        "id": 999999,
+                        "source_tags_prompt": "deleted",
+                        "natural_prompt": "Deleted conversion.",
+                    },
+                ],
+                only_missing=True,
+            )
+
+            self.assertEqual(result["updated"], 0)
+            self.assertEqual(result["unchanged"], 1)
+            self.assertEqual(result["source_changed"], 1)
+            self.assertEqual(result["source_deleted"], 1)
+            self.assertEqual(result["stale_or_missing"], 2)
+
 class PromptFewShotMessageTests(unittest.TestCase):
     def test_retrieved_pairs_are_inserted_before_the_current_request(self):
         session = _FakeSession()

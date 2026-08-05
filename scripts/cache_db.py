@@ -531,10 +531,15 @@ class TagCacheManager:
 
     def _make_duplicate_key(self, record):
         metadata = self._prompt_batch_metadata(record)
+        source_identity = str(metadata.get("source_identity") or "")
+        producer = str(metadata.get("producer") or "unknown")
+        if source_identity.startswith(("tags:", "post:", "prompt_batch:")):
+            return source_identity
+        if source_identity:
+            return f"prompt_batch:{producer}:identity:{source_identity}"
         sha256 = str(metadata.get("sha256") or "")
         if sha256:
             return f"prompt_batch:sha256:{sha256}"
-        producer = str(metadata.get("producer") or "unknown")
         record_id = str(metadata.get("record_id") or "")
         if record_id:
             return f"prompt_batch:{producer}:record:{record_id}"
@@ -545,12 +550,23 @@ class TagCacheManager:
             record.get("tags_raw") or record.get("tags_prompt") or record.get("tags") or ""
         )
         if tag_key:
-            return f"tags:{tag_key}"
+            duplicate_key = f"tags:{tag_key}"
+            if len(duplicate_key) > 512:
+                return f"tags:sha256:{hashlib.sha256(tag_key.encode('utf-8')).hexdigest()}"
+            return duplicate_key
         booru = str(record.get("booru") or "").strip()
         post_id = str(record.get("post_id") or "").strip()
         if booru and post_id:
             return f"post:{booru}:{post_id}"
         return "tags:"
+
+    def _can_enrich_duplicate(self, existing, incoming):
+        return bool(
+            str(incoming.get("natural_prompt") or "").strip()
+            and not str(existing["natural_prompt"] or "").strip()
+            and self._canonical_tag_key(existing["tags_prompt"])
+            == self._canonical_tag_key(incoming.get("tags_prompt") or "")
+        )
 
     @staticmethod
     def prompt_batch_search_query(record):
@@ -563,6 +579,7 @@ class TagCacheManager:
             "status": str(record.get("status") or "")[:80],
             "error": str(record.get("error") or "")[:2000],
             "appended": record.get("appended") is True,
+            "source_identity": str(record.get("prompt_batch_source_identity") or "")[:512],
         }
         if not any(metadata.values()):
             return ""
@@ -964,7 +981,7 @@ class TagCacheManager:
             conn.close()
 
     def _insert_records(self, conn, records, dedupe=True, min_score=None):
-        stats = {"inserted": 0, "skipped_duplicate": 0, "skipped_score": 0, "skipped_empty": 0, "total": 0}
+        stats = {"inserted": 0, "enriched": 0, "skipped_duplicate": 0, "skipped_score": 0, "skipped_empty": 0, "total": 0}
         for item in records:
             record = self._coerce_record(item)
             if not record["tags_prompt"]:
@@ -973,11 +990,28 @@ class TagCacheManager:
             if min_score is not None and record["score"] < int(min_score):
                 stats["skipped_score"] += 1
                 continue
-            if dedupe and conn.execute(
-                "SELECT 1 FROM tags WHERE duplicate_key = ? LIMIT 1",
+            existing = conn.execute(
+                "SELECT id, tags_prompt, natural_prompt FROM tags WHERE duplicate_key = ? LIMIT 1",
                 (record["duplicate_key"],),
-            ).fetchone():
-                stats["skipped_duplicate"] += 1
+            ).fetchone() if dedupe else None
+            if existing:
+                if self._can_enrich_duplicate(existing, record):
+                    conn.execute(
+                        """
+                        UPDATE tags SET
+                            natural_prompt=?, natural_preset=?, natural_model=?, natural_updated_at=?,
+                            natural_source_hash=?, natural_converter_version=?, search_query=?
+                        WHERE id=?
+                        """,
+                        (
+                            record["natural_prompt"], record["natural_preset"], record["natural_model"],
+                            record["natural_updated_at"], record["natural_source_hash"],
+                            record["natural_converter_version"], record["search_query"], existing["id"],
+                        ),
+                    )
+                    stats["enriched"] += 1
+                else:
+                    stats["skipped_duplicate"] += 1
                 continue
             cursor = conn.execute(
                 """
@@ -1682,6 +1716,9 @@ class TagCacheManager:
                 "requested": len(updates),
                 "updated": 0,
                 "stale_or_missing": 0,
+                "source_changed": 0,
+                "source_deleted": 0,
+                "unchanged": 0,
                 "rejected": rejected,
             }
 
@@ -1692,6 +1729,9 @@ class TagCacheManager:
             else self.NATURAL_CONVERTER_VERSION
         ).strip()
         updated = 0
+        source_changed = 0
+        source_deleted = 0
+        unchanged = 0
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -1732,12 +1772,28 @@ class TagCacheManager:
                         *((source_hash, converter_version) if only_missing else ()),
                     ),
                 )
-                updated += max(0, int(cursor.rowcount or 0))
+                rowcount = max(0, int(cursor.rowcount or 0))
+                updated += rowcount
+                if rowcount:
+                    continue
+                current = conn.execute(
+                    "SELECT COALESCE(tags_prompt, tags) AS tags_prompt FROM tags WHERE id = ?",
+                    (tag_id,),
+                ).fetchone()
+                if current is None:
+                    source_deleted += 1
+                elif str(current["tags_prompt"] or "") != source_tags_prompt:
+                    source_changed += 1
+                else:
+                    unchanged += 1
             conn.commit()
             return {
                 "requested": len(normalized) + rejected,
                 "updated": updated,
-                "stale_or_missing": max(0, len(normalized) - updated),
+                "stale_or_missing": source_changed + source_deleted,
+                "source_changed": source_changed,
+                "source_deleted": source_deleted,
+                "unchanged": unchanged,
                 "rejected": rejected,
             }
         except Exception:
@@ -2105,8 +2161,10 @@ class TagCacheManager:
         prompt = {"positive": positive, "natural": natural}
         if natural:
             prompt["processed"] = natural
+            prompt["processed_kind"] = "natural"
         result = {
             "record_id": str(metadata.get("record_id") or row.get("id", "")),
+            "source_identity": str(metadata.get("source_identity") or row.get("duplicate_key") or ""),
             "index": position,
             "image": {
                 "filename": str(metadata.get("filename") or ""),
@@ -2130,6 +2188,27 @@ class TagCacheManager:
             result["appended"] = True
         return result
 
+    @staticmethod
+    def _prompt_batch_natural_prompt(record, prompt):
+        natural = record.get("natural_prompt") or prompt.get("natural") or ""
+        if natural:
+            return natural
+        processed = prompt.get("processed") or ""
+        if not processed:
+            return ""
+        output_kind = (
+            prompt.get("processed_kind")
+            or prompt.get("output_kind")
+            or record.get("processed_kind")
+            or record.get("output_kind")
+        )
+        if output_kind is None or not str(output_kind).strip():
+            # prompt_batch.v1 originally treated an untyped processed value as natural
+            # language. Keep that path only for legacy producers without kind metadata.
+            return processed
+        normalized_kind = str(output_kind).strip().lower().replace("-", "_").replace(" ", "_")
+        return processed if normalized_kind in {"natural", "natural_language", "prose"} else ""
+
     def export_records(self, file_format="json", file_path=None):
         file_format = str(file_format or "json").lower().strip()
         if file_format not in ("json", "csv"):
@@ -2143,7 +2222,7 @@ class TagCacheManager:
             "id", "booru", "post_id", "tags_raw", "tags_prompt",
             "natural_prompt", "natural_preset", "natural_model", "natural_updated_at",
             "natural_source_hash", "natural_converter_version",
-            "score", "rating", "source_url", "preview_url", "search_query",
+            "score", "rating", "source_url", "preview_url", "search_query", "duplicate_key",
         ]
         conn = self._connect()
         try:
@@ -2201,12 +2280,15 @@ class TagCacheManager:
             if not isinstance(prompt, dict) or not isinstance(image, dict) or not isinstance(booru, (dict, str)):
                 return {"ok": False, "message": "prompt_batch.v1 记录缺少 image 或 prompt", "records": []}
             positive = record.get("tags_prompt") or prompt.get("positive") or ""
-            natural = record.get("natural_prompt") or prompt.get("natural") or prompt.get("processed") or ""
+            natural = self._prompt_batch_natural_prompt(record, prompt)
             if not str(positive).strip():
                 return {"ok": False, "message": "prompt_batch.v1 记录缺少正向 Prompt", "records": []}
             if len(str(positive)) > PROMPT_BATCH_MAX_PROMPT_LENGTH or len(str(natural)) > PROMPT_BATCH_MAX_PROMPT_LENGTH:
                 return {"ok": False, "message": "prompt_batch.v1 的 Prompt 超过 12000 字符", "records": []}
             record_id = str(record.get("record_id") or "").strip()
+            source_identity = str(record.get("source_identity") or "").strip()
+            if len(source_identity) > 512:
+                return {"ok": False, "message": f"prompt_batch.v1 第 {record_index} 条 source_identity 超过 512 字符", "records": []}
             sha256 = str(image.get("sha256") or "")
             if sha256 and (len(sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in sha256)):
                 return {"ok": False, "message": f"prompt_batch.v1 第 {record_index} 条 sha256 必须是 64 位十六进制", "records": []}
@@ -2220,6 +2302,7 @@ class TagCacheManager:
                 **record,
                 "record_id": record_id,
                 "prompt_batch_producer": producer_name,
+                "prompt_batch_source_identity": source_identity,
                 "tags_prompt": positive,
                 "natural_prompt": natural,
                 "natural_source_hash": record.get("natural_source_hash") or (self._natural_source_hash(positive) if natural else ""),
@@ -2231,7 +2314,7 @@ class TagCacheManager:
                 "score": record.get("score", booru.get("score", 0)),
                 "rating": record.get("rating", booru.get("rating", "")),
             }
-            normalized_record["search_query"] = record.get("search_query") or self.prompt_batch_search_query(normalized_record)
+            normalized_record["search_query"] = self.prompt_batch_search_query(normalized_record)
             normalized.append(normalized_record)
         return {"ok": True, "records": normalized, "path": file_path}
 
@@ -2303,7 +2386,7 @@ class TagCacheManager:
             return {"ok": False, "message": "导入文件没有可用记录", "records": []}
         if is_prompt_batch:
             return self.normalize_prompt_batch_payload(payload, file_path)
-        if not is_prompt_batch and len(records) > int(self.MAX_IMPORT_RECORDS):
+        if len(records) > int(self.MAX_IMPORT_RECORDS):
             return {
                 "ok": False,
                 "message": f"导入记录过多（上限 {self.MAX_IMPORT_RECORDS} 条）",
@@ -2311,39 +2394,18 @@ class TagCacheManager:
             }
 
         normalized = []
-        seen_record_ids = set()
         for record_index, record in enumerate(records, 1):
             if isinstance(record, str):
-                if is_prompt_batch:
-                    return {"ok": False, "message": "prompt_batch.v1 的记录必须是对象", "records": []}
                 normalized.append({"tags_prompt": record})
             elif isinstance(record, dict):
                 prompt = record.get("prompt") or {}
                 image = record.get("image") or {}
                 booru = record.get("booru") or {}
-                if is_prompt_batch and (not isinstance(prompt, dict) or not isinstance(image, dict)):
-                    return {"ok": False, "message": "prompt_batch.v1 记录缺少 image 或 prompt", "records": []}
                 if not isinstance(prompt, dict) or not isinstance(image, dict) or not isinstance(booru, (dict, str)):
                     continue
                 positive = record.get("tags_prompt") or prompt.get("positive") or ""
-                natural = record.get("natural_prompt") or prompt.get("natural") or prompt.get("processed") or ""
-                if is_prompt_batch:
-                    if not str(positive).strip():
-                        return {"ok": False, "message": "prompt_batch.v1 记录缺少正向 Prompt", "records": []}
-                    if len(str(positive)) > PROMPT_BATCH_MAX_PROMPT_LENGTH or len(str(natural)) > PROMPT_BATCH_MAX_PROMPT_LENGTH:
-                        return {"ok": False, "message": "prompt_batch.v1 的 Prompt 超过 12000 字符", "records": []}
-                    record_id = str(record.get("record_id") or "").strip()
-                    sha256 = str(image.get("sha256") or "")
-                    if sha256 and (len(sha256) != 64 or any(char not in "0123456789abcdefABCDEF" for char in sha256)):
-                        return {"ok": False, "message": f"prompt_batch.v1 第 {record_index} 条 sha256 必须是 64 位十六进制", "records": []}
-                    if not record_id:
-                        identity = f"{producer_name}\x1f{sha256}\x1f{image.get('filename', '')}\x1f{positive}"
-                        record_id = f"generated-{hashlib.sha256(identity.encode('utf-8')).hexdigest()}"
-                    if record_id in seen_record_ids:
-                        return {"ok": False, "message": f"prompt_batch.v1 第 {record_index} 条 record_id 重复: {record_id}", "records": []}
-                    seen_record_ids.add(record_id)
-                else:
-                    record_id = record.get("record_id") or ""
+                natural = self._prompt_batch_natural_prompt(record, prompt)
+                record_id = record.get("record_id") or ""
                 normalized_record = {
                     **record,
                     "record_id": record_id,
@@ -2373,6 +2435,7 @@ class TagCacheManager:
                 "message": loaded.get("message", "导入预检失败"),
                 "source_count": 0,
                 "inserted": 0,
+                "enriched": 0,
                 "skipped_duplicate": 0,
                 "skipped_empty": 0,
                 "current_total": self.get_active_total(),
@@ -2383,10 +2446,13 @@ class TagCacheManager:
         conn = self._connect()
         try:
             current_total = conn.execute("SELECT COUNT(*) AS c FROM tags").fetchone()["c"]
-            existing_keys = {
-                row["duplicate_key"]
-                for row in conn.execute("SELECT duplicate_key FROM tags WHERE duplicate_key IS NOT NULL AND duplicate_key != ''").fetchall()
-            } if append else set()
+            existing_records = {
+                row["duplicate_key"]: row
+                for row in conn.execute(
+                    "SELECT duplicate_key, tags_prompt, natural_prompt FROM tags "
+                    "WHERE duplicate_key IS NOT NULL AND duplicate_key != ''"
+                ).fetchall()
+            } if append else {}
         finally:
             conn.close()
 
@@ -2395,6 +2461,7 @@ class TagCacheManager:
             "path": loaded.get("path", ""),
             "source_count": len(loaded["records"]),
             "inserted": 0,
+            "enriched": 0,
             "skipped_duplicate": 0,
             "skipped_empty": 0,
             "current_total": current_total,
@@ -2403,17 +2470,22 @@ class TagCacheManager:
             "dedupe": bool(dedupe),
             "sample": [],
         }
-        seen_keys = set()
+        seen_records = {}
         for item in loaded["records"]:
             record = self._coerce_record(item)
             if not record["tags_prompt"]:
                 stats["skipped_empty"] += 1
                 continue
             duplicate_key = record["duplicate_key"]
-            if dedupe and (duplicate_key in existing_keys or duplicate_key in seen_keys):
-                stats["skipped_duplicate"] += 1
+            existing = seen_records.get(duplicate_key) or existing_records.get(duplicate_key)
+            if dedupe and existing:
+                if self._can_enrich_duplicate(existing, record):
+                    stats["enriched"] += 1
+                    seen_records[duplicate_key] = record
+                else:
+                    stats["skipped_duplicate"] += 1
                 continue
-            seen_keys.add(duplicate_key)
+            seen_records[duplicate_key] = record
             stats["inserted"] += 1
             if len(stats["sample"]) < 8:
                 stats["sample"].append(record)

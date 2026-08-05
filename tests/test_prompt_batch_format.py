@@ -26,6 +26,18 @@ class PromptBatchFormatTests(unittest.TestCase):
             legacy.write_text(json.dumps(["3girls"]), encoding="utf-8")
             self.assertTrue(manager.import_records(str(legacy))["ok"])
 
+    def test_native_export_reimport_is_deduplicated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            manager.append_records([{"tags_prompt": "1girl, blue_eyes"}])
+
+            exported = manager.export_records("json")
+            imported = manager.import_records(exported["path"], append=True, dedupe=True)
+
+            self.assertEqual(imported["inserted"], 0)
+            self.assertEqual(imported["skipped_duplicate"], 1)
+            self.assertEqual(manager.get_active_total(), 1)
+
     def test_same_prompt_from_two_images_stays_as_two_records(self):
         with tempfile.TemporaryDirectory() as directory:
             manager = TagCacheManager(directory)
@@ -66,6 +78,117 @@ class PromptBatchFormatTests(unittest.TestCase):
             record = json.loads(Path(exported["path"]).read_text(encoding="utf-8"))["records"][0]
             self.assertEqual(record["prompt"]["positive"], "raw tags")
             self.assertEqual(record["prompt"]["processed"], "polished prompt")
+
+    def test_processed_reimport_enriches_existing_image_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            source = Path(directory) / "batch.json"
+            raw = {
+                "schema_version": "prompt_batch.v1",
+                "producer": {"name": "collector"},
+                "records": [{
+                    "record_id": "one",
+                    "source_identity": "image:collector:one",
+                    "image": {"filename": "one.png", "sha256": "a" * 64},
+                    "prompt": {"positive": "raw tags"},
+                }],
+            }
+            source.write_text(json.dumps(raw), encoding="utf-8")
+            self.assertEqual(manager.import_records(str(source))["inserted"], 1)
+
+            raw["records"][0]["prompt"].update({
+                "processed": "A polished sentence.",
+                "processed_kind": "natural",
+            })
+            source.write_text(json.dumps(raw), encoding="utf-8")
+            enriched = manager.import_records(str(source), append=True, dedupe=True)
+
+            self.assertEqual(enriched["inserted"], 0)
+            self.assertEqual(enriched["enriched"], 1)
+            self.assertEqual(enriched["skipped_duplicate"], 0)
+            record = json.loads(Path(manager.export_records("json")["path"]).read_text(encoding="utf-8"))["records"][0]
+            self.assertEqual(record["source_identity"], "image:collector:one")
+            self.assertEqual(record["prompt"]["processed"], "A polished sentence.")
+
+    def test_enrichment_preview_matches_import_for_repeated_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            source = Path(directory) / "batch.json"
+            raw_record = {
+                "record_id": "one",
+                "image": {"filename": "one.png", "sha256": "a" * 64},
+                "prompt": {"positive": "raw tags"},
+            }
+            source.write_text(json.dumps({
+                "schema_version": "prompt_batch.v1",
+                "producer": {"name": "collector"},
+                "records": [raw_record],
+            }), encoding="utf-8")
+            self.assertEqual(manager.import_records(str(source))["inserted"], 1)
+
+            candidates = []
+            for index, processed in enumerate(("First polished sentence.", "Second polished sentence."), 1):
+                candidates.append({
+                    **raw_record,
+                    "record_id": f"candidate-{index}",
+                    "prompt": {
+                        "positive": "raw tags",
+                        "processed": processed,
+                        "processed_kind": "natural",
+                    },
+                })
+            source.write_text(json.dumps({
+                "schema_version": "prompt_batch.v1",
+                "producer": {"name": "collector"},
+                "records": candidates,
+            }), encoding="utf-8")
+
+            preview = manager.preview_import_records(str(source), append=True, dedupe=True)
+            imported = manager.import_records(str(source), append=True, dedupe=True)
+
+            self.assertEqual(preview["enriched"], imported["enriched"])
+            self.assertEqual(preview["skipped_duplicate"], imported["skipped_duplicate"])
+            self.assertEqual((imported["enriched"], imported["skipped_duplicate"]), (1, 1))
+
+    def test_explicit_processed_kind_only_maps_natural_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            natural = manager.normalize_prompt_batch_payload({
+                "schema_version": "prompt_batch.v1",
+                "records": [{
+                    "prompt": {
+                        "positive": "raw tags",
+                        "processed": "A polished sentence.",
+                        "processed_kind": "natural",
+                    },
+                }],
+            })
+            tags = manager.normalize_prompt_batch_payload({
+                "schema_version": "prompt_batch.v1",
+                "records": [{
+                    "prompt": {
+                        "positive": "raw tags",
+                        "processed": "cleaned, tags",
+                        "output_kind": "tags",
+                    },
+                }],
+            })
+
+            self.assertEqual(natural["records"][0]["natural_prompt"], "A polished sentence.")
+            self.assertEqual(tags["records"][0]["natural_prompt"], "")
+
+    def test_processed_without_kind_uses_documented_legacy_natural_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manager = TagCacheManager(directory)
+            loaded = manager.normalize_prompt_batch_payload({
+                "schema_version": "prompt_batch.v1",
+                "records": [{
+                    "prompt": {"positive": "raw tags", "processed": "Legacy sentence."},
+                }],
+            })
+
+            self.assertTrue(loaded["ok"])
+            self.assertEqual(loaded["records"][0]["natural_prompt"], "Legacy sentence.")
 
     def test_prompt_batch_identity_is_validated_and_producer_scoped(self):
         with tempfile.TemporaryDirectory() as directory:

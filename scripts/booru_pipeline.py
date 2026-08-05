@@ -1,6 +1,6 @@
 """Pure, Forge-independent online booru prompt generation helpers."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import random
 
 
@@ -49,6 +49,8 @@ class PromptGenerationResult:
     error: str = ""
     error_kind: str = ""
     empty: bool = False
+    fetch_status: str = ""
+    fetch_evidence: dict = field(default_factory=dict)
 
 
 def resolve_credentials(service, supplied, saved):
@@ -174,21 +176,52 @@ def generate_online_prompt(request, transform, credential, client_factory, rng=N
     try:
         client = client_factory(request, credential)
         payload = client.fetch()
+        fetch_evidence = dict(getattr(client, "fetch_evidence", {}) or {})
+        fetch_status = str(fetch_evidence.get("status") or "")
         posts = _sort_posts(normalize_posts(request.service, payload), request.sorting_order)
         if not posts:
-            return PromptGenerationResult(posts=posts, empty=True)
+            return PromptGenerationResult(
+                posts=posts,
+                empty=True,
+                fetch_status=fetch_status,
+                fetch_evidence=fetch_evidence,
+            )
         selected = posts[0] if request.sorting_order in ("High Score", "Low Score") else posts[rng.randrange(len(posts))]
         tags = selected["tags"]
         if transform.mix_amount:
             tags = mix_post_tags(posts, transform.mix_amount, rng)
         prompt = transform_prompt_tags(tags, transform)
-        return PromptGenerationResult(prompt=prompt, posts=posts, selected_post=selected)
+        return PromptGenerationResult(
+            prompt=prompt,
+            posts=posts,
+            selected_post=selected,
+            fetch_status=fetch_status,
+            fetch_evidence=fetch_evidence,
+        )
     except RetryExhaustedError as error:
-        return PromptGenerationResult(error=str(error), error_kind="retry_exhausted")
+        fetch_evidence = dict(getattr(client, "fetch_evidence", {}) or {})
+        return PromptGenerationResult(
+            error=str(error),
+            error_kind="retry_exhausted",
+            fetch_status=str(fetch_evidence.get("status") or ""),
+            fetch_evidence=fetch_evidence,
+        )
     except ValueError as error:
-        return PromptGenerationResult(error=str(error), error_kind="parse")
+        fetch_evidence = dict(getattr(client, "fetch_evidence", {}) or {})
+        return PromptGenerationResult(
+            error=str(error),
+            error_kind="parse",
+            fetch_status=str(fetch_evidence.get("status") or ""),
+            fetch_evidence=fetch_evidence,
+        )
     except Exception as error:
-        return PromptGenerationResult(error=str(error), error_kind="request")
+        fetch_evidence = dict(getattr(client, "fetch_evidence", {}) or {})
+        return PromptGenerationResult(
+            error=str(error),
+            error_kind="request",
+            fetch_status=str(fetch_evidence.get("status") or ""),
+            fetch_evidence=fetch_evidence,
+        )
     finally:
         if client is not None:
             client.close()

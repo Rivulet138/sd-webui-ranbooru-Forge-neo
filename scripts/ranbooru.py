@@ -518,9 +518,10 @@ def get_available_ratings(booru):
 
 def show_fringe_benefits(booru):
     if booru == 'gelbooru':
-        return gr.update(visible=True)
-    else:
-        return gr.update(visible=False)
+        return gr.update(visible=True, value=True)
+    if booru == 'rule34':
+        return gr.update(visible=True, value=False)
+    return gr.update(visible=False, value=False)
 
 
 def check_exception(booru, parameters):
@@ -780,23 +781,15 @@ class XBooru(Booru):
             logger.debug("Requesting booru URL: %s", redact_sensitive(str(url)))
             res = self.fetch_with_retry(url, timeout=10)
             data = _response_posts_or_raise(res, "XBooru")
-            result_count = 0
             for post in data:
                 if isinstance(post, dict) and 'directory' in post and 'image' in post:
                     post['file_url'] = f"https://xbooru.com/images/{post['directory']}/{post['image']}"
-                    result_count += 1
-            if result_count <= max_pages*POST_AMOUNT:
-                max_pages = result_count // POST_AMOUNT+1
-                # If max_pages is bigger than available pages, loop the function with updated max_pages based on the result count.
-                if attempt == 0:
-                    logger.debug("Processing %s results", result_count)
+            result_count = len(data)
+            if result_count == 0 and attempt == 0:
+                max_pages = 2
+                logger.debug("Processing %s results", result_count)
                 continue
-            else:
-                logger.debug(
-                    "Processing %s out of %s results",
-                    max_pages * POST_AMOUNT,
-                    result_count,
-                )
+            logger.debug("Processing %s results", result_count)
             break
         return {'post': data}
 
@@ -1432,7 +1425,11 @@ def _fetch_booru_posts_with_fallback(
     tag_categories=None,
     plain_tags='',
     mature_rating='All',
+    allow_animated_fallback=False,
+    fallback_evidence=None,
 ):
+    evidence = fallback_evidence if isinstance(fallback_evidence, dict) else {}
+    evidence.clear()
     data = _fetch_booru_data(
         api_url,
         booru,
@@ -1442,23 +1439,50 @@ def _fetch_booru_posts_with_fallback(
         tag_categories,
     )
     posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
-    if not posts and booru == 'rule34' and add_tags.startswith('&tags=-animated'):
+    evidence.update({
+        "status": "ok" if posts else "empty",
+        "initial_post_count": len(posts),
+        "fallback_post_count": 0,
+        "fallback_authorized": bool(allow_animated_fallback),
+    })
+    can_relax_animated = (
+        not posts
+        and booru == 'rule34'
+        and add_tags.startswith('&tags=-animated')
+    )
+    if can_relax_animated and not allow_animated_fallback:
+        evidence["status"] = "empty_without_fallback"
+    elif can_relax_animated:
         fallback_add_tags = '&tags='
         if plain_tags:
             fallback_add_tags += str(plain_tags).replace(',', '+')
         fallback_add_tags += _get_rating_tag(booru, mature_rating)
-        data = api_url.get_data(fallback_add_tags, max_pages)
+        evidence.update({
+            "status": "fallback_requested",
+            "fallback_query": fallback_add_tags,
+        })
+        try:
+            data = api_url.get_data(fallback_add_tags, max_pages)
+        except Exception:
+            evidence["status"] = "fallback_failed"
+            raise
         posts = _normalize_posts(data.get('post', []) if isinstance(data, dict) else [])
+        evidence.update({
+            "status": "fallback_succeeded" if posts else "fallback_empty",
+            "fallback_post_count": len(posts),
+        })
     return posts
 
 
 class _BooruPipelineClient:
     """Adapts the Forge entry module's HTTP clients to the pure pipeline protocol."""
 
-    def __init__(self, client, request, add_tags):
+    def __init__(self, client, request, add_tags, allow_animated_fallback=False):
         self.client = client
         self.request = request
         self.add_tags = add_tags
+        self.allow_animated_fallback = bool(allow_animated_fallback)
+        self.fetch_evidence = {}
 
     def fetch(self):
         try:
@@ -1471,6 +1495,8 @@ class _BooruPipelineClient:
                 self.request.tag_categories,
                 self.request.tags,
                 self.request.mature_rating,
+                self.allow_animated_fallback,
+                self.fetch_evidence,
             )
         except requests.exceptions.RequestException as error:
             raise RetryExhaustedError(str(error)) from error
@@ -1484,6 +1510,15 @@ def _pipeline_request_tags(service, tags, mature_rating):
     if tags:
         add_tags += '+' + str(tags).replace(',', '+')
     return add_tags + _get_rating_tag(service, mature_rating)
+
+
+def _adapt_pipeline_client(client, request, allow_animated_fallback):
+    return _BooruPipelineClient(
+        client,
+        request,
+        _pipeline_request_tags(request.service, request.tags, request.mature_rating),
+        allow_animated_fallback=(request.service == 'rule34' and allow_animated_fallback),
+    )
 
 
 def _pipeline_saved_credentials(service):
@@ -1510,11 +1545,7 @@ def _pipeline_client_factory(use_cache, fringe_benefits):
             credential.user_id if request.service == 'rule34' else None,
         )
         client.configure_http_cache(use_cache)
-        return _BooruPipelineClient(
-            client,
-            request,
-            _pipeline_request_tags(request.service, request.tags, request.mature_rating),
-        )
+        return _adapt_pipeline_client(client, request, fringe_benefits)
 
     return factory
 
@@ -2658,7 +2689,8 @@ class Script(scripts.Script):
         pending_updates = []
         processed = 0
         saved = 0
-        stale = 0
+        source_changed = 0
+        source_deleted = 0
         reused = 0
         timeout_skipped = 0
         transient_skipped = 0
@@ -2667,7 +2699,7 @@ class Script(scripts.Script):
         update_batch_size = 10
 
         def flush_pending():
-            nonlocal saved, stale
+            nonlocal saved, source_changed, source_deleted
             if not pending_updates:
                 return
             update_result = tag_cache_manager.update_natural_prompts(
@@ -2678,7 +2710,8 @@ class Script(scripts.Script):
                 converter_version=NATURAL_LANGUAGE_CONVERTER_VERSION,
             )
             saved += update_result["updated"]
-            stale += update_result["stale_or_missing"]
+            source_changed += update_result["source_changed"]
+            source_deleted += update_result["source_deleted"]
             pending_updates.clear()
 
         try:
@@ -2707,7 +2740,7 @@ class Script(scripts.Script):
                                     f"批量转换在第 {processed}/{len(records)} 条停止："
                                     f"已连续 {consecutive_timeouts} 条记录单次请求超时。\n"
                                     f"本次已保存 {saved} 条；超时跳过 {timeout_skipped} 条；"
-                                    f"源记录变化或已删除 {stale} 条。备份：{backup_path}"
+                                    f"源记录变化 {source_changed} 条，已删除 {source_deleted} 条。备份：{backup_path}"
                                 ),
                                 Script._natural_language_cache_status(),
                             )
@@ -2735,7 +2768,7 @@ class Script(scripts.Script):
                     yield (
                         (
                             f"批量转换在第 {processed}/{len(records)} 条停止：{error}\n"
-                            f"已保存 {saved} 条；源记录变化或已删除 {stale} 条；"
+                            f"已保存 {saved} 条；源记录变化 {source_changed} 条，已删除 {source_deleted} 条；"
                             f"已完成的结果仍保留。备份：{backup_path}"
                         ),
                         Script._natural_language_cache_status(),
@@ -2761,7 +2794,7 @@ class Script(scripts.Script):
                     yield (
                         (
                             f"批量转换已取消：完成 {processed}/{len(records)} 条，"
-                            f"已保存 {saved} 条，源记录变化或删除 {stale} 条。"
+                            f"已保存 {saved} 条，源记录变化 {source_changed} 条，删除 {source_deleted} 条。"
                             f"备份：{backup_path}"
                         ),
                         Script._natural_language_cache_status(),
@@ -2783,7 +2816,7 @@ class Script(scripts.Script):
                     f"复用相同整条 Tag 的结果 {reused} 条，"
                     f"RAG 命中 {rag_queries_with_examples} 条并注入 {rag_examples_used} 个样例，"
                     f"超时跳过 {timeout_skipped} 条，"
-                    f"源记录变化或已删除 {stale} 条。备份：{backup_path}"
+                    f"源记录变化 {source_changed} 条，已删除 {source_deleted} 条。备份：{backup_path}"
                 ),
                 Script._natural_language_cache_status(),
             )
@@ -2923,7 +2956,8 @@ class Script(scripts.Script):
             return result.get("message", "导入失败"), tag_cache_manager.get_status()
         backup_note = f"，覆盖前备份: {result.get('backup_path')}" if result.get("backup_path") else ""
         return (
-            f"导入完成: 写入 {result['inserted']} 条，重复跳过 {result['skipped_duplicate']} 条，总计 {result['total']} 条{backup_note}",
+            f"导入完成: 写入 {result['inserted']} 条，补全 {result.get('enriched', 0)} 条，"
+            f"重复跳过 {result['skipped_duplicate']} 条，总计 {result['total']} 条{backup_note}",
             tag_cache_manager.get_status(),
         )
 
@@ -2945,7 +2979,10 @@ class Script(scripts.Script):
                     preview.append(f"{index}: {record['tags_prompt'][:120]}")
             result = (tag_cache_manager.append_records(records, dedupe=dedupe)
                       if append_mode else tag_cache_manager.save_records(records, dedupe=dedupe, backup_reason="collector_import"))
-            return "Collector 批次导入完成\n" + "\n".join(preview) + f"\n写入 {result.get('inserted', 0)} 条", tag_cache_manager.get_status()
+            return (
+                "Collector 批次导入完成\n" + "\n".join(preview)
+                + f"\n写入 {result.get('inserted', 0)} 条，补全 {result.get('enriched', 0)} 条"
+            ), tag_cache_manager.get_status()
         except Exception as error:
             return f"Collector 批次解析失败: {error}", tag_cache_manager.get_status()
 
@@ -2955,7 +2992,7 @@ class Script(scripts.Script):
             return result.get("message", "导入预检失败")
         mode = "追加" if result.get("append") else "覆盖"
         lines = [
-            f"导入预检 ({mode}): 文件记录 {result.get('source_count', 0)} 条，预计写入 {result.get('inserted', 0)} 条",
+            f"导入预检 ({mode}): 文件记录 {result.get('source_count', 0)} 条，预计写入 {result.get('inserted', 0)} 条，补全 {result.get('enriched', 0)} 条",
             f"空记录跳过 {result.get('skipped_empty', 0)} 条，重复跳过 {result.get('skipped_duplicate', 0)} 条",
             f"当前总数 {result.get('current_total', 0)} 条，导入后预计 {result.get('estimated_total', 0)} 条",
         ]
@@ -3086,7 +3123,11 @@ class Script(scripts.Script):
                                 shuffle_tags = gr.Checkbox(label="Shuffle tags", value=True)
                                 change_dash = gr.Checkbox(label='Convert "_" to spaces', value=False)
                                 same_prompt = gr.Checkbox(label="Use same prompt for all images", value=False)
-                                fringe_benefits = gr.Checkbox(label="Fringe Benefits", value=(default_booru == 'gelbooru'), visible=(default_booru == 'gelbooru'))
+                                fringe_benefits = gr.Checkbox(
+                                    label="Fringe Benefits / Rule34 animated fallback",
+                                    value=(default_booru == 'gelbooru'),
+                                    visible=(default_booru in ('gelbooru', 'rule34')),
+                                )
                                 with gr.Group(visible=False) as gelbooru_credentials_group:
                                     gr.Markdown("### API Credentials")
                                     api_key = gr.Textbox(
@@ -4173,19 +4214,16 @@ class Script(scripts.Script):
                         mix_amount=mix_amount if mix_prompt else 0,
                     ),
                     credential,
-                    lambda pipeline_request, _credential: _BooruPipelineClient(
+                    lambda pipeline_request, _credential: _adapt_pipeline_client(
                         api_url,
                         pipeline_request,
-                        _pipeline_request_tags(
-                            pipeline_request.service,
-                            pipeline_request.tags,
-                            pipeline_request.mature_rating,
-                        ),
+                        fringe_benefits,
                     ),
                     rng=random,
                 )
             finally:
                 api_url.close()
+            logger.info("Ranbooru fetch status=%s evidence=%s", result.fetch_status, result.fetch_evidence)
             if result.error:
                 logger.error("%s", _format_ranbooru_error(booru, result.error))
                 return p
