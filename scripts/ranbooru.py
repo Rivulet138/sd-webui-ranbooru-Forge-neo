@@ -198,7 +198,6 @@ except ImportError:
 
 
 tag_cache_manager = TagCacheManager(user_cache_dir)
-_natural_batch_lock = threading.Lock()
 _natural_batch_cancel = threading.Event()
 _natural_endpoint_policy_choices = list(NATURAL_LANGUAGE_ENDPOINT_POLICIES)
 _prompt_studio_module = None
@@ -2852,12 +2851,6 @@ class Script(scripts.Script):
         rag_min_percentile,
         rag_context_chars,
     ):
-        if not _natural_batch_lock.acquire(blocking=False):
-            yield (
-                "已有自然语言批量任务正在运行，请等待其完成或停止后再试。",
-                Script._natural_language_cache_status(),
-            )
-            return
         _natural_batch_cancel.clear()
         try:
             yield from Script._cache_batch_convert_natural_unlocked(
@@ -2876,26 +2869,16 @@ class Script(scripts.Script):
                 rag_context_chars,
             )
         finally:
-            _natural_batch_lock.release()
+            _natural_batch_cancel.clear()
 
     @staticmethod
     def _cancel_natural_batch():
-        if not _natural_batch_lock.locked():
-            return "当前没有正在运行的自然语言批量任务。"
         _natural_batch_cancel.set()
         return "已请求取消；当前模型请求返回后将保存已完成结果并停止。"
 
     @staticmethod
     def _cache_clear_natural_conversion(position_spec):
-        if not _natural_batch_lock.acquire(blocking=False):
-            return (
-                "A batch conversion is running; cancel or wait before clearing results.",
-                Script._natural_language_cache_status(),
-            )
-        try:
-            return Script._cache_clear_natural_conversion_unlocked(position_spec)
-        finally:
-            _natural_batch_lock.release()
+        return Script._cache_clear_natural_conversion_unlocked(position_spec)
 
     @staticmethod
     def _cache_clear_natural_conversion_unlocked(position_spec):
