@@ -13,6 +13,7 @@ import importlib
 import json
 import threading
 import sys
+import uuid
 try:
     import requests_cache
     HAS_REQUESTS_CACHE = True
@@ -199,6 +200,14 @@ except ImportError:
 
 tag_cache_manager = TagCacheManager(user_cache_dir)
 _natural_batch_cancel = threading.Event()
+_natural_batch_cancel_events: dict[str, threading.Event] = {}
+_natural_batch_cancel_lock = threading.Lock()
+
+
+def _natural_cancel_event(cancel_id: str = "") -> tuple[str, threading.Event]:
+    key = str(cancel_id or "").strip() or f"direct:{threading.get_ident()}"
+    with _natural_batch_cancel_lock:
+        return key, _natural_batch_cancel_events.setdefault(key, threading.Event())
 _natural_endpoint_policy_choices = list(NATURAL_LANGUAGE_ENDPOINT_POLICIES)
 _prompt_studio_module = None
 _prompt_studio_lock = threading.RLock()
@@ -2576,7 +2585,9 @@ class Script(scripts.Script):
         rag_top_k,
         rag_min_percentile,
         rag_context_chars,
+        cancel_event=None,
     ):
+        cancel_event = cancel_event or _natural_batch_cancel
         if not str(position_spec or "").strip():
             yield (
                 "请输入当前活动缓存的可见序号或范围，例如 1-100,205-240。",
@@ -2724,7 +2735,7 @@ class Script(scripts.Script):
                 [record["tags_prompt"] for record in records],
                 config,
                 converter,
-                should_cancel=_natural_batch_cancel.is_set,
+                should_cancel=cancel_event.is_set,
                 example_provider=retrieve_examples if rag_enabled else None,
             ):
                 processed = index + 1
@@ -2788,7 +2799,7 @@ class Script(scripts.Script):
                 )
                 if len(pending_updates) >= update_batch_size:
                     flush_pending()
-                if _natural_batch_cancel.is_set():
+                if cancel_event.is_set():
                     flush_pending()
                     yield (
                         (
@@ -2850,8 +2861,10 @@ class Script(scripts.Script):
         rag_top_k,
         rag_min_percentile,
         rag_context_chars,
+        cancel_id="",
     ):
-        _natural_batch_cancel.clear()
+        event_key, cancel_event = _natural_cancel_event(cancel_id)
+        cancel_event.clear()
         try:
             yield from Script._cache_batch_convert_natural_unlocked(
                 position_spec,
@@ -2867,13 +2880,18 @@ class Script(scripts.Script):
                 rag_top_k,
                 rag_min_percentile,
                 rag_context_chars,
+                cancel_event,
             )
         finally:
-            _natural_batch_cancel.clear()
+            cancel_event.clear()
+            with _natural_batch_cancel_lock:
+                if _natural_batch_cancel_events.get(event_key) is cancel_event:
+                    _natural_batch_cancel_events.pop(event_key, None)
 
     @staticmethod
-    def _cancel_natural_batch():
-        _natural_batch_cancel.set()
+    def _cancel_natural_batch(cancel_id=""):
+        _key, event = _natural_cancel_event(cancel_id)
+        event.set()
         return "已请求取消；当前模型请求返回后将保存已完成结果并停止。"
 
     @staticmethod
@@ -3289,6 +3307,7 @@ class Script(scripts.Script):
                                     value=self._natural_language_cache_status(),
                                     interactive=False,
                                     lines=1,
+                                    elem_classes=["ranbooru-status"],
                                 )
                                 with gr.Row(elem_classes=["ranbooru-form-row"]):
                                     cache_natural_language_positions = gr.Textbox(
@@ -3421,6 +3440,7 @@ class Script(scripts.Script):
                                         "取消批量转换",
                                         variant="stop",
                                     )
+                                    cache_natural_cancel_id = gr.State(lambda: uuid.uuid4().hex)
                                     cache_natural_language_clear_btn = gr.Button(
                                         "清除所选已转换结果"
                                     )
@@ -3694,6 +3714,7 @@ class Script(scripts.Script):
                 cache_prompt_rag_top_k,
                 cache_prompt_rag_min_percentile,
                 cache_prompt_rag_context_chars,
+                cache_natural_cancel_id,
             ],
             outputs=[
                 cache_natural_language_preview,
@@ -3702,7 +3723,7 @@ class Script(scripts.Script):
         )
         cache_natural_language_cancel_btn.click(
             fn=self._cancel_natural_batch,
-            inputs=[],
+            inputs=[cache_natural_cancel_id],
             outputs=[cache_natural_language_preview],
             cancels=[natural_conversion_event],
             queue=False,

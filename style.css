@@ -14,8 +14,15 @@
 .ranbooru-form-row > * { min-width: min(100%, 12rem); }
 .ranbooru-table { width: 100%; overflow-x: auto; }
 .ranbooru-table .dataframe { min-width: 52rem; }
+.ranbooru-table table { table-layout: fixed; }
+.ranbooru-table td, .ranbooru-table th { overflow-wrap: anywhere; white-space: normal; }
 .ranbooru-primary-action button { min-height: 2.4rem; }
 .ranbooru-input textarea, .ranbooru-input input { min-width: 0; }
+.ranbooru-status { min-height: 2.5rem; padding: .55rem .75rem; border: 1px solid var(--border-color-primary, #555); border-radius: 6px; overflow-wrap: anywhere; }
+#ranbooru_cache_workspace button:focus-visible,
+#ranbooru_cache_workspace input:focus-visible,
+#ranbooru_cache_workspace textarea:focus-visible,
+#ranbooru_cache_workspace select:focus-visible { outline: 2px solid var(--primary-500, #4f8cff); outline-offset: 2px; }
 #ranbooru_cache_tabs > .tab-nav { overflow-x: auto; flex-wrap: nowrap; }
 #ranbooru_cache_tabs > .tab-nav button { flex: 0 0 auto; min-width: max-content; min-height: 2.5rem; white-space: nowrap; }
 
@@ -25,4 +32,12 @@
   .ranbooru-form-row > * { width: 100%; min-width: 0 !important; }
   .ranbooru-table { overflow-x: auto; }
   #ranbooru_cache_workspace button { min-height: 2.65rem; white-space: normal; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #ranbooru_cache_workspace *, #ranbooru_cache_workspace *::before, #ranbooru_cache_workspace *::after {
+    scroll-behavior: auto !important;
+    transition-duration: .01ms !important;
+    animation-duration: .01ms !important;
+  }
 }
