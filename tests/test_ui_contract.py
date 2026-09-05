@@ -19,7 +19,9 @@ class RanbooruUiContractTests(unittest.TestCase):
     def test_cache_workspace_exposes_task_tabs_and_stable_ids(self):
         source = (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
 
-        self.assertIn('gr.Accordion(label="Ranbooru", open=False', source)
+        self.assertIn('gr.Accordion(label=f"Ranbooru 设置 Settings · {view_label}", open=False', source)
+        self.assertIn('view_suffix = "_img2img" if is_img2img else ""', source)
+        self.assertIn('elem_id=f"ranbooru_tag_prompt{view_suffix}"', source)
         self.assertNotIn("Ranbooru 在线生成设置", source)
         for label in ("缓存采集", "浏览与联动", "自然语言与 RAG", "维护与导入导出"):
             self.assertIn(f'gr.Tab("{label}"', source)
