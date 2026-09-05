@@ -428,12 +428,9 @@ class CredentialsManager:
             )
         except (TypeError, ValueError, OverflowError):
             rag_context_chars_value = 3000
-        if isinstance(rag_enabled, str):
-            rag_enabled_value = rag_enabled.strip().lower() not in {
-                "0", "false", "no", "off"
-            }
-        else:
-            rag_enabled_value = bool(rag_enabled)
+        # Natural-language conversion and RAG are retired. Keep legacy fields
+        # readable for migration, but never enable or persist the feature.
+        rag_enabled_value = False
         backend_value = str(backend or NATURAL_LANGUAGE_OFF)
         endpoint_value = str(endpoint or "").strip()
         with self._lock:
@@ -2000,7 +1997,7 @@ class Script(scripts.Script):
         """从缓存顺序取出下一条"""
         tags, idx, total = tag_cache_manager.get_next_tags_from_pool(
             loop=loop_mode,
-            prefer_natural=prefer_natural,
+            prefer_natural=False,
         )
         if tags is None:
             if total == 0:
@@ -2247,11 +2244,10 @@ class Script(scripts.Script):
             return "", "请输入有效的缓存序号", ""
         tags = tag_cache_manager.get_by_position(
             cache_position,
-            prefer_natural=prefer_natural,
+            prefer_natural=False,
         )
         if tags:
-            prompt_kind = "自然语言 Prompt" if prefer_natural else "原始 Tag"
-            return tags, f"已取出第 {cache_position} 条（优先使用{prompt_kind}）", str(tag_cache_manager.tag_id_at_position(cache_position) or "")
+            return tags, f"已取出第 {cache_position} 条（使用原始 Tag）", str(tag_cache_manager.tag_id_at_position(cache_position) or "")
         return "", f"未找到第 {cache_position} 条", ""
 
     @staticmethod
@@ -2259,10 +2255,9 @@ class Script(scripts.Script):
         stable_id = Script._parse_cache_id(tag_id)
         if stable_id is None:
             return "", "请输入搜索结果中的内部 ID", ""
-        tags = tag_cache_manager.get_by_id(stable_id, prefer_natural=prefer_natural)
+        tags = tag_cache_manager.get_by_id(stable_id, prefer_natural=False)
         if tags:
-            prompt_kind = "自然语言 Prompt" if prefer_natural else "原始 Tag"
-            return tags, f"已按内部 ID {stable_id} 取出（优先使用{prompt_kind}）", str(stable_id)
+            return tags, f"已按内部 ID {stable_id} 取出（使用原始 Tag）", str(stable_id)
         return "", f"未找到内部 ID {stable_id}", ""
 
     @staticmethod
@@ -2443,7 +2438,7 @@ class Script(scripts.Script):
                 Script._cache_refresh_status(),
                 "",
             )
-        return Script._cache_get_next(loop_mode, prefer_natural)
+        return Script._cache_get_next(loop_mode, False)
 
     @staticmethod
     def _cache_jump_take_and_set(
@@ -2492,6 +2487,7 @@ class Script(scripts.Script):
         rag_min_percentile,
         rag_context_chars,
     ):
+        return "自然语言转换与 RAG 已移除，请在 LLM Prompt Studio 中处理。"
         settings = credentials_manager.save_natural_language_settings(
             preset,
             backend,
@@ -2562,6 +2558,7 @@ class Script(scripts.Script):
 
     @staticmethod
     def _cache_preview_natural_conversion(position_spec, only_missing=True):
+        return "自然语言转换与 RAG 已移除，请在 LLM Prompt Studio 中处理。"
         if not str(position_spec or "").strip():
             return "请输入当前活动缓存的可见序号或范围，例如 1-100,205-240。"
         result = tag_cache_manager.preview_natural_conversion(
@@ -2864,6 +2861,11 @@ class Script(scripts.Script):
         rag_context_chars,
         cancel_id="",
     ):
+        yield (
+            "自然语言转换与 RAG 已移除，请在 LLM Prompt Studio 中处理。",
+            Script._natural_language_cache_status(),
+        )
+        return
         event_key, cancel_event = _natural_cancel_event(cancel_id)
         cancel_event.clear()
         try:
@@ -2897,7 +2899,7 @@ class Script(scripts.Script):
 
     @staticmethod
     def _cache_clear_natural_conversion(position_spec):
-        return Script._cache_clear_natural_conversion_unlocked(position_spec)
+        return "自然语言转换与 RAG 已移除；原始 Tag 缓存未修改。", Script._natural_language_cache_status()
 
     @staticmethod
     def _cache_clear_natural_conversion_unlocked(position_spec):
@@ -3992,7 +3994,9 @@ class Script(scripts.Script):
     def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
         max_pages = _normalize_max_pages(max_pages)
         cache_prompt_write_mode = args[0] if args else "追加到后面"
-        use_preconverted_cache_prompt = bool(args[1]) if len(args) > 1 else True
+        # Legacy callers may still pass this flag; natural-language cache
+        # injection is retired and the generation path always uses raw Tags.
+        use_preconverted_cache_prompt = False
         job_id = _processing_job_id(p)
         if self._active_job_id != job_id and not _is_hires_second_pass(p):
             self._active_job_id = job_id
@@ -4029,11 +4033,11 @@ class Script(scripts.Script):
                 cache_entries, idx, total = tag_cache_manager.get_next_tags_batch_from_pool(
                     total_images,
                     loop=use_local_cache_loop,
-                    prefer_natural=use_preconverted_cache_prompt,
+                    prefer_natural=False,
                     include_prompt_metadata=True,
                 )
                 cache_prompts = [entry["prompt"] for entry in cache_entries]
-                natural_prompt_flags = [bool(entry["is_natural"]) for entry in cache_entries]
+                natural_prompt_flags = [False for _entry in cache_entries]
                 if len(cache_prompts) < total_images:
                     logger.warning(
                         "Cache exhausted at index %s/%s; missing %s prompts",
