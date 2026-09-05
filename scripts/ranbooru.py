@@ -3297,16 +3297,7 @@ class Script(scripts.Script):
                                     )
                             with gr.Tab("自然语言与 RAG", elem_id="ranbooru_tab_natural", visible=False):
                                 gr.Markdown(
-                                    "按主缓存的**可见序号**选择几十或"
-                                    "几百条记录；每条记录的整个 `tags_prompt` 会一次性转换并保存到数据库的"
-                                    "独立自然语言字段，原始 Tag 不会被覆盖。生成和手动写入时只读取已保存"
-                                    "结果，未转换的记录自动回退为原始 Tag，不会临时调用模型。\n\n"
-                                    "Krea 2 预设采用紧凑自然语言：优先描述媒介、主体、动作、场景、构图、"
-                                    "时间/光线与单一风格锚点，并去掉 masterpiece、8k 等空泛质量词。\n\n"
-                                    "启用本地 RAG 后，会从有效的已转换缓存中检索相似且高分的记录，"
-                                    "作为 Few-Shot 示例并发送到当前模型服务；没有可用样例时自动使用 Zero-Shot。\n\n"
-                                    "仅使用你信任的模型服务：OpenAI 兼容模式会把选中的缓存 Tag "
-                                    "发送到所填地址；共享或公网 WebUI 应限制此面板的访问。"
+                                    "此旧面板已停用。自然语言转换与 RAG 不再由 Ranbooru 执行；请将筛选后的 Tag 载入 LLM Prompt Studio，使用对应模型的格式转换、扩写或润色模板。"
                                 )
                                 cache_natural_language_status = gr.Textbox(
                                     label="预转换状态",
