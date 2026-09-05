@@ -3534,8 +3534,8 @@ class Script(scripts.Script):
                                     cache_import_preflight_btn = gr.Button("预检导入")
                                     cache_import_btn = gr.Button("导入缓存", variant="primary")
                                 cache_import_export_result = gr.Textbox(label="导入/导出结果", elem_id="ranbooru_cache_import_result", interactive=False, lines=8)
-                                cache_prompt_batch_payload = gr.Textbox(label="Prompt Batch JSON", elem_id="ranbooru_prompt_batch_payload", visible=False, lines=1)
-                                cache_prompt_batch_import_btn = gr.Button("导入 Collector 批次", elem_id="ranbooru_prompt_batch_import_btn")
+                                cache_prompt_batch_payload = gr.Textbox(label="Prompt Batch JSON", elem_id=f"ranbooru_prompt_batch_payload{view_suffix}", visible=False, lines=1)
+                                cache_prompt_batch_import_btn = gr.Button("导入 Collector 批次", elem_id=f"ranbooru_prompt_batch_import_btn{view_suffix}")
                                 cache_manage_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
 
 

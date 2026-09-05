@@ -22,6 +22,7 @@ class RanbooruUiContractTests(unittest.TestCase):
         self.assertIn('gr.Accordion(label=f"Ranbooru 设置 Settings · {view_label}", open=False', source)
         self.assertIn('view_suffix = "_img2img" if is_img2img else ""', source)
         self.assertIn('elem_id=f"ranbooru_tag_prompt{view_suffix}"', source)
+        self.assertIn('elem_id=f"ranbooru_prompt_batch_payload{view_suffix}"', source)
         self.assertNotIn("Ranbooru 在线生成设置", source)
         for label in ("缓存采集", "浏览与联动", "自然语言与 RAG", "维护与导入导出"):
             self.assertIn(f'gr.Tab("{label}"', source)
