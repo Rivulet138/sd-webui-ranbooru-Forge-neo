@@ -3289,8 +3289,9 @@ class Script(scripts.Script):
                                     use_local_cache_gen = gr.Checkbox(label="生成时使用此缓存", value=False)
                                     use_local_cache_loop = gr.Checkbox(label="生成时循环读取 (到末尾自动重头)", value=True)
                                     use_preconverted_cache_prompt = gr.Checkbox(
-                                        label="优先使用已预转换的自然语言 Prompt",
-                                        value=True,
+                                        label="优先使用已预转换的 Prompt",
+                                        value=False,
+                                        visible=False,
                                     )
                             with gr.Tab("自然语言与 RAG", elem_id="ranbooru_tab_natural", visible=False):
                                 gr.Markdown(
