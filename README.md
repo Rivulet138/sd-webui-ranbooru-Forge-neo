@@ -21,7 +21,7 @@
 
 1. 在 `Tag Prompt` 输入区填写搜索 Tag，选择 Booru 来源，点击“生成提示词 Generate”。
 2. 需要重复使用时，在“本地缓存工作区”采集并浏览缓存，确认当前序号后写入 Prompt。
-3. 需要自然语言时，先保留原始 Tag，再在转换页预览结果；需要模型化润色或扩写时，把批次交给 LLM Prompt Studio。
+3. 需要自然语言时，先保留原始 Tag，再在转换页预览结果；需要模型化润色或扩写时，在 LLM Prompt Studio 的 Ranbooru 联动区点击“载入到 LLM 批处理”，即可按筛选结果批量处理。
 4. 通过 `prompt_batch.v1` 在 PNG Collector、Ranbooru 和 LLM Studio 之间传递有序记录。
 
 页面状态会显示来源、缓存数量和最近一次操作。目标扩展未加载时，原始取词和缓存仍可独立使用，刷新 Forge 后可再次交接。
