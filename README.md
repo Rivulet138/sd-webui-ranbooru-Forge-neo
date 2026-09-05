@@ -1,6 +1,6 @@
 # Ranbooru Forge Neo
 
-面向 Stable Diffusion WebUI Forge / Forge Neo 的 Booru Prompt 与本地 Tag 缓存扩展。它可以在线获取 Booru 标签、清理并写入 txt2img / img2img，也可以建立 SQLite 缓存，顺序取词、批量管理，并将整条 Tag Prompt 转换成LLM 输出。
+面向 Stable Diffusion WebUI Forge / Forge Neo 的 Booru Prompt 与本地 Tag 缓存扩展。它可以在线获取 Booru 标签、清理并写入 txt2img / img2img，也可以建立 SQLite 缓存、顺序取词和批量管理，并将筛选后的 Tag Prompt 交给 LLM Prompt Studio 处理。
 
 ![Ranbooru](pics/logo.png)
 
@@ -13,16 +13,16 @@
 - 支持清理坏 Tag、自定义排除、下划线转空格、乱序、Tag 数量限制、背景和颜色处理。
 - 支持追加到后面、追加到前面、替换或只输出四种 Prompt 写入方式。
 - 使用 SQLite 保存本地 Tag 缓存，支持顺序读取、循环读取、搜索、删除、去重、备份、撤销和导入导出。
-- 可通过 Ollama 或 OpenAI Compatible 服务把整条 Tag Prompt 批量转换为LLM 输出，原始 Tag 不会被覆盖。
-- 与 LLM Prompt Studio、PNG Prompt Collector 通过 `prompt_batch.v1` 交换逐条 Prompt。
+- 可将筛选后的 Tag Prompt 发送到 LLM Prompt Studio；格式转换、扩写和润色由 LLM Studio 的对应模型模板负责，原始 Tag 不会被覆盖。
+- Ranbooru → LLM Prompt Studio 使用 `prompt_batch.v1` 交换逐条 Prompt；PNG Prompt Collector 走独立的 PNG → LLM 链路。
 - 保留 Img2Img、ControlNet、DeepBooru、LoRAnado、Chaos 和文件驱动 Tag 池。
 
 ## 推荐工作流
 
 1. 在 `Tag Prompt` 输入区填写搜索 Tag，选择 Booru 来源，点击“生成提示词 Generate”。
 2. 需要重复使用时，在“本地缓存工作区”采集并浏览缓存，确认当前序号后写入 Prompt。
-3. 需要LLM 输出时，先保留原始 Tag，再在转换页预览结果；需要模型化润色或扩写时，在 LLM Prompt Studio 的 Ranbooru 联动区点击“载入到 LLM 批处理”，即可按筛选结果批量处理。
-4. 通过 `prompt_batch.v1` 在 PNG Collector、Ranbooru 和 LLM Studio 之间传递有序记录。
+3. 需要模型化转换、润色或扩写时，在 LLM Prompt Studio 的 Ranbooru 联动区点击“载入到 LLM 批处理”，即可按筛选结果批量处理，原始 Tag 始终保留。
+4. 通过 `prompt_batch.v1` 将 Ranbooru 的筛选结果传递到 LLM Studio。
 
 页面状态会显示来源、缓存数量和最近一次操作。目标扩展未加载时，原始取词和缓存仍可独立使用，刷新 Forge 后可再次交接。
 
