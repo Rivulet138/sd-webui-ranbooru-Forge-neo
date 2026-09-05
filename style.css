@@ -3,6 +3,18 @@
   min-width: 0;
 }
 
+.ranbooru-view-input textarea,
+.ranbooru-view-input input { border-radius: 6px; border: 1px solid var(--border-color-primary, #555); }
+.ranbooru-view-input textarea:focus,
+.ranbooru-view-input input:focus { border-color: var(--primary-500, #4f8cff); box-shadow: 0 0 0 1px var(--primary-500, #4f8cff); }
+.ranbooru-view-action button { width: 100%; font-weight: 650; letter-spacing: 0; }
+.ranbooru-panel > .label-wrap { min-height: 2.6rem; font-weight: 650; }
+.ranbooru-panel .gr-button { min-height: 2.25rem; }
+.ranbooru-panel input:focus-visible,
+.ranbooru-panel textarea:focus-visible,
+.ranbooru-panel button:focus-visible,
+.ranbooru-panel select:focus-visible { outline: 2px solid var(--primary-500, #4f8cff); outline-offset: 2px; }
+
 #ranbooru_cache_workspace > .label-wrap {
   min-height: 2.75rem;
   font-weight: 600;

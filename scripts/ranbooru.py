@@ -3089,17 +3089,19 @@ class Script(scripts.Script):
         row_container = self.prompt_row[is_img2img] or gr.Row()
         input_row = self.input_row[is_img2img] or gr.Row()
         action_row = self.action_row[is_img2img] or gr.Row()
+        view_suffix = "_img2img" if is_img2img else ""
+        view_label = "图生图 Img2Img" if is_img2img else "文生图 Txt2Img"
         with row_container:
             with input_row:
                 with gr.Column(scale=2, min_width=220):
-                    tags = gr.Textbox(lines=1, label="Tags to Search (Pre)", elem_id="ranbooru_tags", elem_classes=["ranbooru-input"])
+                    tags = gr.Textbox(lines=1, label=f"预搜索标签 Pre-search tags · {view_label}", elem_id=f"ranbooru_tags{view_suffix}", elem_classes=["ranbooru-input", "ranbooru-view-input"])
                 with gr.Column(scale=8):
-                    tag_prompt_input = gr.Textbox(lines=3, label="Tag Prompt", elem_id="ranbooru_tag_prompt", elem_classes=["ranbooru-input"])
+                    tag_prompt_input = gr.Textbox(lines=3, label=f"标签提示词 Tag prompt · {view_label}", elem_id=f"ranbooru_tag_prompt{view_suffix}", elem_classes=["ranbooru-input", "ranbooru-view-input"])
             with action_row:
                 with gr.Column(scale=2, min_width=220):
-                    generate_prompt_btn = gr.Button("生成提示词", elem_id="ranbooru_generate_prompt", elem_classes=["ranbooru-primary-action"])
+                    generate_prompt_btn = gr.Button("生成提示词 Generate", elem_id=f"ranbooru_generate_prompt{view_suffix}", elem_classes=["ranbooru-primary-action", "ranbooru-view-action"])
                 with gr.Column(scale=8):
-                    with gr.Accordion(label="Ranbooru", open=False, elem_id="ranbooru_online_workspace", elem_classes=["ranbooru-panel"]):
+                    with gr.Accordion(label=f"Ranbooru 设置 Settings · {view_label}", open=False, elem_id=f"ranbooru_online_workspace{view_suffix}", elem_classes=["ranbooru-panel"]):
                         enabled = gr.Checkbox(label="Enabled", value=False)
                         with gr.Row():
                             with gr.Column(scale=1):

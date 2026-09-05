@@ -40,6 +40,14 @@ git pull --ff-only origin kemomimi
 
 Ranbooru 同时嵌入 txt2img 和 img2img。顶部的 `Tag Prompt` 是当前写入内容，`生成提示词` 用于只更新 Prompt，不开始生图。
 
+### 推荐工作流
+
+1. 在对应的 txt2img 或 img2img 区域填写预搜索标签，点击 `生成提示词 Generate`。
+2. 需要批量复用时打开“本地缓存工作区”，先采集，再在“浏览与联动”中取出并写入提示词。
+3. 可将当前批次通过 `prompt_batch.v1` 发送到 LLM Prompt Studio；转换结果会回写到输出框，原始 Tag 保留。
+
+两个生图页使用独立的 DOM ID（`ranbooru_*` 与 `ranbooru_*_img2img`），避免 Gradio 重复 ID 导致脚本和浏览器自动化失效；旧 txt2img ID 保持兼容。
+
 ### Ranbooru
 
 在线抓取和即时生图区域。
