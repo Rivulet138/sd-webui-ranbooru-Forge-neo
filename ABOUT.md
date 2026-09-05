@@ -7,3 +7,4 @@ The extension keeps the original tag prompt intact when natural-language convers
 The txt2img panel keeps the historical IDs `ranbooru_tags`, `ranbooru_tag_prompt`, and `ranbooru_generate_prompt` for integrations. The img2img panel uses suffixed IDs such as `ranbooru_tag_prompt_img2img`, preventing duplicate DOM IDs while preserving existing txt2img automation.
 
 This project is community maintained. Forge owns the host UI, generation settings, and third-party provider credentials. Ranbooru only installs its declared HTTP cache dependency and stores its local cache under the Forge user directory.
+

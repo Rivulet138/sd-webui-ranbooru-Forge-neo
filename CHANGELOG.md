@@ -10,3 +10,4 @@
 ## 1.1.0
 
 - Added local cache browsing, maintenance, natural-language conversion, and batch handoff support.
+

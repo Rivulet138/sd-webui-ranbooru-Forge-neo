@@ -2655,7 +2655,8 @@ class Script(scripts.Script):
             endpoint_policy=saved_settings["endpoint_policy"],
             few_shot_max_chars=saved_settings.get("rag_context_chars", 3000),
         )
-        rag_enabled = bool(saved_settings.get("rag_enabled", False))
+        # Natural-language conversion and RAG are retired; cached records remain tag-only.
+        rag_enabled = False
         rag_top_k = int(saved_settings.get("rag_top_k", 3))
         rag_min_percentile = (
             float(saved_settings.get("rag_min_percentile", 75)) / 100.0
@@ -3291,7 +3292,7 @@ class Script(scripts.Script):
                                         label="优先使用已预转换的自然语言 Prompt",
                                         value=True,
                                     )
-                            with gr.Tab("自然语言与 RAG", elem_id="ranbooru_tab_natural"):
+                            with gr.Tab("自然语言与 RAG", elem_id="ranbooru_tab_natural", visible=False):
                                 gr.Markdown(
                                     "按主缓存的**可见序号**选择几十或"
                                     "几百条记录；每条记录的整个 `tags_prompt` 会一次性转换并保存到数据库的"

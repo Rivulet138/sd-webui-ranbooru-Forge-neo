@@ -1,6 +1,6 @@
 # Ranbooru Forge Neo
 
-面向 Stable Diffusion WebUI Forge / Forge Neo 的 Booru Prompt 与本地 Tag 缓存扩展。它可以在线获取 Booru 标签、清理并写入 txt2img / img2img，也可以建立 SQLite 缓存，顺序取词、批量管理，并将整条 Tag Prompt 转换成自然语言。
+面向 Stable Diffusion WebUI Forge / Forge Neo 的 Booru Prompt 与本地 Tag 缓存扩展。它可以在线获取 Booru 标签、清理并写入 txt2img / img2img，也可以建立 SQLite 缓存，顺序取词、批量管理，并将整条 Tag Prompt 转换成LLM 输出。
 
 ![Ranbooru](pics/logo.png)
 
@@ -13,7 +13,7 @@
 - 支持清理坏 Tag、自定义排除、下划线转空格、乱序、Tag 数量限制、背景和颜色处理。
 - 支持追加到后面、追加到前面、替换或只输出四种 Prompt 写入方式。
 - 使用 SQLite 保存本地 Tag 缓存，支持顺序读取、循环读取、搜索、删除、去重、备份、撤销和导入导出。
-- 可通过 Ollama 或 OpenAI Compatible 服务把整条 Tag Prompt 批量转换为自然语言，原始 Tag 不会被覆盖。
+- 可通过 Ollama 或 OpenAI Compatible 服务把整条 Tag Prompt 批量转换为LLM 输出，原始 Tag 不会被覆盖。
 - 与 LLM Prompt Studio、PNG Prompt Collector 通过 `prompt_batch.v1` 交换逐条 Prompt。
 - 保留 Img2Img、ControlNet、DeepBooru、LoRAnado、Chaos 和文件驱动 Tag 池。
 
@@ -21,7 +21,7 @@
 
 1. 在 `Tag Prompt` 输入区填写搜索 Tag，选择 Booru 来源，点击“生成提示词 Generate”。
 2. 需要重复使用时，在“本地缓存工作区”采集并浏览缓存，确认当前序号后写入 Prompt。
-3. 需要自然语言时，先保留原始 Tag，再在转换页预览结果；需要模型化润色或扩写时，在 LLM Prompt Studio 的 Ranbooru 联动区点击“载入到 LLM 批处理”，即可按筛选结果批量处理。
+3. 需要LLM 输出时，先保留原始 Tag，再在转换页预览结果；需要模型化润色或扩写时，在 LLM Prompt Studio 的 Ranbooru 联动区点击“载入到 LLM 批处理”，即可按筛选结果批量处理。
 4. 通过 `prompt_batch.v1` 在 PNG Collector、Ranbooru 和 LLM Studio 之间传递有序记录。
 
 页面状态会显示来源、缓存数量和最近一次操作。目标扩展未加载时，原始取词和缓存仍可独立使用，刷新 Forge 后可再次交接。
@@ -95,22 +95,22 @@ Gelbooru 和 Rule34 可填写 API Key / User ID。凭据保存在服务器端，
 
 - `生成时使用此缓存`：Forge 每次生成时自动取下一条。
 - `生成时循环读取`：到末尾后从第一条继续。
-- `优先使用已预转换的自然语言 Prompt`：记录有有效自然语言结果时使用自然语言，否则回退原始 Tag。
+- `优先使用已预转换的LLM 输出 Prompt`：记录有有效LLM 输出结果时使用LLM 输出，否则回退原始 Tag。
 - `发送到 LLM 提示词工作室`：将当前完整记录交给 LLM Prompt Studio 继续处理。
 
 界面中的可见序号始终是 `1..总数`，不等同于 SQLite 内部 ID。
 
-#### 自然语言与 RAG
+#### 缓存联动
 
-把缓存中的整条 `tags_prompt` 逐条转换为自然语言，并写入独立字段。支持：
+把缓存中的整条 `tags_prompt` 逐条转换为LLM 输出，并写入独立字段。支持：
 
 - Ollama 本地服务。
 - OpenAI Compatible 本地或远程服务。
-- Krea 2 紧凑自然语言预设。
+- Krea 2 紧凑LLM 输出预设。
 - 按可见序号或范围批量转换，例如 `1-100,205-240`。
 - 只转换尚无有效结果的记录。
 
-本页仍提供可选的本地 RAG / Few-Shot，默认关闭。启用后，只从当前 SQLite 缓存中选择相似且高分的已转换记录作为示例；没有合适样例时自动使用 Zero-Shot。此功能属于 Ranbooru，不属于 LLM Prompt Studio。
+本页仍提供可选的本地 RAG（已移除），默认关闭。启用后，只从当前 SQLite 缓存中选择相似且高分的已转换记录作为示例；没有合适样例时自动使用 Zero-Shot。此功能属于 Ranbooru，不属于 LLM Prompt Studio。
 
 每条待转换记录发起一次模型请求。点击取消后会在当前请求返回或超时后停止，并保留已经完成的结果。插件不维护跨标签页任务所有者、租约或“另一标签页正在使用”状态。
 
@@ -156,15 +156,15 @@ user/remove/tags_remove.txt
 
 1. 在 `缓存采集` 建立或追加缓存。
 2. 在 `浏览与联动` 勾选 `生成时使用此缓存`。
-3. 根据需要启用循环读取和自然语言优先。
+3. 根据需要启用循环读取和LLM 输出优先。
 4. 开始 Forge 批次或连续生成；每张图按顺序取得一条记录。
 
-### 自然语言预转换
+### LLM 输出预转换
 
-1. 在 `自然语言与 RAG` 选择范围和后端。
+1. 在 `缓存联动` 选择范围和后端。
 2. 填写模型服务地址、模型 ID 和 API Key。
 3. 先预览，再执行转换。
-4. 返回 `浏览与联动`，启用自然语言优先。
+4. 返回 `浏览与联动`，启用LLM 输出优先。
 
 ## 支持站点
 
@@ -194,9 +194,9 @@ PNG Prompt Collector
   -> Forge txt2img / img2img
 ```
 
-当记录包含 `prompt.processed` 时，生产方应同时写入 `prompt.processed_kind` 或 `prompt.output_kind`。Ranbooru 只把 `natural`、`natural_language` 或 `prose` 类型存入 `natural_prompt`；Tag 或混合结果不会误存为自然语言。
+当记录包含 `prompt.processed` 时，生产方应同时写入 `prompt.processed_kind` 或 `prompt.output_kind`。Ranbooru 只把 `natural`、`natural_language` 或 `prose` 类型存入 `natural_prompt`；Tag 或混合结果不会误存为LLM 输出。
 
-未安装其他插件时，Ranbooru 的在线抓取、本地缓存、自然语言转换和生图链路仍可独立使用。
+未安装其他插件时，Ranbooru 的在线抓取、本地缓存、LLM 联动和生图链路仍可独立使用。
 
 ## 数据目录
 
@@ -208,7 +208,7 @@ user/
 `-- remove/tags_remove.txt
 ```
 
-- `tag_cache.db` 保存原始 Tag、清理结果、来源、Post ID、Score 和自然语言转换元数据。
+- `tag_cache.db` 保存原始 Tag、清理结果、来源、Post ID、Score 和LLM 联动元数据。
 - `credentials.json` 保存 Booru 与 LLM 凭据，不应提交或分享。
 - 数据库操作使用事务；删除、覆盖和整理操作支持备份与撤销。
 
@@ -233,3 +233,4 @@ E:\sd-webui-forge-neo\venv\Scripts\python.exe -m compileall -q scripts tests
 ## 致谢
 
 本项目基于 [liming123332/sd-webui-ranbooru-reforge](https://github.com/liming123332/sd-webui-ranbooru-reforge) 继续维护和增强。请遵守各 Booru 站点的服务条款、内容规则和 API 频率限制。
+
