@@ -145,7 +145,7 @@ user/remove/tags_remove.txt
 
 1. 在 `缓存采集` 建立或追加缓存。
 2. 在 `浏览与联动` 勾选 `生成时使用此缓存`。
-3. 根据需要启用循环读取和LLM 输出优先。
+3. 根据需要启用循环读取。
 4. 开始 Forge 批次或连续生成；每张图按顺序取得一条记录。
 
 ### 送入 LLM 批处理
@@ -173,17 +173,21 @@ user/remove/tags_remove.txt
 
 ## 跨插件链路
 
-三个插件使用统一的 `prompt_batch.v1`：
+Ranbooru 与 LLM Prompt Studio 使用 `prompt_batch.v1` 交换逐条 Tag Prompt。PNG Prompt Collector 是独立的 PNG → LLM 链路：
 
 ```text
+Ranbooru 缓存
+  -> 一条 Tag Prompt
+  -> LLM Prompt Studio 格式转换 / 扩写 / 润色
+  -> Forge txt2img / img2img
+
 PNG Prompt Collector
   -> 一图一条 positive Prompt
-  -> LLM Prompt Studio 润色/扩写
-  -> Ranbooru 导入或缓存
-  -> Forge txt2img / img2img
+  -> LLM Prompt Studio 格式转换 / 扩写 / 润色
+  -> Forge txt2img 正面 Prompt
 ```
 
-当记录包含 `prompt.processed` 时，生产方应同时写入 `prompt.processed_kind` 或 `prompt.output_kind`。Ranbooru 只把 `natural`、`natural_language` 或 `prose` 类型存入 `natural_prompt`；Tag 或混合结果不会误存为LLM 输出。
+LLM 处理结果保存在批次记录的 `prompt.processed`，不会覆盖 Ranbooru 的原始 Tag 缓存。
 
 未安装其他插件时，Ranbooru 的在线抓取、本地缓存、LLM 联动和生图链路仍可独立使用。
 
@@ -197,7 +201,7 @@ user/
 `-- remove/tags_remove.txt
 ```
 
-- `tag_cache.db` 保存原始 Tag、清理结果、来源、Post ID、Score 和LLM 联动元数据。
+- `tag_cache.db` 保存原始 Tag、清理结果、来源、Post ID 和 Score。
 - `credentials.json` 保存 Booru 与 LLM 凭据，不应提交或分享。
 - 数据库操作使用事务；删除、覆盖和整理操作支持备份与撤销。
 
