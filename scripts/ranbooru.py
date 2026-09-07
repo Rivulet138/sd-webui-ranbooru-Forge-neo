@@ -3097,12 +3097,12 @@ class Script(scripts.Script):
         with row_container:
             with input_row:
                 with gr.Column(scale=2, min_width=220):
-                    tags = gr.Textbox(lines=1, label=f"预搜索标签 Pre-search tags · {view_label}", elem_id=f"ranbooru_tags{view_suffix}", elem_classes=["ranbooru-input", "ranbooru-view-input"])
+                    tags = gr.Textbox(lines=1, label=f"搜索 Tag · {view_label}", elem_id=f"ranbooru_tags{view_suffix}", elem_classes=["ranbooru-input", "ranbooru-view-input"])
                 with gr.Column(scale=8):
-                    tag_prompt_input = gr.Textbox(lines=3, label=f"标签提示词 Tag prompt · {view_label}", elem_id=f"ranbooru_tag_prompt{view_suffix}", elem_classes=["ranbooru-input", "ranbooru-view-input"])
+                    tag_prompt_input = gr.Textbox(lines=3, label=f"Prompt · {view_label}", elem_id=f"ranbooru_tag_prompt{view_suffix}", elem_classes=["ranbooru-input", "ranbooru-view-input"])
             with action_row:
                 with gr.Column(scale=2, min_width=220):
-                    generate_prompt_btn = gr.Button("生成提示词 Generate", elem_id=f"ranbooru_generate_prompt{view_suffix}", elem_classes=["ranbooru-primary-action", "ranbooru-view-action"])
+                    generate_prompt_btn = gr.Button("生成", elem_id=f"ranbooru_generate_prompt{view_suffix}", elem_classes=["ranbooru-primary-action", "ranbooru-view-action"])
                 with gr.Column(scale=8):
                     with gr.Accordion(label=f"Ranbooru 设置 Settings · {view_label}", open=False, elem_id=f"ranbooru_online_workspace{view_suffix}", elem_classes=["ranbooru-panel"]):
                         enabled = gr.Checkbox(label="Enabled", value=False)
@@ -3112,23 +3112,23 @@ class Script(scripts.Script):
                                 tag_categories = gr.CheckboxGroup(
                                     ["general", "character", "copyright", "artist", "meta"],
                                     value=["general", "character", "copyright"],
-                                    label="Tag Categories (Danbooru/Safebooru/AIBooru/e621)",
+                                    label="Tag 分类",
                                     visible=default_booru in ['danbooru', 'safebooru', 'aibooru', 'e621']
                                 )
-                                max_pages = gr.Number(label="Max Pages", minimum=1, maximum=9999, value=100, step=1, precision=0)
+                                max_pages = gr.Number(label="页数", minimum=1, maximum=9999, value=100, step=1, precision=0)
                                 gr.Markdown("""## Post""")
                                 post_id = gr.Textbox(lines=1, label="Post ID")
                                 gr.Markdown("""## Tags""")
-                                remove_tags = gr.Textbox(lines=1, label="Tags to Remove (Post)")
+                                remove_tags = gr.Textbox(lines=1, label="排除 Tag")
                                 with gr.Group():
                                     with gr.Group():
                                         prompt_output = gr.Textbox(lines=3, label="提示词输出")
                             with gr.Column(scale=1):
-                                mature_rating = gr.Radio(list(RATINGS[default_booru]), label="Mature Rating", value="All")
-                                remove_bad_tags = gr.Checkbox(label="Remove bad tags", value=True)
-                                shuffle_tags = gr.Checkbox(label="Shuffle tags", value=True)
-                                change_dash = gr.Checkbox(label='Convert "_" to spaces', value=False)
-                                same_prompt = gr.Checkbox(label="Use same prompt for all images", value=False)
+                                mature_rating = gr.Radio(list(RATINGS[default_booru]), label="分级", value="All")
+                                remove_bad_tags = gr.Checkbox(label="清理坏 Tag", value=True)
+                                shuffle_tags = gr.Checkbox(label="打乱 Tag", value=True)
+                                change_dash = gr.Checkbox(label='下划线转空格', value=False)
+                                same_prompt = gr.Checkbox(label="批次同 Prompt", value=False)
                                 fringe_benefits = gr.Checkbox(
                                     label="Fringe Benefits / Rule34 animated fallback",
                                     value=(default_booru == 'gelbooru'),
@@ -3269,19 +3269,19 @@ class Script(scripts.Script):
                                 )
                                 cache_current_record_id = gr.State("")
                                 with gr.Row(elem_classes=["ranbooru-form-row"]):
-                                    cache_send_prompt_studio_btn = gr.Button("发送到 LLM 提示词工作室")
+                                    cache_send_prompt_studio_btn = gr.Button("送入 LLM")
                                     cache_process_prompt_studio_btn = gr.Button(
                                         "使用 LLM 处理并缓存",
                                         variant="primary",
                                     )
                                 cache_prompt_studio_result = gr.Textbox(
-                                    label="LLM 提示词工作室处理结果",
+                                    label="LLM 结果",
                                     interactive=False,
                                     lines=4,
                                 )
                                 cache_prompt_studio_status = gr.Textbox(
                                     elem_id="ranbooru_llm_handoff_status",
-                                    label="LLM 提示词工作室联动状态",
+                                    label="联动状态",
                                     interactive=False,
                                     lines=2,
                                 )
