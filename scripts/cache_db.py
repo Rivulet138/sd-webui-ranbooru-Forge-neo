@@ -946,6 +946,10 @@ class TagCacheManager:
         if not records:
             return {"ok": False, "message": "撤销记录为空", "inserted": 0, "total": self.get_active_total()}
         stats = self.append_records(records, dedupe=dedupe)
+        try:
+            os.remove(path)
+        except OSError as error:
+            log_event(logger, "cache_mutation_failure", "Failed to consume undo journal: %s", error)
         return {
             "ok": True,
             **stats,
@@ -2535,7 +2539,7 @@ class TagCacheManager:
         except Exception as e:
             conn.rollback()
             log_event(logger, "cache_mutation_failure", "ID deletion failed: %s", e)
-            return 0
+            raise RuntimeError(f"ID deletion failed: {e}") from e
         finally:
             conn.close()
 
@@ -2567,7 +2571,7 @@ class TagCacheManager:
         except Exception as e:
             conn.rollback()
             log_event(logger, "cache_mutation_failure", "Tag deletion failed: %s", e)
-            return 0
+            raise RuntimeError(f"Tag deletion failed: {e}") from e
         finally:
             conn.close()
 

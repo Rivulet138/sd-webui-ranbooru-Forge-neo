@@ -13,6 +13,7 @@
 - 支持清理坏 Tag、自定义排除、下划线转空格、乱序、Tag 数量限制、背景和颜色处理。
 - 支持追加到后面、追加到前面、替换或只输出四种 Prompt 写入方式。
 - 使用 SQLite 保存本地 Tag 缓存，支持顺序读取、循环读取、搜索、删除、去重、备份、撤销和导入导出。
+- 可在缓存工作区将 Tag 转换为自然语言 Prompt；原始 Tag 始终保留。
 - 可将筛选后的 Tag Prompt 发送到 LLM Prompt Studio；格式转换、扩写和润色由 LLM Studio 的对应模型模板负责，原始 Tag 不会被覆盖。
 - Ranbooru → LLM Prompt Studio 使用 `prompt_batch.v1` 交换逐条 Prompt；PNG Prompt Collector 走独立的 PNG → LLM 链路。
 - 保留 Img2Img、ControlNet、DeepBooru、LoRAnado、Chaos 和文件驱动 Tag 池。
@@ -170,6 +171,10 @@ user/remove/tags_remove.txt
 | yande.re | 支持 | 不支持 | - | 不需要 |
 
 在线接口可能限流。超时、连接错误或 HTTP 429 会按站点请求逻辑执行有限重试。
+
+Safebooru 当前 API 的帖子查询最多接受 2 个搜索 Tag。Ranbooru 不会再为 Safebooru 自动追加 `-animated`；输入超过 2 个 Tag 时会在请求前提示减少查询条件，批量需求请使用 Tag 缓存分批抓取。
+
+在线生成模式会从 Safebooru 第 1 页读取结果，再从返回的帖子中随机选择；`Max Pages` 仍用于 Tag 缓存的逐页抓取。这样单个稀有 Tag 不会因为随机命中空页而被误判为无结果。
 
 ## 跨插件链路
 

@@ -14,6 +14,7 @@ import json
 import threading
 import sys
 import uuid
+from urllib.parse import quote_plus
 try:
     import requests_cache
     HAS_REQUESTS_CACHE = True
@@ -157,9 +158,8 @@ except ImportError:
 
 try:
     from .natural_language import (
-        BACKEND_CHOICES as NATURAL_LANGUAGE_BACKENDS,
+        BACKEND_OPENAI as NATURAL_LANGUAGE_OPENAI,
         BACKEND_OFF as NATURAL_LANGUAGE_OFF,
-        ENDPOINT_POLICY_CHOICES as NATURAL_LANGUAGE_ENDPOINT_POLICIES,
         ENDPOINT_POLICY_UNRESTRICTED as NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED,
         CONVERTER_VERSION as NATURAL_LANGUAGE_CONVERTER_VERSION,
         PRESET_CHOICES as NATURAL_LANGUAGE_PRESETS,
@@ -179,9 +179,8 @@ except ImportError:
         sys.path.insert(0, _ranbooru_scripts_dir)
     try:
         from natural_language import (
-            BACKEND_CHOICES as NATURAL_LANGUAGE_BACKENDS,
+            BACKEND_OPENAI as NATURAL_LANGUAGE_OPENAI,
             BACKEND_OFF as NATURAL_LANGUAGE_OFF,
-            ENDPOINT_POLICY_CHOICES as NATURAL_LANGUAGE_ENDPOINT_POLICIES,
             ENDPOINT_POLICY_UNRESTRICTED as NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED,
             CONVERTER_VERSION as NATURAL_LANGUAGE_CONVERTER_VERSION,
             PRESET_CHOICES as NATURAL_LANGUAGE_PRESETS,
@@ -208,7 +207,6 @@ def _natural_cancel_event(cancel_id: str = "") -> tuple[str, threading.Event]:
     key = str(cancel_id or "").strip() or f"direct:{threading.get_ident()}"
     with _natural_batch_cancel_lock:
         return key, _natural_batch_cancel_events.setdefault(key, threading.Event())
-_natural_endpoint_policy_choices = list(NATURAL_LANGUAGE_ENDPOINT_POLICIES)
 _prompt_studio_module = None
 _prompt_studio_lock = threading.RLock()
 
@@ -299,6 +297,15 @@ def _cache_process_with_prompt_studio(current_prompt, record_id=""):
         return result["prompt"], result["status"]
     except Exception as error:
         return "", f"处理失败：{error}"
+
+
+def _cache_process_and_write_prompt(current_prompt, record_id=""):
+    """Process the selected cache record and expose the result in Forge's prompt box."""
+    prompt, status = _cache_process_with_prompt_studio(current_prompt, record_id)
+    prompt = str(prompt or "").strip()
+    if prompt:
+        status = f"{status}；已写入 Tag Prompt，可直接检查后生成。"
+    return prompt, status, prompt
 
 
 class CredentialReadError(RuntimeError):
@@ -410,28 +417,10 @@ class CredentialsManager:
             timeout_value = min(300.0, max(1.0, float(timeout or 120)))
         except (TypeError, ValueError):
             timeout_value = 120.0
-        try:
-            rag_top_k_value = max(1, min(5, int(float(rag_top_k or 3))))
-        except (TypeError, ValueError, OverflowError):
-            rag_top_k_value = 3
-        try:
-            rag_min_percentile_value = max(
-                0.0,
-                min(100.0, float(rag_min_percentile)),
-            )
-        except (TypeError, ValueError, OverflowError):
-            rag_min_percentile_value = 75.0
-        try:
-            rag_context_chars_value = max(
-                0,
-                min(12000, int(float(rag_context_chars or 0))),
-            )
-        except (TypeError, ValueError, OverflowError):
-            rag_context_chars_value = 3000
-        # Natural-language conversion and RAG are retired. Keep legacy fields
-        # readable for migration, but never enable or persist the feature.
-        rag_enabled_value = False
-        backend_value = str(backend or NATURAL_LANGUAGE_OFF)
+        # The conversion panel uses one fixed OpenAI-compatible HTTP protocol.
+        # Keep legacy arguments in the method signature for older callers, but
+        # do not persist retired backend, policy, or RAG choices.
+        backend_value = NATURAL_LANGUAGE_OPENAI
         endpoint_value = str(endpoint or "").strip()
         with self._lock:
             credentials = self._load_credentials(for_write=True)
@@ -445,17 +434,11 @@ class CredentialsManager:
             settings = {
                 "preset": str(preset or PRESET_KREA2),
                 "backend": backend_value,
-                "endpoint_policy": str(
-                    endpoint_policy or NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED
-                ),
+                "endpoint_policy": NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED,
                 "endpoint": endpoint_value,
                 "model": str(model or "").strip(),
                 "api_key": str(api_key or "").strip() or existing_key,
                 "timeout": timeout_value,
-                "rag_enabled": rag_enabled_value,
-                "rag_top_k": rag_top_k_value,
-                "rag_min_percentile": rag_min_percentile_value,
-                "rag_context_chars": rag_context_chars_value,
             }
             credentials["natural_language"] = settings
             self._save_credentials(credentials)
@@ -484,6 +467,7 @@ COLORED_BG = ['black_background', 'aqua_background', 'white_background', 'colore
 ADD_BG = ['outdoors', 'indoors']
 BW_BG = ['monochrome', 'greyscale', 'grayscale']
 POST_AMOUNT = 100
+SAFEBOORU_MAX_QUERY_TAGS = 2
 DEBUG = False
 RATING_TYPES = {
     "none": {
@@ -545,6 +529,10 @@ def _response_posts_or_raise(response, source, keys=("posts", "post")):
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
+        if payload.get("success") is False or payload.get("error"):
+            error_code = payload.get("error") or "API 错误"
+            message = payload.get("message") or "未知 API 错误"
+            raise RuntimeError(f"{source}: {error_code}: {message}")
         for key in keys:
             if key in payload:
                 posts = payload[key]
@@ -552,6 +540,23 @@ def _response_posts_or_raise(response, source, keys=("posts", "post")):
                     return posts
                 raise RuntimeError(f"{source} 的 {key} 字段不是列表")
     raise RuntimeError(f"{source} 返回了不支持的 JSON 结构")
+
+
+def _response_post_or_raise(response, source):
+    """Parse a single-post response while preserving provider error payloads."""
+    try:
+        payload = response.json()
+    except ValueError as error:
+        raise RuntimeError(f"{source} 返回了无法解析的 JSON") from error
+    if isinstance(payload, dict):
+        if payload.get("success") is False or payload.get("error"):
+            error_code = payload.get("error") or "API 错误"
+            message = payload.get("message") or "未知 API 错误"
+            raise RuntimeError(f"{source}: {error_code}: {message}")
+        post = payload.get("post", payload)
+        if isinstance(post, dict):
+            return post
+    raise RuntimeError(f"{source} 返回了不支持的单帖 JSON 结构")
 
 
 class Booru():
@@ -595,6 +600,7 @@ class Booru():
         """Fetch URL with retry logic for rate limiting and network errors."""
         import time
         safe_url = re.sub(r'((?:api_key|user_id)=)[^&\s]+', r'\1***', str(url))
+        last_error = None
         for attempt in range(max_retries):
             try:
                 response = self.session.get(url, timeout=timeout, **kwargs)
@@ -606,6 +612,7 @@ class Booru():
                 response.raise_for_status()
                 return response
             except requests.exceptions.Timeout:
+                last_error = requests.exceptions.Timeout(f"{self.booru} request timed out")
                 if attempt < max_retries - 1:
                     log_event(
                         logger,
@@ -617,6 +624,7 @@ class Booru():
                     )
                     time.sleep(2 ** attempt)
             except requests.exceptions.RequestException as e:
+                last_error = e
                 safe_error = redact_sensitive(e)
                 if attempt < max_retries - 1:
                     log_event(
@@ -629,7 +637,8 @@ class Booru():
                         max_retries,
                     )
                     time.sleep(2 ** attempt)
-        raise Exception(f"[{self.booru}] All {max_retries} attempts failed for {safe_url}")
+        error = RetryExhaustedError(f"[{self.booru}] All {max_retries} attempts failed for {safe_url}")
+        raise error from last_error
 
     def get_data(self, add_tags, max_pages=10, id=''):
         pass
@@ -638,7 +647,12 @@ class Booru():
         return self.get_data(add_tags, max_pages, "&id=" + id)
 
     def _filter_tags_by_category(self, post, categories):
-        if not categories or not isinstance(categories, list):
+        # Keep the full provider tag set for search/filter matching even when
+        # the prompt output is restricted to selected categories.
+        full_tags = _get_post_tags(post)
+        if full_tags:
+            post['_ranbooru_match_tags'] = full_tags
+        if not categories or not isinstance(categories, (list, tuple, set)):
             return post.get('tag_string', '')
         parts = []
         for category in categories:
@@ -660,7 +674,10 @@ class Gelbooru(Booru):
         max_pages = _normalize_max_pages(max_pages)
         for attempt in range(2):
             local_add_tags = '' if id else add_tags
-            url = f"{self.base_url}&pid={random.randint(0, max_pages-1)}{id}{local_add_tags}"
+            # Online generation only needs a populated result page. Randomly
+            # selecting a page makes sparse queries look empty when max_pages
+            # is larger than the query's actual result set.
+            url = f"{self.base_url}&pid=0{id}{local_add_tags}"
             if self.api_key and self.user_id:
                 url += f"&api_key={self.api_key}&user_id={self.user_id}"
             if self.fringe_benefits:
@@ -705,7 +722,7 @@ class e621(Booru):
         for attempt in range(2):
             if id:
                 add_tags = ''
-            random_page = random.randint(1, max(1, int(max_pages)))
+            random_page = 1
             url = f"{self.base_url}&page={random_page}{add_tags}"
             self.booru_url = url
             res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
@@ -739,17 +756,23 @@ class e621(Booru):
 
     def _filter_tags_by_category(self, post, categories):
         """Filter tags by selected categories (e621 uses nested tags dict)."""
-        if not categories or not isinstance(categories, list):
+        if not categories or not isinstance(categories, (list, tuple, set)):
             tags_dict = post.get('tags', {})
             if isinstance(tags_dict, dict):
                 all_tags = []
                 for cat in ['general', 'artist', 'copyright', 'character', 'species', 'meta']:
                     all_tags.extend(tags_dict.get(cat, []))
+                post['_ranbooru_match_tags'] = ' '.join(all_tags)
                 return ' '.join(all_tags)
             return ''
         tags_dict = post.get('tags', {})
         if not isinstance(tags_dict, dict):
             return ''
+        all_tags = []
+        for cat in ['general', 'artist', 'copyright', 'character', 'species', 'meta']:
+            all_tags.extend(tags_dict.get(cat, []))
+        if all_tags:
+            post['_ranbooru_match_tags'] = ' '.join(all_tags)
         parts = []
         for cat in categories:
             if cat in tags_dict:
@@ -761,13 +784,9 @@ class e621(Booru):
             return self.get_data(add_tags, max_pages, '', tag_categories=None)
         self.booru_url = f"https://e621.net/posts/{id}.json"
         res = self.fetch_with_retry(self.booru_url, headers=self.headers, timeout=10)
-        data = res.json()
-        if isinstance(data, dict):
-            post = data.get('post', data)
-            if isinstance(post, dict):
-                post['tags'] = self._filter_tags_by_category(post, None)
-                return {'post': [post]}
-        return {'post': []}
+        post = _response_post_or_raise(res, "e621")
+        post['tags'] = self._filter_tags_by_category(post, None)
+        return {'post': [post]}
 
 
 
@@ -781,7 +800,7 @@ class XBooru(Booru):
         for attempt in range(2):
             if id:
                 add_tags = ''
-            url = f"{self.base_url}&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
+            url = f"{self.base_url}&pid=0{id}{add_tags}"
             self.booru_url = url
             logger.debug("Requesting booru URL: %s", redact_sensitive(str(url)))
             res = self.fetch_with_retry(url, timeout=10)
@@ -822,7 +841,7 @@ class Rule34(Booru):
         for attempt in range(2):
             if id:
                 add_tags = ''
-            url = f"{self.base_url}&pid={random.randint(0, max_pages-1)}{id}{add_tags}"
+            url = f"{self.base_url}&pid=0{id}{add_tags}"
             if self.api_key and self.user_id:
                 url += f"&api_key={self.api_key}&user_id={self.user_id}"
             self.booru_url = url
@@ -857,30 +876,21 @@ class Safebooru(Booru):
         super().__init__('safebooru', f'https://safebooru.donmai.us/posts.json?limit={POST_AMOUNT}')
 
     def get_data(self, add_tags, max_pages=10, id='', tag_categories=None):
-        max_pages = _normalize_max_pages(max_pages)
-        for attempt in range(2):
-            if id:
-                add_tags = ''
-            random_page = random.randint(1, max(1, int(max_pages)))
-            url = f"{self.base_url}&page={random_page}{add_tags}"
-            self.booru_url = url
-            res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
-            data = _response_posts_or_raise(res, "Safebooru")
-            result_count = 0
-            for post in data:
-                if isinstance(post, dict):
-                    post['tags'] = self._filter_tags_by_category(post, tag_categories)
-                    if not post.get('file_url') and post.get('large_file_url'):
-                        post['file_url'] = post.get('large_file_url')
-                    result_count += 1
-            if result_count == 0:
-                max_pages = 2
-                if attempt == 0:
-                    logger.debug("Processing %s results", result_count)
-                continue
-            else:
-                logger.debug("Found enough results")
-            break
+        if id:
+            add_tags = ''
+        # Safebooru does not expose a result count. Picking a page from the UI's
+        # Max Pages range turns sparse valid queries into intermittent empty results.
+        # Fetch page one and let the shared prompt pipeline choose a random post.
+        url = f"{self.base_url}&page=1{add_tags}"
+        self.booru_url = url
+        res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
+        data = _response_posts_or_raise(res, "Safebooru")
+        for post in data:
+            if isinstance(post, dict):
+                post['tags'] = self._filter_tags_by_category(post, tag_categories)
+                if not post.get('file_url') and post.get('large_file_url'):
+                    post['file_url'] = post.get('large_file_url')
+        logger.debug("Safebooru page 1 returned %s results", len(data))
         return {'post': data}
 
     def get_data_page(self, add_tags, page=0, id='', tag_categories=None):
@@ -903,13 +913,11 @@ class Safebooru(Booru):
             return self.get_data(add_tags, max_pages, '', tag_categories=None)
         self.booru_url = f"https://safebooru.donmai.us/posts/{id}.json"
         res = self.fetch_with_retry(self.booru_url, headers=self.headers, timeout=10)
-        data = res.json()
-        if isinstance(data, dict):
-            data['tags'] = data.get('tag_string', '')
-            if not data.get('file_url') and data.get('large_file_url'):
-                data['file_url'] = data.get('large_file_url')
-            return {'post': [data]}
-        return {'post': []}
+        data = _response_post_or_raise(res, "Safebooru")
+        data['tags'] = data.get('tag_string', '')
+        if not data.get('file_url') and data.get('large_file_url'):
+            data['file_url'] = data.get('large_file_url')
+        return {'post': [data]}
 
 
 class Konachan(Booru):
@@ -922,7 +930,7 @@ class Konachan(Booru):
         for attempt in range(2):
             if id:
                 add_tags = ''
-            url = f"{self.base_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
+            url = f"{self.base_url}&page=1{id}{add_tags}"
             self.booru_url = url
             res = self.fetch_with_retry(url, timeout=10)
             data = _response_posts_or_raise(res, "Konachan")
@@ -961,7 +969,7 @@ class Yandere(Booru):
         for attempt in range(2):
             if id:
                 add_tags = ''
-            page = random.randint(0, max_pages-1)
+            page = 1
             extras = '&filter=1&include_tags=1&include_votes=1&include_pools=1'
             url = f"{self.base_url}&limit={POST_AMOUNT}&page={page}{id}{add_tags}{extras}"
             self.booru_url = url
@@ -1003,7 +1011,7 @@ class AIBooru(Booru):
         for attempt in range(2):
             if id:
                 add_tags = ''
-            url = f"{self.base_url}&page={random.randint(0, max_pages-1)}{id}{add_tags}"
+            url = f"{self.base_url}&page=1{id}{add_tags}"
             self.booru_url = url
             res = self.fetch_with_retry(url)
             data = _response_posts_or_raise(res, "AIBooru")
@@ -1047,7 +1055,7 @@ class Danbooru(Booru):
         for attempt in range(2):
             if id:
                 add_tags = ''
-            random_page = random.randint(1, max(1, int(max_pages)))
+            random_page = 1
             url = f"{self.base_url}&page={random_page}{add_tags}"
             self.booru_url = url
             res = self.fetch_with_retry(url, headers=self.headers, timeout=10)
@@ -1084,11 +1092,9 @@ class Danbooru(Booru):
             return self.get_data(add_tags, max_pages, '', tag_categories=None)
         self.booru_url = f"https://danbooru.donmai.us/posts/{id}.json"
         res = self.fetch_with_retry(self.booru_url, headers=self.headers, timeout=10)
-        data = res.json()
-        if isinstance(data, dict):
-            data['tags'] = data.get('tag_string', '')
-            return {'post': [data]}
-        return {'post': []}
+        data = _response_post_or_raise(res, "Danbooru")
+        data['tags'] = data.get('tag_string', '')
+        return {'post': [data]}
 
 
 def generate_chaos(pos_tags, neg_tags, chaos_amount):
@@ -1261,6 +1267,31 @@ def _get_rating_tag(booru, mature_rating):
     if not rating or rating == 'All':
         return ''
     return f'+rating:{rating}'
+
+
+def _split_query_tags(value):
+    """Parse the UI's comma-separated tag input without putting raw values in a URL."""
+    return [token for token in re.split(r'[\s,]+', str(value or '').strip()) if token]
+
+
+def _build_booru_search_suffix(booru, tags, mature_rating, include_default_filters=True):
+    """Build an encoded `tags` parameter and apply only provider-supported defaults."""
+    query_tags = _split_query_tags(tags)
+    if include_default_filters and booru != 'safebooru':
+        query_tags.insert(0, '-animated')
+
+    rating_tag = _get_rating_tag(booru, mature_rating)
+    if rating_tag:
+        query_tags.append(rating_tag.lstrip('+'))
+
+    if booru == 'safebooru' and len(query_tags) > SAFEBOORU_MAX_QUERY_TAGS:
+        raise ValueError(
+            'Safebooru 当前 API 最多允许 2 个搜索 tag；请减少 Tags to Search，'
+            '或分批使用 tag cache。'
+        )
+    if not query_tags:
+        return ''
+    return f"&tags={quote_plus(' '.join(dict.fromkeys(query_tags)), safe='')}"
 
 
 def _safe_read_text_file(base_dir, filename):
@@ -1458,10 +1489,12 @@ def _fetch_booru_posts_with_fallback(
     if can_relax_animated and not allow_animated_fallback:
         evidence["status"] = "empty_without_fallback"
     elif can_relax_animated:
-        fallback_add_tags = '&tags='
-        if plain_tags:
-            fallback_add_tags += str(plain_tags).replace(',', '+')
-        fallback_add_tags += _get_rating_tag(booru, mature_rating)
+        fallback_add_tags = _build_booru_search_suffix(
+            booru,
+            plain_tags,
+            mature_rating,
+            include_default_filters=False,
+        )
         evidence.update({
             "status": "fallback_requested",
             "fallback_query": fallback_add_tags,
@@ -1511,10 +1544,7 @@ class _BooruPipelineClient:
 
 
 def _pipeline_request_tags(service, tags, mature_rating):
-    add_tags = '&tags=-animated'
-    if tags:
-        add_tags += '+' + str(tags).replace(',', '+')
-    return add_tags + _get_rating_tag(service, mature_rating)
+    return _build_booru_search_suffix(service, tags, mature_rating)
 
 
 def _adapt_pipeline_client(client, request, allow_animated_fallback):
@@ -1549,7 +1579,9 @@ def _pipeline_client_factory(use_cache, fringe_benefits):
             credential.api_key if request.service == 'rule34' else None,
             credential.user_id if request.service == 'rule34' else None,
         )
-        client.configure_http_cache(use_cache)
+        # Authenticated Gelbooru/Rule34 URLs contain credentials. Do not put
+        # those URLs into the persistent requests-cache SQLite store.
+        client.configure_http_cache(use_cache and not (credential.api_key or credential.user_id))
         return _adapt_pipeline_client(client, request, fringe_benefits)
 
     return factory
@@ -1686,10 +1718,7 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
         rule34_user_id,
     )
 
-    add_tags = '&tags=-animated'
-    if tags_search:
-        add_tags += '+' + tags_search.replace(',', '+')
-    add_tags += _get_rating_tag(booru_name, mature_rating)
+    add_tags = _build_booru_search_suffix(booru_name, tags_search, mature_rating)
     effective_keep_all_tags = _join_tag_filters(_positive_search_tags(tags_search), cache_keep_all_tags)
 
     # Build bad_tags
@@ -1765,10 +1794,13 @@ def batch_fetch_tags(booru_name, tags_search, max_pages, fringe_benefits,
                     stats["skipped_empty"] += 1
                     continue
                 tag_list = _split_tag_tokens(raw_tags)
-                if not _post_has_required_tags(tag_list, effective_keep_all_tags, cache_keep_any_tags):
+                match_tag_list = _split_tag_tokens(
+                    post.get('_ranbooru_match_tags') or raw_tags
+                )
+                if not _post_has_required_tags(match_tag_list, effective_keep_all_tags, cache_keep_any_tags):
                     stats["skipped_filter"] += 1
                     continue
-                if _post_has_excluded_tags(tag_list, cache_exclude_tags):
+                if _post_has_excluded_tags(match_tag_list, cache_exclude_tags):
                     stats["skipped_exclude"] += 1
                     continue
                 if shuffle_tags:
@@ -1997,7 +2029,7 @@ class Script(scripts.Script):
         """从缓存顺序取出下一条"""
         tags, idx, total = tag_cache_manager.get_next_tags_from_pool(
             loop=loop_mode,
-            prefer_natural=False,
+            prefer_natural=prefer_natural,
         )
         if tags is None:
             if total == 0:
@@ -2244,10 +2276,11 @@ class Script(scripts.Script):
             return "", "请输入有效的缓存序号", ""
         tags = tag_cache_manager.get_by_position(
             cache_position,
-            prefer_natural=False,
+            prefer_natural=prefer_natural,
         )
         if tags:
-            return tags, f"已取出第 {cache_position} 条（使用原始 Tag）", str(tag_cache_manager.tag_id_at_position(cache_position) or "")
+            mode = "预转换 Prompt" if prefer_natural else "原始 Tag"
+            return tags, f"已取出第 {cache_position} 条（使用{mode}）", str(tag_cache_manager.tag_id_at_position(cache_position) or "")
         return "", f"未找到第 {cache_position} 条", ""
 
     @staticmethod
@@ -2255,9 +2288,10 @@ class Script(scripts.Script):
         stable_id = Script._parse_cache_id(tag_id)
         if stable_id is None:
             return "", "请输入搜索结果中的内部 ID", ""
-        tags = tag_cache_manager.get_by_id(stable_id, prefer_natural=False)
+        tags = tag_cache_manager.get_by_id(stable_id, prefer_natural=prefer_natural)
         if tags:
-            return tags, f"已按内部 ID {stable_id} 取出（使用原始 Tag）", str(stable_id)
+            mode = "预转换 Prompt" if prefer_natural else "原始 Tag"
+            return tags, f"已按内部 ID {stable_id} 取出（使用{mode}）", str(stable_id)
         return "", f"未找到内部 ID {stable_id}", ""
 
     @staticmethod
@@ -2294,7 +2328,10 @@ class Script(scripts.Script):
         stable_id = Script._parse_cache_id(tag_id)
         if stable_id is None:
             return "请输入搜索结果中的内部 ID", tag_cache_manager.get_status()
-        deleted = tag_cache_manager.delete_by_ids([stable_id])
+        try:
+            deleted = tag_cache_manager.delete_by_ids([stable_id])
+        except Exception as error:
+            return f"删除失败：{error}", tag_cache_manager.get_status()
         if deleted:
             return f"已删除内部 ID {stable_id}", tag_cache_manager.get_status()
         return f"删除失败：未找到内部 ID {stable_id}", tag_cache_manager.get_status()
@@ -2303,7 +2340,10 @@ class Script(scripts.Script):
     def _cache_delete_by_tags(tags):
         if not str(tags or "").strip():
             return "请输入要删除的 tag，例如 comic,text,speech_bubble", tag_cache_manager.get_status()
-        count = tag_cache_manager.delete_by_any_tags(tags)
+        try:
+            count = tag_cache_manager.delete_by_any_tags(tags)
+        except Exception as error:
+            return f"删除失败：{error}", tag_cache_manager.get_status()
         return f"已删除包含指定 tag 的 {count} 条缓存", tag_cache_manager.get_status()
 
     @staticmethod
@@ -2438,7 +2478,7 @@ class Script(scripts.Script):
                 Script._cache_refresh_status(),
                 "",
             )
-        return Script._cache_get_next(loop_mode, False)
+        return Script._cache_get_next(loop_mode, prefer_natural)
 
     @staticmethod
     def _cache_jump_take_and_set(
@@ -2476,30 +2516,19 @@ class Script(scripts.Script):
     @staticmethod
     def _save_natural_language_settings(
         preset,
-        backend,
-        endpoint_policy,
         endpoint,
         model,
         api_key,
         timeout,
-        rag_enabled,
-        rag_top_k,
-        rag_min_percentile,
-        rag_context_chars,
     ):
-        return "自然语言转换与 RAG 已移除，请在 LLM Prompt Studio 中处理。"
         settings = credentials_manager.save_natural_language_settings(
             preset,
-            backend,
-            endpoint_policy,
+            NATURAL_LANGUAGE_OPENAI,
+            NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED,
             endpoint,
             model,
             api_key,
             timeout,
-            rag_enabled,
-            rag_top_k,
-            rag_min_percentile,
-            rag_context_chars,
         )
         key_status = "已保存 API Key" if settings["api_key"] else "API Key 为空"
         return f"LLM 设置已保存；{key_status}。"
@@ -2509,16 +2538,10 @@ class Script(scripts.Script):
         credentials_manager.clear_natural_language_settings()
         return (
             PRESET_KREA2,
-            NATURAL_LANGUAGE_OFF,
-            NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED,
             "",
             "",
             "",
             120,
-            False,
-            3,
-            75,
-            3000,
             "已清除保存的 LLM 设置和 API Key。",
         )
 
@@ -2558,7 +2581,6 @@ class Script(scripts.Script):
 
     @staticmethod
     def _cache_preview_natural_conversion(position_spec, only_missing=True):
-        return "自然语言转换与 RAG 已移除，请在 LLM Prompt Studio 中处理。"
         if not str(position_spec or "").strip():
             return "请输入当前活动缓存的可见序号或范围，例如 1-100,205-240。"
         result = tag_cache_manager.preview_natural_conversion(
@@ -2572,28 +2594,16 @@ class Script(scripts.Script):
         position_spec,
         only_missing,
         preset,
-        backend,
-        endpoint_policy,
         endpoint,
         model,
         api_key,
         timeout,
-        rag_enabled,
-        rag_top_k,
-        rag_min_percentile,
-        rag_context_chars,
         cancel_event=None,
     ):
         cancel_event = cancel_event or _natural_batch_cancel
         if not str(position_spec or "").strip():
             yield (
                 "请输入当前活动缓存的可见序号或范围，例如 1-100,205-240。",
-                Script._natural_language_cache_status(),
-            )
-            return
-        if backend == NATURAL_LANGUAGE_OFF:
-            yield (
-                "请选择 Ollama（本地）或 OpenAI 兼容 LLM 后再开始批量转换。",
                 Script._natural_language_cache_status(),
             )
             return
@@ -2606,16 +2616,12 @@ class Script(scripts.Script):
         try:
             saved_settings = credentials_manager.save_natural_language_settings(
                 preset,
-                backend,
-                endpoint_policy,
+                NATURAL_LANGUAGE_OPENAI,
+                NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED,
                 endpoint,
                 model,
                 api_key,
                 timeout,
-                rag_enabled,
-                rag_top_k,
-                rag_min_percentile,
-                rag_context_chars,
             )
         except OSError as error:
             yield (
@@ -2643,55 +2649,14 @@ class Script(scripts.Script):
             )
             return
         config = NaturalLanguageConfig(
-            backend=saved_settings["backend"],
+            backend=NATURAL_LANGUAGE_OPENAI,
             endpoint=saved_settings["endpoint"],
             model=saved_settings["model"],
             api_key=saved_settings["api_key"],
             timeout=saved_settings["timeout"],
             preset=saved_settings["preset"],
-            endpoint_policy=saved_settings["endpoint_policy"],
-            few_shot_max_chars=saved_settings.get("rag_context_chars", 3000),
+            endpoint_policy=NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED,
         )
-        # Natural-language conversion and RAG are retired; cached records remain tag-only.
-        rag_enabled = False
-        rag_top_k = int(saved_settings.get("rag_top_k", 3))
-        rag_min_percentile = (
-            float(saved_settings.get("rag_min_percentile", 75)) / 100.0
-        )
-        rag_warning = ""
-        try:
-            rag_candidates = (
-                tag_cache_manager.get_prompt_rag_candidates(
-                    preset=config.preset,
-                    min_score_percentile=rag_min_percentile,
-                )
-                if rag_enabled
-                else []
-            )
-        except Exception as error:
-            rag_candidates = []
-            rag_warning = "；RAG 候选读取失败，已回退 Zero-Shot"
-            logger.warning("Prompt RAG candidate loading failed: %s", error)
-        rag_queries_with_examples = 0
-        rag_examples_used = 0
-
-        def retrieve_examples(original):
-            nonlocal rag_queries_with_examples, rag_examples_used
-            examples = tag_cache_manager.select_prompt_rag_examples(
-                original,
-                rag_candidates,
-                limit=rag_top_k,
-            )
-            injected_count = len(
-                CachedTagNaturalLanguageConverter._few_shot_messages(
-                    examples,
-                    max_chars=config.few_shot_max_chars,
-                )
-            ) // 2
-            if injected_count:
-                rag_queries_with_examples += 1
-                rag_examples_used += injected_count
-            return examples
 
         converter = CachedTagNaturalLanguageConverter()
         pending_updates = []
@@ -2725,8 +2690,7 @@ class Script(scripts.Script):
         try:
             yield (
                 f"已保存 LLM 设置和服务地址；已选择 {len(records)} 条整记录，"
-                f"数据库备份完成；本地 RAG 候选 {len(rag_candidates)} 条"
-                f"{rag_warning}；开始调用模型。",
+                "数据库备份完成；使用普通 HTTP 客户端开始调用模型。",
                 Script._natural_language_cache_status(),
             )
             for index, original, converted, error, was_reused in iter_cached_tag_conversions(
@@ -2734,7 +2698,8 @@ class Script(scripts.Script):
                 config,
                 converter,
                 should_cancel=cancel_event.is_set,
-                example_provider=retrieve_examples if rag_enabled else None,
+                timeout_retries=2,
+                retry_backoff_seconds=1.0,
             ):
                 processed = index + 1
                 if error:
@@ -2746,7 +2711,7 @@ class Script(scripts.Script):
                             yield (
                                 (
                                     f"批量转换在第 {processed}/{len(records)} 条停止："
-                                    f"已连续 {consecutive_timeouts} 条记录单次请求超时。\n"
+                                    f"已连续 {consecutive_timeouts} 条记录重试后仍超时。\n"
                                     f"本次已保存 {saved} 条；超时跳过 {timeout_skipped} 条；"
                                     f"源记录变化 {source_changed} 条，已删除 {source_deleted} 条。备份：{backup_path}"
                                 ),
@@ -2755,7 +2720,7 @@ class Script(scripts.Script):
                             return
                         yield (
                             (
-                                f"第 {processed}/{len(records)} 条单次请求超时，"
+                                f"第 {processed}/{len(records)} 条重试后仍超时，"
                                 f"已跳过并继续；连续超时 {consecutive_timeouts}/"
                                 f"{max_consecutive_timeouts}；已保存 {saved} 条。"
                             ),
@@ -2767,8 +2732,8 @@ class Script(scripts.Script):
                         consecutive_timeouts = 0
                         yield (
                             (
-                                f"Record {processed}/{len(records)} failed after one request; "
-                                f"skipped and continuing. Saved {saved}.\n{error}"
+                                f"第 {processed}/{len(records)} 条重试后仍失败，"
+                                f"已跳过并继续；已保存 {saved} 条。\n{error}"
                             ),
                             Script._natural_language_cache_status(),
                         )
@@ -2822,8 +2787,8 @@ class Script(scripts.Script):
                 (
                     f"批量预转换完成：选择 {len(records)} 条，保存 {saved} 条，"
                     f"复用相同整条 Tag 的结果 {reused} 条，"
-                    f"RAG 命中 {rag_queries_with_examples} 条并注入 {rag_examples_used} 个样例，"
                     f"超时跳过 {timeout_skipped} 条，"
+                    f"可重试错误跳过 {transient_skipped} 条，"
                     f"源记录变化 {source_changed} 条，已删除 {source_deleted} 条。备份：{backup_path}"
                 ),
                 Script._natural_language_cache_status(),
@@ -2849,23 +2814,12 @@ class Script(scripts.Script):
         position_spec,
         only_missing,
         preset,
-        backend,
-        endpoint_policy,
         endpoint,
         model,
         api_key,
         timeout,
-        rag_enabled,
-        rag_top_k,
-        rag_min_percentile,
-        rag_context_chars,
         cancel_id="",
     ):
-        yield (
-            "自然语言转换与 RAG 已移除，请在 LLM Prompt Studio 中处理。",
-            Script._natural_language_cache_status(),
-        )
-        return
         event_key, cancel_event = _natural_cancel_event(cancel_id)
         cancel_event.clear()
         try:
@@ -2873,16 +2827,10 @@ class Script(scripts.Script):
                 position_spec,
                 only_missing,
                 preset,
-                backend,
-                endpoint_policy,
                 endpoint,
                 model,
                 api_key,
                 timeout,
-                rag_enabled,
-                rag_top_k,
-                rag_min_percentile,
-                rag_context_chars,
                 cancel_event,
             )
         finally:
@@ -2899,7 +2847,7 @@ class Script(scripts.Script):
 
     @staticmethod
     def _cache_clear_natural_conversion(position_spec):
-        return "自然语言转换与 RAG 已移除；原始 Tag 缓存未修改。", Script._natural_language_cache_status()
+        return Script._cache_clear_natural_conversion_unlocked(position_spec)
 
     @staticmethod
     def _cache_clear_natural_conversion_unlocked(position_spec):
@@ -3028,16 +2976,6 @@ class Script(scripts.Script):
         saved_natural_preset = saved_natural_settings.get("preset", PRESET_KREA2)
         if saved_natural_preset not in NATURAL_LANGUAGE_PRESETS:
             saved_natural_preset = PRESET_KREA2
-        saved_natural_backend = saved_natural_settings.get(
-            "backend", NATURAL_LANGUAGE_OFF
-        )
-        if saved_natural_backend not in NATURAL_LANGUAGE_BACKENDS:
-            saved_natural_backend = NATURAL_LANGUAGE_OFF
-        saved_natural_policy = saved_natural_settings.get(
-            "endpoint_policy", NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED
-        )
-        if saved_natural_policy not in _natural_endpoint_policy_choices:
-            saved_natural_policy = NATURAL_LANGUAGE_ENDPOINT_UNRESTRICTED
         try:
             saved_natural_timeout = min(
                 300.0,
@@ -3045,40 +2983,6 @@ class Script(scripts.Script):
             )
         except (TypeError, ValueError):
             saved_natural_timeout = 120.0
-        saved_rag_enabled = saved_natural_settings.get("rag_enabled", False)
-        if isinstance(saved_rag_enabled, str):
-            saved_rag_enabled = saved_rag_enabled.strip().lower() not in {
-                "0", "false", "no", "off"
-            }
-        else:
-            saved_rag_enabled = bool(saved_rag_enabled)
-        try:
-            saved_rag_top_k = max(
-                1,
-                min(5, int(float(saved_natural_settings.get("rag_top_k", 3)))),
-            )
-        except (TypeError, ValueError, OverflowError):
-            saved_rag_top_k = 3
-        try:
-            saved_rag_min_percentile = max(
-                0.0,
-                min(
-                    100.0,
-                    float(saved_natural_settings.get("rag_min_percentile", 75)),
-                ),
-            )
-        except (TypeError, ValueError, OverflowError):
-            saved_rag_min_percentile = 75.0
-        try:
-            saved_rag_context_chars = max(
-                0,
-                min(
-                    12000,
-                    int(float(saved_natural_settings.get("rag_context_chars", 3000))),
-                ),
-            )
-        except (TypeError, ValueError, OverflowError):
-            saved_rag_context_chars = 3000
         saved_natural_has_api_key = bool(
             str(saved_natural_settings.get("api_key", "")).strip()
         )
@@ -3104,7 +3008,7 @@ class Script(scripts.Script):
                 with gr.Column(scale=2, min_width=220):
                     generate_prompt_btn = gr.Button("生成", elem_id=f"ranbooru_generate_prompt{view_suffix}", elem_classes=["ranbooru-primary-action", "ranbooru-view-action"])
                 with gr.Column(scale=8):
-                    with gr.Accordion(label=f"Ranbooru 设置 Settings · {view_label}", open=False, elem_id=f"ranbooru_online_workspace{view_suffix}", elem_classes=["ranbooru-panel"]):
+                    with gr.Accordion(label=f"高级选项 · Ranbooru · {view_label}", open=False, elem_id=f"ranbooru_online_workspace{view_suffix}", elem_classes=["ranbooru-panel"]):
                         enabled = gr.Checkbox(label="Enabled", value=False)
                         with gr.Row():
                             with gr.Column(scale=1):
@@ -3200,6 +3104,9 @@ class Script(scripts.Script):
                         with gr.Tabs(elem_id="ranbooru_cache_tabs", elem_classes=["ranbooru-cache-tabs"]):
                             with gr.Tab("缓存采集", elem_id="ranbooru_tab_collect"):
                                 gr.Markdown("### 采集条件")
+                                gr.Markdown(
+                                    "远端搜索使用上方唯一的 Tags to Search；下面三个字段只对返回帖子做本地缓存过滤。"
+                                )
                                 with gr.Row(elem_classes=["ranbooru-form-row"]):
                                     cache_status_display = gr.Textbox(
                                         elem_id="ranbooru_cache_status",
@@ -3274,6 +3181,10 @@ class Script(scripts.Script):
                                         "使用 LLM 处理并缓存",
                                         variant="primary",
                                     )
+                                    cache_process_prompt_studio_write_btn = gr.Button(
+                                        "处理并写入 Tag Prompt",
+                                        variant="secondary",
+                                    )
                                 cache_prompt_studio_result = gr.Textbox(
                                     label="LLM 结果",
                                     interactive=False,
@@ -3295,9 +3206,9 @@ class Script(scripts.Script):
                                         value=False,
                                         visible=False,
                                     )
-                            with gr.Tab("自然语言与 RAG", elem_id="ranbooru_tab_natural", visible=False):
+                            with gr.Tab("自然语言转换", elem_id="ranbooru_tab_natural", visible=True):
                                 gr.Markdown(
-                                    "此旧面板已停用。自然语言转换与 RAG 不再由 Ranbooru 执行；请将筛选后的 Tag 载入 LLM Prompt Studio，使用对应模型的格式转换、扩写或润色模板。"
+                                    "将缓存中的 Tag 转换为自然语言 Prompt。原始 Tag 始终保留，生成时可选择优先使用预转换 Prompt。"
                                 )
                                 cache_natural_language_status = gr.Textbox(
                                     label="预转换状态",
@@ -3316,71 +3227,25 @@ class Script(scripts.Script):
                                         label="只转换尚未转换的记录",
                                         value=True,
                                     )
-                                with gr.Row(elem_classes=["ranbooru-form-row"]):
-                                    cache_prompt_rag_enabled = gr.Checkbox(
-                                        label="启用本地高分 Prompt RAG / Few-Shot",
-                                        value=saved_rag_enabled,
-                                    )
-                                    cache_prompt_rag_top_k = gr.Number(
-                                        label="Few-Shot 样例数",
-                                        minimum=1,
-                                        maximum=5,
-                                        value=saved_rag_top_k,
-                                        step=1,
-                                        precision=0,
-                                    )
-                                    cache_prompt_rag_min_percentile = gr.Number(
-                                        label="RAG 候选最低分位（%）",
-                                        minimum=0,
-                                        maximum=100,
-                                        value=saved_rag_min_percentile,
-                                        step=1,
-                                        precision=0,
-                                    )
-                                    cache_prompt_rag_context_chars = gr.Number(
-                                        label="Few-Shot 上下文字符预算",
-                                        minimum=0,
-                                        maximum=12000,
-                                        value=saved_rag_context_chars,
-                                        step=250,
-                                        precision=0,
-                                    )
                                 cache_natural_language_preset = gr.Dropdown(
                                     NATURAL_LANGUAGE_PRESETS,
                                     label="自然语言预设",
                                     value=saved_natural_preset,
                                 )
-                                with gr.Row(elem_classes=["ranbooru-form-row"]):
-                                    cache_natural_language_backend = gr.Dropdown(
-                                        NATURAL_LANGUAGE_BACKENDS,
-                                        label="转换方式",
-                                        value=saved_natural_backend,
-                                    )
-                                    cache_natural_language_endpoint_policy = gr.Dropdown(
-                                        _natural_endpoint_policy_choices,
-                                        label="服务地址兼容策略",
-                                        value=saved_natural_policy,
-                                        info=(
-                                            "unrestricted：普通 HTTP 客户端模式，兼容系统代理、Fake-IP 和任意地址（推荐）；"
-                                            "allow_private：允许本机、LAN 和 Fake-IP，但仍校验 DNS/IP；"
-                                            "default：仅允许本机 Ollama 和公网服务；"
-                                            "public_only：仅公网。"
-                                        ),
-                                    )
-                                    cache_natural_language_timeout = gr.Number(
-                                        label="请求超时（秒）",
-                                        minimum=1,
-                                        maximum=300,
-                                        value=saved_natural_timeout,
-                                        step=1,
-                                        precision=0,
-                                    )
+                                cache_natural_language_timeout = gr.Number(
+                                    label="请求超时（秒）",
+                                    minimum=1,
+                                    maximum=300,
+                                    value=saved_natural_timeout,
+                                    step=1,
+                                    precision=0,
+                                )
                                 cache_natural_language_endpoint = gr.Textbox(
-                                    label="模型服务地址（留空使用后端默认地址）",
+                                    label="模型服务地址（OpenAI 兼容 HTTP）",
                                     value=str(saved_natural_settings.get("endpoint", "")),
                                     placeholder=(
-                                        "Ollama: http://127.0.0.1:11434；"
-                                        "OpenAI 兼容: https://api.openai.com/v1"
+                                        "例如 https://api.openai.com/v1 或 "
+                                        "http://127.0.0.1:8000/v1/responses"
                                     ),
                                     lines=1,
                                 )
@@ -3395,14 +3260,14 @@ class Script(scripts.Script):
                                         label=(
                                             "API Key（已保存，无需重填）"
                                             if saved_natural_has_api_key
-                                            else "API Key（Ollama 可留空）"
+                                            else "API Key（可留空，取决于服务）"
                                         ),
                                         type="password",
                                         value="",
                                         placeholder=(
                                             "已保存到服务器；留空继续使用，输入新值可替换。"
                                             if saved_natural_has_api_key
-                                            else "输入后会与服务地址等 LLM 设置一起保存。"
+                                            else "按服务要求填写；留空表示不发送鉴权头。"
                                         ),
                                         lines=1,
                                     )
@@ -3599,12 +3464,23 @@ class Script(scripts.Script):
             fn=_cache_send_to_prompt_studio,
             inputs=[cache_next_output, cache_current_record_id],
             outputs=[cache_prompt_studio_status],
+        ).then(
+            fn=None,
+            inputs=None,
+            outputs=None,
+            js="() => { window.llmPromptStudioAutoLoop?.focusHandoff?.(); }",
         )
 
         cache_process_prompt_studio_btn.click(
             fn=_cache_process_with_prompt_studio,
             inputs=[cache_next_output, cache_current_record_id],
             outputs=[cache_prompt_studio_result, cache_prompt_studio_status],
+        )
+
+        cache_process_prompt_studio_write_btn.click(
+            fn=_cache_process_and_write_prompt,
+            inputs=[cache_next_output, cache_current_record_id],
+            outputs=[cache_prompt_studio_result, cache_prompt_studio_status, tag_prompt_input],
         )
 
         cache_lookup_id_btn.click(
@@ -3655,16 +3531,10 @@ class Script(scripts.Script):
             fn=self._save_natural_language_settings,
             inputs=[
                 cache_natural_language_preset,
-                cache_natural_language_backend,
-                cache_natural_language_endpoint_policy,
                 cache_natural_language_endpoint,
                 cache_natural_language_model,
                 cache_natural_language_api_key,
                 cache_natural_language_timeout,
-                cache_prompt_rag_enabled,
-                cache_prompt_rag_top_k,
-                cache_prompt_rag_min_percentile,
-                cache_prompt_rag_context_chars,
             ],
             outputs=[cache_natural_language_settings_status],
         )
@@ -3673,16 +3543,10 @@ class Script(scripts.Script):
             inputs=[],
             outputs=[
                 cache_natural_language_preset,
-                cache_natural_language_backend,
-                cache_natural_language_endpoint_policy,
                 cache_natural_language_endpoint,
                 cache_natural_language_model,
                 cache_natural_language_api_key,
                 cache_natural_language_timeout,
-                cache_prompt_rag_enabled,
-                cache_prompt_rag_top_k,
-                cache_prompt_rag_min_percentile,
-                cache_prompt_rag_context_chars,
                 cache_natural_language_settings_status,
             ],
         )
@@ -3701,16 +3565,10 @@ class Script(scripts.Script):
                 cache_natural_language_positions,
                 cache_natural_language_only_missing,
                 cache_natural_language_preset,
-                cache_natural_language_backend,
-                cache_natural_language_endpoint_policy,
                 cache_natural_language_endpoint,
                 cache_natural_language_model,
                 cache_natural_language_api_key,
                 cache_natural_language_timeout,
-                cache_prompt_rag_enabled,
-                cache_prompt_rag_top_k,
-                cache_prompt_rag_min_percentile,
-                cache_prompt_rag_context_chars,
                 cache_natural_cancel_id,
             ],
             outputs=[
@@ -3985,9 +3843,6 @@ class Script(scripts.Script):
     def before_process(self, p, enabled, tags, booru, remove_bad_tags, max_pages, change_dash, same_prompt, fringe_benefits, remove_tags, use_img2img, denoising, use_last_img, change_background, change_color, shuffle_tags, post_id, mix_prompt, mix_amount, chaos_mode, negative_mode, chaos_amount, limit_tags, max_tags, sorting_order, mature_rating, lora_folder, lora_amount, lora_min, lora_max, lora_enabled, lora_custom_weights, lora_lock_prev, use_ip, use_search_txt, use_remove_txt, choose_search_txt, choose_remove_txt, crop_center, use_deepbooru, type_deepbooru, use_same_seed, use_cache, api_key, user_id, save_credentials, use_local_cache_gen, use_local_cache_loop, tag_categories, *args):
         max_pages = _normalize_max_pages(max_pages)
         cache_prompt_write_mode = args[0] if args else "追加到后面"
-        # Legacy callers may still pass this flag; natural-language cache
-        # injection is retired and the generation path always uses raw Tags.
-        use_preconverted_cache_prompt = False
         job_id = _processing_job_id(p)
         if self._active_job_id != job_id and not _is_hires_second_pass(p):
             self._active_job_id = job_id
@@ -3996,6 +3851,8 @@ class Script(scripts.Script):
             self.original_prompt = p.prompt if isinstance(p.prompt, list) else str(p.prompt or '')
         if use_cache and not HAS_REQUESTS_CACHE:
             logger.warning("requests-cache is not installed; running without cache")
+
+        use_preconverted_cache_prompt = bool(args[1]) if len(args) > 1 else False
 
         if enabled:
             if use_local_cache_gen:
@@ -4024,7 +3881,7 @@ class Script(scripts.Script):
                 cache_entries, idx, total = tag_cache_manager.get_next_tags_batch_from_pool(
                     total_images,
                     loop=use_local_cache_loop,
-                    prefer_natural=False,
+                    prefer_natural=use_preconverted_cache_prompt,
                     include_prompt_metadata=True,
                 )
                 cache_prompts = [entry["prompt"] for entry in cache_entries]
@@ -4206,7 +4063,7 @@ class Script(scripts.Script):
                 rule34_api_key,
                 rule34_user_id,
             )
-            api_url.configure_http_cache(use_cache)
+            api_url.configure_http_cache(use_cache and not (api_key or user_id))
             try:
                 result = generate_online_prompt(
                     request,

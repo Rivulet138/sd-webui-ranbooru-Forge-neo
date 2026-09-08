@@ -47,6 +47,17 @@ class _FakeSession:
         )
 
 
+class _FakeResponsesSession(_FakeSession):
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _FakeResponse({
+            "output": [{
+                "type": "message",
+                "content": [{"type": "output_text", "text": "A response prompt."}],
+            }],
+        })
+
+
 class PromptRagCacheTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -320,6 +331,26 @@ class PromptFewShotMessageTests(unittest.TestCase):
         self.assertEqual([message["role"] for message in messages], ["user", "assistant"])
         self.assertEqual(messages[1]["content"], "A forest.")
 
+    def test_openai_responses_endpoint_uses_input_and_output_text(self):
+        session = _FakeResponsesSession()
+        converter = CachedTagNaturalLanguageConverter(session)
+        result = converter.convert(
+            "1girl, blue_hair",
+            NaturalLanguageConfig(
+                backend=BACKEND_OPENAI,
+                endpoint="https://example.test/v1/responses",
+                endpoint_policy=ENDPOINT_POLICY_UNRESTRICTED,
+                model="test-model",
+            ),
+        )
+
+        self.assertEqual(result, "A response prompt.")
+        url, request = session.calls[0]
+        self.assertEqual(url, "https://example.test/v1/responses")
+        self.assertIn("input", request["json"])
+        self.assertNotIn("messages", request["json"])
+        self.assertEqual(request["json"]["max_output_tokens"], 512)
+
     def test_retrieval_failure_falls_back_to_zero_shot(self):
         class _Converter:
             def convert(self, tags, config):
@@ -366,11 +397,39 @@ class PromptFewShotMessageTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(converter.calls, ["forest", "timeout"])
+        self.assertEqual(converter.calls, ["forest", "timeout", "timeout", "timeout", "timeout"])
         self.assertTrue(rows[1][4])
-        self.assertIn("未自动重试", rows[2][3])
+        self.assertIn("已重试 3 次", rows[2][3])
         self.assertTrue(rows[3][4])
         self.assertEqual(rows[3][3], rows[2][3])
+
+    def test_empty_model_response_is_retried_before_the_record_is_skipped(self):
+        class _FlakyConverter:
+            def __init__(self):
+                self.calls = 0
+
+            def convert(self, tags, config):
+                self.calls += 1
+                if self.calls == 1:
+                    raise NaturalLanguageConversionError(
+                        "模型返回了空内容"
+                    )
+                return "Recovered prompt."
+
+        converter = _FlakyConverter()
+        rows = list(
+            iter_cached_tag_conversions(
+                ["forest"],
+                NaturalLanguageConfig(backend=BACKEND_OLLAMA, model="test-model"),
+                converter=converter,
+                timeout_retries=2,
+                retry_backoff_seconds=0,
+            )
+        )
+
+        self.assertEqual(converter.calls, 2)
+        self.assertEqual(rows[0][2], "Recovered prompt.")
+        self.assertEqual(rows[0][3], "")
 
 
 class PromptRagUiContractTests(unittest.TestCase):
@@ -390,26 +449,6 @@ class PromptRagUiContractTests(unittest.TestCase):
             for node in script_class.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         }
-        credentials_class = next(
-            node
-            for node in source.body
-            if isinstance(node, ast.ClassDef) and node.name == "CredentialsManager"
-        )
-        save_settings = next(
-            node
-            for node in credentials_class.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "save_natural_language_settings"
-        )
-        default_offset = len(save_settings.args.args) - len(save_settings.args.defaults)
-        defaults = {
-            argument.arg: default
-            for argument, default in zip(
-                save_settings.args.args[default_offset:],
-                save_settings.args.defaults,
-            )
-        }
-        self.assertIs(defaults["rag_enabled"].value, False)
         ui_method = methods["ui"]
         click_inputs = {}
         click_outputs = {}

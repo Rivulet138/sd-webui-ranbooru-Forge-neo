@@ -15,16 +15,48 @@ class RanbooruUiContractTests(unittest.TestCase):
     def test_realtime_prompt_batch_import_uses_shared_normalizer(self):
         source = (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
         self.assertIn("tag_cache_manager.normalize_prompt_batch_payload(data)", source)
+        self.assertNotIn("此旧面板已停用", source)
+        self.assertIn('gr.Tab("自然语言转换", elem_id="ranbooru_tab_natural", visible=True)', source)
+        self.assertNotIn("Prompt RAG / Few-Shot", source)
+        self.assertNotIn("服务地址兼容策略", source)
+        self.assertNotIn("转换方式", source)
+
+    def test_natural_language_cache_callbacks_are_live(self):
+        source = ast.parse(
+            (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
+        )
+        script_class = next(
+            node for node in source.body
+            if isinstance(node, ast.ClassDef) and node.name == "Script"
+        )
+        methods = {
+            node.name: node
+            for node in script_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        for method_name in (
+            "_save_natural_language_settings",
+            "_cache_preview_natural_conversion",
+            "_cache_batch_convert_natural",
+            "_cache_clear_natural_conversion",
+        ):
+            with self.subTest(method=method_name):
+                first = methods[method_name].body[0]
+                if isinstance(first, ast.Return):
+                    self.assertNotIn(
+                        "自然语言转换与 RAG 已移除",
+                        ast.unparse(first.value) if first.value else "",
+                    )
 
     def test_cache_workspace_exposes_task_tabs_and_stable_ids(self):
         source = (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
 
-        self.assertIn('gr.Accordion(label=f"Ranbooru 设置 Settings · {view_label}", open=False', source)
+        self.assertIn('gr.Accordion(label=f"高级选项 · Ranbooru · {view_label}", open=False', source)
         self.assertIn('view_suffix = "_img2img" if is_img2img else ""', source)
         self.assertIn('elem_id=f"ranbooru_tag_prompt{view_suffix}"', source)
         self.assertIn('elem_id=f"ranbooru_prompt_batch_payload{view_suffix}"', source)
         self.assertNotIn("Ranbooru 在线生成设置", source)
-        for label in ("缓存采集", "浏览与联动", "自然语言与 RAG", "维护与导入导出"):
+        for label in ("缓存采集", "浏览与联动", "自然语言转换", "维护与导入导出"):
             self.assertIn(f'gr.Tab("{label}"', source)
 
         for elem_id in (
@@ -36,6 +68,7 @@ class RanbooruUiContractTests(unittest.TestCase):
             "ranbooru_cache_delete_preview",
         ):
             self.assertIn(f'elem_id="{elem_id}"', source)
+
 
     def test_cache_workspace_is_collapsible_and_closed_by_default(self):
         source = ast.parse(
@@ -70,7 +103,7 @@ class RanbooruUiContractTests(unittest.TestCase):
             and isinstance(call.args[0], ast.Constant)
         }
         self.assertTrue(
-            {"缓存采集", "浏览与联动", "自然语言与 RAG", "维护与导入导出"}
+            {"缓存采集", "浏览与联动", "自然语言转换", "维护与导入导出"}
             <= nested_tabs
         )
 
@@ -81,7 +114,7 @@ class RanbooruUiContractTests(unittest.TestCase):
         expected = {
             "缓存采集": {"cache_fetch_btn"},
             "浏览与联动": {"cache_next_btn", "cache_send_prompt_studio_btn"},
-            "自然语言与 RAG": {"cache_natural_language_convert_btn"},
+            "自然语言转换": {"cache_natural_language_convert_btn"},
             "维护与导入导出": {"cache_delete_btn", "cache_import_btn"},
         }
         found = {}
@@ -121,6 +154,14 @@ class RanbooruUiContractTests(unittest.TestCase):
         self.assertIn(".ranbooru-form-row", css)
         self.assertIn(".ranbooru-table", css)
         self.assertIn("@media (max-width: 900px)", css)
+
+    def test_prompt_studio_actions_have_matching_output_contracts(self):
+        source = (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
+        self.assertIn("cache_process_prompt_studio_btn.click(", source)
+        self.assertIn("outputs=[cache_prompt_studio_result, cache_prompt_studio_status],", source)
+        self.assertIn("cache_process_prompt_studio_write_btn.click(", source)
+        self.assertIn("outputs=[cache_prompt_studio_result, cache_prompt_studio_status, tag_prompt_input],", source)
+        self.assertIn("focusHandoff", source)
 
 
 if __name__ == "__main__":

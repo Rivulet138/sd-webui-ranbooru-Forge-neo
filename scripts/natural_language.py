@@ -90,7 +90,7 @@ class NaturalLanguageConfig:
     timeout: float = 120.0
     preset: str = PRESET_KREA2
     system_prompt: str = ""
-    endpoint_policy: str = ENDPOINT_POLICY_DEFAULT
+    endpoint_policy: str = ENDPOINT_POLICY_UNRESTRICTED
     few_shot_max_chars: int = DEFAULT_FEW_SHOT_CHARS
 
 
@@ -318,7 +318,19 @@ def _read_json_response(response):
             raise NaturalLanguageConversionError(
                 f"Model response exceeds the {MAX_RESPONSE_BYTES}-byte limit"
             )
-    return json.loads(body.decode("utf-8"))
+    status_code = getattr(response, "status_code", "unknown")
+    if not body:
+        raise NaturalLanguageConversionError(
+            f"模型服务返回空响应（HTTP {status_code}）"
+        )
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        preview = body[:240].decode("utf-8", errors="replace").strip()
+        detail = preview or "<empty>"
+        raise NaturalLanguageConversionError(
+            f"模型服务返回的不是有效 JSON（HTTP {status_code}）：{detail}"
+        ) from error
 
 
 def _response_text(value):
@@ -343,6 +355,29 @@ def _clean_model_output(value):
     if not text:
         raise NaturalLanguageConversionError("模型返回了空内容")
     return text[:MAX_OUTPUT_CHARS].rstrip()
+
+
+def _responses_api_output_text(payload):
+    """Extract assistant text from an OpenAI Responses API payload."""
+    if not isinstance(payload, dict):
+        raise NaturalLanguageConversionError("Responses API 返回的顶层结构不是对象")
+    if payload.get("output_text"):
+        return _clean_model_output(payload["output_text"])
+    output = payload.get("output")
+    if isinstance(output, list):
+        text_parts = []
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                text_parts.append(_response_text(content))
+            elif isinstance(content, str):
+                text_parts.append(content)
+        return _clean_model_output(" ".join(part for part in text_parts if part))
+    raise NaturalLanguageConversionError(
+        "Responses API 响应缺少 output_text 或 output 内容"
+    )
 
 
 def _reject_redirect_response(response):
@@ -395,6 +430,15 @@ def is_retryable_conversion_error(error):
     return any(
         marker in message
         for marker in (
+            "空响应",
+            "空内容",
+            "empty response",
+            "empty content",
+            "不是有效 json",
+            "invalid json",
+            "缺少 output_text",
+            "缺少 output 内容",
+            "无法解析模型响应",
             "connection reset",
             "connection aborted",
             "connection refused",
@@ -408,20 +452,25 @@ def iter_cached_tag_conversions(
     tags_list,
     config,
     converter=None,
-    timeout_retries=0,
+    timeout_retries=2,
     should_cancel=None,
     retry_backoff_seconds=0.5,
     sleep_fn=time.sleep,
     example_provider=None,
 ):
-    """Yield whole-record conversions with at most one LLM request per unique prompt."""
+    """Yield whole-record conversions with bounded retries per unique prompt."""
     originals = [str(tags or "").strip() for tags in tags_list]
     owns_converter = converter is None
     converter = converter or CachedTagNaturalLanguageConverter()
     outcomes_by_original = {}
-    # Retain these arguments for extension API compatibility. Automatic retries are
-    # deliberately disabled so a unique Prompt is dispatched at most once per run.
-    _ = timeout_retries, retry_backoff_seconds, sleep_fn
+    try:
+        timeout_retries = max(0, min(5, int(timeout_retries)))
+    except (TypeError, ValueError, OverflowError):
+        timeout_retries = 2
+    try:
+        retry_backoff_seconds = max(0.0, min(10.0, float(retry_backoff_seconds)))
+    except (TypeError, ValueError, OverflowError):
+        retry_backoff_seconds = 1.0
 
     def raise_if_cancelled():
         if should_cancel is not None and should_cancel():
@@ -448,14 +497,22 @@ def iter_cached_tag_conversions(
                         redact_sensitive(error),
                     )
 
-            prepared, error = convert_cached_tags_safely(
-                original,
-                config,
-                converter,
-                examples,
-            )
-            if error and is_retryable_conversion_error(error):
-                error = f"{error}（未自动重试）"
+            prepared, error = original, ""
+            for attempt in range(timeout_retries + 1):
+                raise_if_cancelled()
+                prepared, error = convert_cached_tags_safely(
+                    original,
+                    config,
+                    converter,
+                    examples,
+                )
+                if not error or not is_retryable_conversion_error(error):
+                    break
+                if attempt < timeout_retries:
+                    if retry_backoff_seconds:
+                        sleep_fn(retry_backoff_seconds * (attempt + 1))
+                    continue
+                error = f"{error}（已重试 {timeout_retries} 次）"
             outcomes_by_original[original] = (prepared, error)
             if error:
                 if is_retryable_conversion_error(error):
@@ -470,7 +527,7 @@ def iter_cached_tag_conversions(
 
 
 class CachedTagNaturalLanguageConverter:
-    """HTTP client for Ollama and OpenAI-compatible chat completion servers."""
+    """Ordinary HTTP client for OpenAI-compatible model endpoints."""
 
     def __init__(self, session=None, resolver=None):
         self._owns_session = session is None
@@ -700,25 +757,36 @@ class CachedTagNaturalLanguageConverter:
             BACKEND_OPENAI,
             endpoint_policy,
         )
-        url = (
-            base_url
-            if base_url.endswith("/chat/completions")
-            else f"{base_url}/chat/completions"
-        )
+        use_responses_api = base_url.endswith("/responses")
+        if use_responses_api:
+            url = base_url
+        elif base_url.endswith("/chat/completions"):
+            url = base_url
+        else:
+            url = f"{base_url}/chat/completions"
         headers = {"Content-Type": "application/json"}
         if host_header:
             headers["Host"] = host_header
         if str(api_key or "").strip():
             headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+        request_body = {
+            "model": model,
+            "temperature": 0.2,
+        }
+        if use_responses_api:
+            request_body.update({
+                "input": messages,
+                "max_output_tokens": 512,
+            })
+        else:
+            request_body.update({
+                "messages": messages,
+                "max_tokens": 512,
+            })
         response = self.session.post(
             url,
             headers=headers,
-            json={
-                "model": model,
-                "messages": messages,
-                "temperature": 0.2,
-                "max_tokens": 512,
-            },
+            json=request_body,
             timeout=timeout,
             allow_redirects=False,
             stream=True,
@@ -729,4 +797,6 @@ class CachedTagNaturalLanguageConverter:
             payload = _read_json_response(response)
         finally:
             response.close()
+        if use_responses_api:
+            return _responses_api_output_text(payload)
         return _clean_model_output(payload["choices"][0]["message"]["content"])
