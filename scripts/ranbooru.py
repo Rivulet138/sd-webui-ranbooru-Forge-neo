@@ -2914,31 +2914,6 @@ class Script(scripts.Script):
         )
 
     @staticmethod
-    def _cache_import_payload(payload, append_mode=True, dedupe=True):
-        """Import a Collector JSON batch directly from a textbox payload."""
-        try:
-            payload_text = str(payload or "")
-            data = json.loads(payload_text)
-            if not isinstance(data, dict) or data.get("schema_version") != "prompt_batch.v1":
-                return "Collector 批次 schema_version 无效", tag_cache_manager.get_status()
-            loaded = tag_cache_manager.normalize_prompt_batch_payload(data)
-            if not loaded.get("ok"):
-                return loaded.get("message", "Collector 批次无效"), tag_cache_manager.get_status()
-            records = loaded["records"]
-            preview = []
-            for index, record in enumerate(records, 1):
-                if len(preview) < 8:
-                    preview.append(f"{index}: {record['tags_prompt'][:120]}")
-            result = (tag_cache_manager.append_records(records, dedupe=dedupe)
-                      if append_mode else tag_cache_manager.save_records(records, dedupe=dedupe, backup_reason="collector_import"))
-            return (
-                "Collector 批次导入完成\n" + "\n".join(preview)
-                + f"\n写入 {result.get('inserted', 0)} 条，补全 {result.get('enriched', 0)} 条"
-            ), tag_cache_manager.get_status()
-        except Exception as error:
-            return f"Collector 批次解析失败: {error}", tag_cache_manager.get_status()
-
-    @staticmethod
     def _format_import_preview(result):
         if not result.get("ok"):
             return result.get("message", "导入预检失败")
@@ -3394,8 +3369,6 @@ class Script(scripts.Script):
                                     cache_import_preflight_btn = gr.Button("预检导入")
                                     cache_import_btn = gr.Button("导入缓存", variant="primary")
                                 cache_import_export_result = gr.Textbox(label="导入/导出结果", elem_id="ranbooru_cache_import_result", interactive=False, lines=8)
-                                cache_prompt_batch_payload = gr.Textbox(label="Prompt Batch JSON", elem_id=f"ranbooru_prompt_batch_payload{view_suffix}", visible=False, lines=1)
-                                cache_prompt_batch_import_btn = gr.Button("导入 Collector 批次", elem_id=f"ranbooru_prompt_batch_import_btn{view_suffix}")
                                 cache_manage_result = gr.Textbox(label="操作结果", interactive=False, lines=1)
 
 
@@ -3679,12 +3652,6 @@ class Script(scripts.Script):
             fn=self._cache_import,
             inputs=[cache_import_path, cache_import_append, cache_import_dedupe],
             outputs=[cache_import_export_result, cache_status_display]
-        )
-
-        cache_prompt_batch_import_btn.click(
-            fn=self._cache_import_payload,
-            inputs=[cache_prompt_batch_payload, cache_import_append, cache_import_dedupe],
-            outputs=[cache_import_export_result, cache_status_display],
         )
 
         cache_search_btn.click(

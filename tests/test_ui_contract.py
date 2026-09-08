@@ -12,9 +12,11 @@ class RanbooruUiContractTests(unittest.TestCase):
         self.assertIn('importlib.import_module("prompt_studio_ui")', source)
         self.assertNotIn('spec_from_file_location("ranbooru_prompt_studio_bridge"', source)
 
-    def test_realtime_prompt_batch_import_uses_shared_normalizer(self):
+    def test_ranbooru_has_no_collector_receiver(self):
         source = (ROOT / "scripts" / "ranbooru.py").read_text(encoding="utf-8")
-        self.assertIn("tag_cache_manager.normalize_prompt_batch_payload(data)", source)
+        self.assertNotIn("_cache_import_payload", source)
+        self.assertNotIn("ranbooru_prompt_batch_payload", source)
+        self.assertNotIn("导入 Collector 批次", source)
         self.assertNotIn("此旧面板已停用", source)
         self.assertIn('gr.Tab("自然语言转换", elem_id="ranbooru_tab_natural", visible=True)', source)
         self.assertNotIn("Prompt RAG / Few-Shot", source)
@@ -54,7 +56,7 @@ class RanbooruUiContractTests(unittest.TestCase):
         self.assertIn('gr.Accordion(label=f"高级选项 · Ranbooru · {view_label}", open=False', source)
         self.assertIn('view_suffix = "_img2img" if is_img2img else ""', source)
         self.assertIn('elem_id=f"ranbooru_tag_prompt{view_suffix}"', source)
-        self.assertIn('elem_id=f"ranbooru_prompt_batch_payload{view_suffix}"', source)
+        self.assertNotIn('elem_id=f"ranbooru_prompt_batch_payload{view_suffix}"', source)
         self.assertNotIn("Ranbooru 在线生成设置", source)
         for label in ("缓存采集", "浏览与联动", "自然语言转换", "维护与导入导出"):
             self.assertIn(f'gr.Tab("{label}"', source)
